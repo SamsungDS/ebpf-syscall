@@ -1,0 +1,200 @@
+//go:build ignore
+
+#include "vmlinux.h"
+#include <bpf/bpf_helpers.h>
+#include <bpf/bpf_tracing.h>
+#include <bpf/bpf_core_read.h>
+
+#define MAX_COMM_LEN 16
+#define MAX_ENTRIES 8192
+
+// Syscall event structure
+struct syscall_event {
+    u64 timestamp;
+    u32 pid;
+    u32 syscall_nr;
+    u32 fd;
+    u64 size;
+    u64 offset;
+    char comm[MAX_COMM_LEN];
+};
+
+// Maps for syscall statistics
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, MAX_ENTRIES);
+    __type(key, u32);
+    __type(value, u64);
+} syscall_sizes SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, MAX_ENTRIES);
+    __type(key, u32);
+    __type(value, u64);
+} syscall_counts SEC(".maps");
+
+// Ring buffer for detailed events
+struct {
+    __uint(type, BPF_MAP_TYPE_RINGBUF);
+    __uint(max_entries, 256 * 1024);
+} events SEC(".maps");
+
+// Global flag to control detailed logging
+volatile const bool detailed_logging = true;
+
+static __always_inline void update_stats(u32 syscall_nr, u64 size)
+{
+    u64 *val;
+    u64 init_val = size;
+    u64 count = 1;
+
+    val = bpf_map_lookup_elem(&syscall_sizes, &syscall_nr);
+    if (val) {
+        __sync_fetch_and_add(val, size);
+    } else {
+        bpf_map_update_elem(&syscall_sizes, &syscall_nr, &init_val, BPF_ANY);
+    }
+
+    val = bpf_map_lookup_elem(&syscall_counts, &syscall_nr);
+    if (val) {
+        __sync_fetch_and_add(val, 1);
+    } else {
+        bpf_map_update_elem(&syscall_counts, &syscall_nr, &count, BPF_ANY);
+    }
+}
+
+static __always_inline void log_event(u32 syscall_nr, u32 fd, u64 size, u64 offset)
+{
+    struct syscall_event *event;
+
+    if (!detailed_logging)
+        return;
+
+    event = bpf_ringbuf_reserve(&events, sizeof(*event), 0);
+    if (!event)
+        return;
+
+    event->timestamp = bpf_ktime_get_ns();
+    event->pid = bpf_get_current_pid_tgid() >> 32;
+    event->syscall_nr = syscall_nr;
+    event->fd = fd;
+    event->size = size;
+    event->offset = offset;
+    bpf_get_current_comm(&event->comm, sizeof(event->comm));
+
+    bpf_ringbuf_submit(event, 0);
+}
+
+// read syscall tracepoint
+SEC("kprobe/__x64_sys_read")
+int trace_read_entry(struct pt_regs *ctx)
+{
+    u32 syscall_nr = 0; // read
+    int fd = (int)PT_REGS_PARM1(ctx);
+    size_t count = (size_t)PT_REGS_PARM3(ctx);
+
+    update_stats(syscall_nr, count);
+    log_event(syscall_nr, fd, count, 0);
+
+    return 0;
+}
+
+// write syscall tracepoint
+SEC("kprobe/__x64_sys_write")
+int trace_write_entry(struct pt_regs *ctx)
+{
+    u32 syscall_nr = 1; // write
+    int fd = (int)PT_REGS_PARM1(ctx);
+    size_t count = (size_t)PT_REGS_PARM3(ctx);
+
+    update_stats(syscall_nr, count);
+    log_event(syscall_nr, fd, count, 0);
+
+    return 0;
+}
+
+// open syscall tracepoint
+SEC("kprobe/__x64_sys_open")
+int trace_open_entry(struct pt_regs *ctx)
+{
+    u32 syscall_nr = 2; // open
+
+    update_stats(syscall_nr, 1);
+    log_event(syscall_nr, -1, 1, 0);
+
+    return 0;
+}
+
+// openat syscall tracepoint
+SEC("kprobe/__x64_sys_openat")
+int trace_openat_entry(struct pt_regs *ctx)
+{
+    u32 syscall_nr = 257; // openat
+    int dfd = (int)PT_REGS_PARM1(ctx);
+
+    update_stats(syscall_nr, 1);
+    log_event(syscall_nr, dfd, 1, 0);
+
+    return 0;
+}
+
+// close syscall tracepoint
+SEC("kprobe/__x64_sys_close")
+int trace_close_entry(struct pt_regs *ctx)
+{
+    u32 syscall_nr = 3; // close
+    unsigned int fd = (unsigned int)PT_REGS_PARM1(ctx);
+
+    update_stats(syscall_nr, 1);
+    log_event(syscall_nr, fd, 1, 0);
+
+    return 0;
+}
+
+// lseek syscall tracepoint
+SEC("kprobe/__x64_sys_lseek")
+int trace_lseek_entry(struct pt_regs *ctx)
+{
+    u32 syscall_nr = 8; // lseek
+    unsigned int fd = (unsigned int)PT_REGS_PARM1(ctx);
+    off_t offset = (off_t)PT_REGS_PARM2(ctx);
+    u64 abs_offset = offset > 0 ? offset : -offset;
+
+    update_stats(syscall_nr, abs_offset);
+    log_event(syscall_nr, fd, abs_offset, offset);
+
+    return 0;
+}
+
+// pread64 syscall tracepoint
+SEC("kprobe/__x64_sys_pread64")
+int trace_pread_entry(struct pt_regs *ctx)
+{
+    u32 syscall_nr = 17; // pread64
+    unsigned int fd = (unsigned int)PT_REGS_PARM1(ctx);
+    size_t count = (size_t)PT_REGS_PARM3(ctx);
+    loff_t pos = (loff_t)PT_REGS_PARM4(ctx);
+
+    update_stats(syscall_nr, count);
+    log_event(syscall_nr, fd, count, pos);
+
+    return 0;
+}
+
+// pwrite64 syscall tracepoint
+SEC("kprobe/__x64_sys_pwrite64")
+int trace_pwrite_entry(struct pt_regs *ctx)
+{
+    u32 syscall_nr = 18; // pwrite64
+    unsigned int fd = (unsigned int)PT_REGS_PARM1(ctx);
+    size_t count = (size_t)PT_REGS_PARM3(ctx);
+    loff_t pos = (loff_t)PT_REGS_PARM4(ctx);
+
+    update_stats(syscall_nr, count);
+    log_event(syscall_nr, fd, count, pos);
+
+    return 0;
+}
+
+char _license[] SEC("license") = "GPL";
