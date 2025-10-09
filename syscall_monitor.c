@@ -8,10 +8,11 @@
 #include <sys/stat.h>
 #include <bpf/libbpf.h>
 #include <bpf/bpf.h>
+#include <stdint.h>
 #include "syscall_monitor.skel.h"
 
 #define MAX_COMM_LEN 16
-#define MAX_EVENTS 100000
+#define MAX_EVENTS 1000000  // Increased from 100000 to 1 million
 #define MAX_PROCESSES 1000
 
 // Syscall event structure (must match BPF program)
@@ -62,6 +63,7 @@ static struct syscall_event *events = NULL;
 static int event_count = 0;
 static int max_events = MAX_EVENTS;
 static bool detailed_logging = false;
+static int events_dropped = 0;
 
 // Syscall name mapping
 static const char* get_syscall_name(uint32_t nr) {
@@ -88,20 +90,41 @@ static void sig_handler(int sig) {
     running = false;
 }
 
-// Ring buffer event handler
+// Ring buffer event handler with dynamic reallocation
 static int handle_event(void *ctx, void *data, size_t data_sz) {
     const struct syscall_event *e = data;
     
-    if (event_count < max_events) {
-        memcpy(&events[event_count], e, sizeof(*e));
-        event_count++;
-    } else {
-        static int overflow_warned = 0;
-        if (!overflow_warned) {
-            fprintf(stderr, "\nWarning: Event buffer full (%d events), dropping new events\n", max_events);
-            overflow_warned = 1;
+    // Check if we need to grow the buffer
+    if (event_count >= max_events) {
+        int new_max = max_events * 2;  // Double the size
+        
+        // Limit maximum to prevent excessive memory usage (e.g., 10 million events = ~760MB)
+        if (new_max > 10000000) {
+            events_dropped++;
+            if (events_dropped == 1) {
+                fprintf(stderr, "\nWarning: Reached maximum event buffer size (10M events)\n");
+                fprintf(stderr, "Consider reducing monitoring duration or disabling detailed logging\n");
+            }
+            return 0;
         }
+        
+        struct syscall_event *new_events = realloc(events, new_max * sizeof(struct syscall_event));
+        if (!new_events) {
+            events_dropped++;
+            if (events_dropped == 1) {
+                fprintf(stderr, "\nWarning: Failed to allocate more memory for events\n");
+            }
+            return 0;
+        }
+        
+        events = new_events;
+        max_events = new_max;
+        fprintf(stderr, "\nInfo: Expanded event buffer to %d events (%.1f MB)\n", 
+                max_events, (max_events * sizeof(struct syscall_event)) / (1024.0 * 1024.0));
     }
+    
+    memcpy(&events[event_count], e, sizeof(*e));
+    event_count++;
     
     return 0;
 }
@@ -564,12 +587,28 @@ static int libbpf_print_fn(enum libbpf_print_level level, const char *format, va
     return 0;
 }
 
-int main() {
+int main(int argc, char **argv) {
     struct syscall_monitor_bpf *skel = NULL;
     struct ring_buffer *rb = NULL;
     int err;
     int duration = 10;
     char input[256];
+    
+    // Parse command line arguments
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--max-events") == 0 && i + 1 < argc) {
+            max_events = atoi(argv[i + 1]);
+            if (max_events < 1000) max_events = 1000;
+            if (max_events > 10000000) max_events = 10000000;
+            i++;
+        } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
+            printf("Usage: %s [OPTIONS]\n", argv[0]);
+            printf("Options:\n");
+            printf("  --max-events N    Set maximum events to capture (default: %d)\n", MAX_EVENTS);
+            printf("  --help, -h        Show this help message\n");
+            return 0;
+        }
+    }
     
     if (!check_requirements()) {
         return 1;
@@ -754,6 +793,11 @@ int main() {
     printf("Unique syscalls observed: %d\n", stat_count);
     printf("Unique processes: %d\n", process_count);
     printf("Events captured: %d\n", event_count);
+    if (events_dropped > 0) {
+        printf("Events dropped: %d (buffer limit reached)\n", events_dropped);
+    }
+    printf("Memory used for events: %.2f MB\n", 
+           (event_count * sizeof(struct syscall_event)) / (1024.0 * 1024.0));
     
     if (event_count > 1) {
         uint64_t start_time = events[0].timestamp;

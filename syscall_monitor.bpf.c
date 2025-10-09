@@ -37,11 +37,12 @@ struct {
 // Ring buffer for detailed events
 struct {
     __uint(type, BPF_MAP_TYPE_RINGBUF);
-    __uint(max_entries, 256 * 1024);
+    __uint(max_entries, 8 * 1024 * 1024);  // 8MB ring buffer (increased from 256KB)
 } events SEC(".maps");
 
 // Global flag to control detailed logging
 volatile const bool detailed_logging = true;
+volatile const unsigned int sampling_rate = 1;  // Sample 1 out of every N events (1 = capture all)
 
 static __always_inline void update_stats(u32 syscall_nr, u64 size)
 {
@@ -70,6 +71,14 @@ static __always_inline void log_event(u32 syscall_nr, u32 fd, u64 size, u64 offs
 
     if (!detailed_logging)
         return;
+
+    // Sampling: only log every Nth event
+    if (sampling_rate > 1) {
+        static __u32 counter = 0;
+        counter++;
+        if (counter % sampling_rate != 0)
+            return;
+    }
 
     event = bpf_ringbuf_reserve(&events, sizeof(*event), 0);
     if (!event)
