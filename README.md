@@ -446,3 +446,33 @@ Data exported to testsyscall.txt
 
 Monitoring complete!
 ```
+## Visualizing per process Syscall Stats
+
+```
+python syscall_visualizer.py <raw-json-output>
+```
+```
+Example Output:
+
+Loading data from syscall_analysis_20251009_050718.json...
+Loaded 4171320 events from 270 processes
+
+Generating visualizations with prefix: syscall_analysis_20251009_050718_viz
+============================================================
+Saved comprehensive dashboard to syscall_analysis_20251009_050718_viz_dashboard.png
+/home/ssgroot/ProfilingTools/syscall_tool/syscall_visualizer.py:175: UserWarning: Data has no positive values, and therefore cannot be log-scaled.
+Saved I/O size bucket analysis to syscall_analysis_20251009_050718_viz_size_buckets.png
+Saved FD analysis to syscall_analysis_20251009_050718_viz_fd_analysis.png
+Saved offset pattern analysis to syscall_analysis_20251009_050718_viz_offset_patterns.png
+============================================================
+All visualizations saved with prefix: syscall_analysis_20251009_050718_viz
+
+Generated files:
+  - syscall_analysis_20251009_050718_viz_dashboard.png (comprehensive overview)
+  - syscall_analysis_20251009_050718_viz_timeseries.png (I/O time series)
+  - syscall_analysis_20251009_050718_viz_size_buckets.png (size distribution)
+  - syscall_analysis_20251009_050718_viz_fd_analysis.png (file descriptor usage)
+  - syscall_analysis_20251009_050718_viz_offset_patterns.png (access patterns)
+
+Visualization complete!
+```
