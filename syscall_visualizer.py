@@ -54,23 +54,59 @@ class SyscallVisualizer:
             sys.exit(1)
     
     def get_io_size_bucket(self, size):
-        """Categorize I/O size into buckets"""
+        """Categorize I/O size into granular buckets"""
         if size == 0:
             return "0 B"
+        elif size == 1:
+            return "1 B"
+        elif size <= 4:
+            return "2-4 B"
+        elif size <= 8:
+            return "5-8 B"
+        elif size <= 16:
+            return "9-16 B"
+        elif size <= 32:
+            return "17-32 B"
+        elif size <= 64:
+            return "33-64 B"
+        elif size <= 128:
+            return "65-128 B"
+        elif size <= 256:
+            return "129-256 B"
+        elif size <= 512:
+            return "257-512 B"
         elif size < 1024:
-            return "< 1 KB"
+            return "513-1023 B"
+        elif size < 2 * 1024:
+            return "1-2 KB"
         elif size < 4 * 1024:
-            return "1-4 KB"
+            return "2-4 KB"
+        elif size < 8 * 1024:
+            return "4-8 KB"
         elif size < 16 * 1024:
-            return "4-16 KB"
+            return "8-16 KB"
+        elif size < 32 * 1024:
+            return "16-32 KB"
         elif size < 64 * 1024:
-            return "16-64 KB"
+            return "32-64 KB"
+        elif size < 128 * 1024:
+            return "64-128 KB"
         elif size < 256 * 1024:
-            return "64-256 KB"
+            return "128-256 KB"
+        elif size < 512 * 1024:
+            return "256-512 KB"
         elif size < 1024 * 1024:
-            return "256KB-1MB"
+            return "512KB-1MB"
+        elif size < 2 * 1024 * 1024:
+            return "1-2 MB"
+        elif size < 4 * 1024 * 1024:
+            return "2-4 MB"
+        elif size < 8 * 1024 * 1024:
+            return "4-8 MB"
+        elif size < 16 * 1024 * 1024:
+            return "8-16 MB"
         else:
-            return "> 1 MB"
+            return "> 16 MB"
     
     def get_top_processes(self, n=10):
         """Get top N processes by event count"""
@@ -158,15 +194,33 @@ class SyscallVisualizer:
         """Plot I/O size distribution in buckets for each process"""
         top_procs = self.get_top_processes(10)
         
-        fig, axes = plt.subplots(2, 1, figsize=(14, 10))
+        fig, axes = plt.subplots(3, 1, figsize=(16, 14))
         fig.suptitle('I/O Size Distribution by Process', fontsize=16, fontweight='bold')
         
-        # Prepare data for stacked bar chart
-        bucket_order = ["0 B", "< 1 KB", "1-4 KB", "4-16 KB", "16-64 KB", 
-                       "64-256 KB", "256KB-1MB", "> 1 MB"]
+        # Define all bucket orders
+        bucket_order_all = [
+            "0 B", "1 B", "2-4 B", "5-8 B", "9-16 B", "17-32 B", "33-64 B",
+            "65-128 B", "129-256 B", "257-512 B", "513-1023 B",
+            "1-2 KB", "2-4 KB", "4-8 KB", "8-16 KB", "16-32 KB", "32-64 KB",
+            "64-128 KB", "128-256 KB", "256-512 KB", "512KB-1MB",
+            "1-2 MB", "2-4 MB", "4-8 MB", "8-16 MB", "> 16 MB"
+        ]
+        
+        # Sub-1KB buckets for detailed view
+        bucket_order_small = [
+            "0 B", "1 B", "2-4 B", "5-8 B", "9-16 B", "17-32 B", "33-64 B",
+            "65-128 B", "129-256 B", "257-512 B", "513-1023 B"
+        ]
+        
+        # KB and larger buckets
+        bucket_order_large = [
+            "1-2 KB", "2-4 KB", "4-8 KB", "8-16 KB", "16-32 KB", "32-64 KB",
+            "64-128 KB", "128-256 KB", "256-512 KB", "512KB-1MB",
+            "1-2 MB", "2-4 MB", "4-8 MB", "8-16 MB", "> 16 MB"
+        ]
         
         process_names = []
-        bucket_data = {bucket: [] for bucket in bucket_order}
+        bucket_data_all = {bucket: [] for bucket in bucket_order_all}
         
         for pid, proc_data in top_procs:
             process_names.append(f"{proc_data['name']}\n({pid})")
@@ -178,60 +232,98 @@ class SyscallVisualizer:
                 bucket_counts[bucket] += 1
             
             # Add counts to data structure
-            for bucket in bucket_order:
-                bucket_data[bucket].append(bucket_counts.get(bucket, 0))
+            for bucket in bucket_order_all:
+                bucket_data_all[bucket].append(bucket_counts.get(bucket, 0))
         
-        # Plot 1: Stacked bar chart (count)
+        # Plot 1: Sub-1KB granular view (stacked bar)
         ax1 = axes[0]
         x_pos = np.arange(len(process_names))
         bottom = np.zeros(len(process_names))
         
-        colors = plt.cm.viridis(np.linspace(0, 1, len(bucket_order)))
+        colors_small = plt.cm.YlOrRd(np.linspace(0.2, 1, len(bucket_order_small)))
         
-        for idx, bucket in enumerate(bucket_order):
-            ax1.bar(x_pos, bucket_data[bucket], bottom=bottom, 
-                   label=bucket, color=colors[idx], edgecolor='black', linewidth=0.5)
-            bottom += bucket_data[bucket]
+        for idx, bucket in enumerate(bucket_order_small):
+            values = bucket_data_all[bucket]
+            if sum(values) > 0:  # Only plot if there's data
+                ax1.bar(x_pos, values, bottom=bottom, 
+                       label=bucket, color=colors_small[idx], 
+                       edgecolor='black', linewidth=0.5)
+                bottom += values
         
         ax1.set_xlabel('Process', fontsize=12)
         ax1.set_ylabel('Number of Events', fontsize=12)
-        ax1.set_title('Event Count by I/O Size Bucket', fontsize=13, fontweight='bold')
+        ax1.set_title('Sub-1KB I/O Size Distribution (Granular)', fontsize=13, fontweight='bold')
         ax1.set_xticks(x_pos)
         ax1.set_xticklabels(process_names, rotation=45, ha='right', fontsize=9)
-        ax1.legend(title='I/O Size', bbox_to_anchor=(1.05, 1), loc='upper left', fontsize=9)
+        ax1.legend(title='I/O Size', bbox_to_anchor=(1.05, 1), loc='upper left', 
+                  fontsize=8, ncol=1)
         ax1.grid(axis='y', alpha=0.3)
         
-        # Plot 2: Heatmap of I/O size buckets
+        # Plot 2: KB and larger sizes (stacked bar)
         ax2 = axes[1]
+        bottom = np.zeros(len(process_names))
+        
+        colors_large = plt.cm.viridis(np.linspace(0, 1, len(bucket_order_large)))
+        
+        for idx, bucket in enumerate(bucket_order_large):
+            values = bucket_data_all[bucket]
+            if sum(values) > 0:  # Only plot if there's data
+                ax2.bar(x_pos, values, bottom=bottom, 
+                       label=bucket, color=colors_large[idx], 
+                       edgecolor='black', linewidth=0.5)
+                bottom += values
+        
+        ax2.set_xlabel('Process', fontsize=12)
+        ax2.set_ylabel('Number of Events', fontsize=12)
+        ax2.set_title('KB-MB Range I/O Size Distribution', fontsize=13, fontweight='bold')
+        ax2.set_xticks(x_pos)
+        ax2.set_xticklabels(process_names, rotation=45, ha='right', fontsize=9)
+        ax2.legend(title='I/O Size', bbox_to_anchor=(1.05, 1), loc='upper left', 
+                  fontsize=8, ncol=1)
+        ax2.grid(axis='y', alpha=0.3)
+        
+        # Plot 3: Heatmap of all buckets (filtered to show only populated buckets)
+        ax3 = axes[2]
+        
+        # Filter out empty buckets for cleaner heatmap
+        populated_buckets = [b for b in bucket_order_all 
+                            if sum(bucket_data_all[b]) > 0]
         
         # Create matrix for heatmap
         heatmap_data = []
-        for bucket in bucket_order:
-            heatmap_data.append(bucket_data[bucket])
+        for bucket in populated_buckets:
+            heatmap_data.append(bucket_data_all[bucket])
         
-        heatmap_data = np.array(heatmap_data)
-        
-        im = ax2.imshow(heatmap_data, cmap='YlOrRd', aspect='auto')
-        
-        # Set ticks and labels
-        ax2.set_xticks(np.arange(len(process_names)))
-        ax2.set_yticks(np.arange(len(bucket_order)))
-        ax2.set_xticklabels(process_names, rotation=45, ha='right', fontsize=9)
-        ax2.set_yticklabels(bucket_order, fontsize=10)
-        
-        # Add colorbar
-        cbar = plt.colorbar(im, ax=ax2)
-        cbar.set_label('Event Count', rotation=270, labelpad=20, fontsize=11)
-        
-        # Add text annotations
-        for i in range(len(bucket_order)):
-            for j in range(len(process_names)):
-                text = ax2.text(j, i, int(heatmap_data[i, j]),
-                              ha="center", va="center", color="black", fontsize=8)
-        
-        ax2.set_title('I/O Size Distribution Heatmap', fontsize=13, fontweight='bold')
-        ax2.set_xlabel('Process', fontsize=12)
-        ax2.set_ylabel('I/O Size Bucket', fontsize=12)
+        if heatmap_data:
+            heatmap_data = np.array(heatmap_data)
+            
+            im = ax3.imshow(heatmap_data, cmap='YlOrRd', aspect='auto', 
+                           interpolation='nearest')
+            
+            # Set ticks and labels
+            ax3.set_xticks(np.arange(len(process_names)))
+            ax3.set_yticks(np.arange(len(populated_buckets)))
+            ax3.set_xticklabels(process_names, rotation=45, ha='right', fontsize=9)
+            ax3.set_yticklabels(populated_buckets, fontsize=8)
+            
+            # Add colorbar
+            cbar = plt.colorbar(im, ax=ax3)
+            cbar.set_label('Event Count', rotation=270, labelpad=20, fontsize=11)
+            
+            # Add text annotations (only for non-zero values)
+            for i in range(len(populated_buckets)):
+                for j in range(len(process_names)):
+                    value = int(heatmap_data[i, j])
+                    if value > 0:
+                        # Choose text color based on background
+                        text_color = "white" if value > heatmap_data.max() * 0.6 else "black"
+                        ax3.text(j, i, value, ha="center", va="center", 
+                               color=text_color, fontsize=7, fontweight='bold')
+            
+            ax3.set_title('Complete I/O Size Distribution Heatmap', 
+                         fontsize=13, fontweight='bold')
+            ax3.set_xlabel('Process', fontsize=12)
+            ax3.set_ylabel('I/O Size Bucket', fontsize=12)
         
         plt.tight_layout()
         
@@ -484,8 +576,11 @@ class SyscallVisualizer:
         # Plot 5: I/O size bucket distribution
         ax5 = fig.add_subplot(gs[1, 2])
         
-        bucket_order = ["< 1 KB", "1-4 KB", "4-16 KB", "16-64 KB", 
-                       "64-256 KB", "256KB-1MB", "> 1 MB"]
+        # Use more granular buckets for dashboard
+        bucket_order = ["1 B", "2-4 B", "5-8 B", "9-16 B", "17-32 B", "33-64 B",
+                       "65-128 B", "129-256 B", "257-512 B", "513-1023 B",
+                       "1-2 KB", "2-4 KB", "4-8 KB", "8-16 KB", "16-32 KB",
+                       "32-64 KB", "64-128 KB", "128-256 KB"]
         bucket_counts = defaultdict(int)
         
         for event in self.events:
@@ -493,16 +588,27 @@ class SyscallVisualizer:
             if bucket != "0 B":  # Exclude zero-size operations
                 bucket_counts[bucket] += 1
         
-        buckets = [b for b in bucket_order if bucket_counts[b] > 0]
-        counts = [bucket_counts[b] for b in buckets]
+        # Filter to top 12 buckets for readability
+        sorted_buckets = sorted(bucket_counts.items(), key=lambda x: x[1], reverse=True)[:12]
+        buckets = [b[0] for b in sorted_buckets]
+        counts = [b[1] for b in sorted_buckets]
         
-        colors_bucket = plt.cm.RdYlGn(np.linspace(0, 1, len(buckets)))
-        ax5.bar(range(len(buckets)), counts, color=colors_bucket, edgecolor='black')
-        ax5.set_xticks(range(len(buckets)))
-        ax5.set_xticklabels(buckets, rotation=45, ha='right', fontsize=9)
-        ax5.set_ylabel('Count', fontsize=10)
-        ax5.set_title('I/O Size Distribution', fontsize=11, fontweight='bold')
-        ax5.grid(axis='y', alpha=0.3)
+        if buckets:
+            colors_bucket = plt.cm.RdYlGn_r(np.linspace(0.2, 0.9, len(buckets)))
+            bars = ax5.bar(range(len(buckets)), counts, color=colors_bucket, edgecolor='black')
+            ax5.set_xticks(range(len(buckets)))
+            ax5.set_xticklabels(buckets, rotation=45, ha='right', fontsize=7)
+            ax5.set_ylabel('Count', fontsize=10)
+            ax5.set_title('Top I/O Size Buckets', fontsize=11, fontweight='bold')
+            ax5.grid(axis='y', alpha=0.3)
+            
+            # Add value labels on bars for top 5
+            for i, (bar, count) in enumerate(zip(bars[:5], counts[:5])):
+                ax5.text(bar.get_x() + bar.get_width()/2, bar.get_height(),
+                        f'{count}', ha='center', va='bottom', fontsize=7)
+        else:
+            ax5.text(0.5, 0.5, 'No I/O data', ha='center', va='center',
+                    transform=ax5.transAxes)
         
         # Plot 6-8: FD usage for top 3 processes
         for proc_idx in range(min(3, len(top_procs))):
