@@ -652,6 +652,467 @@ class SyscallVisualizer:
         
         plt.close()
     
+    def plot_syscall_io_distribution(self, output_file=None):
+        """Plot I/O size distribution per syscall per process"""
+        top_procs = self.get_top_processes(6)
+        
+        n_processes = len(top_procs)
+        n_cols = 2
+        n_rows = (n_processes + 1) // 2
+        
+        fig, axes = plt.subplots(n_rows, n_cols, figsize=(18, 6 * n_rows))
+        fig.suptitle('I/O Size Distribution by Syscall (Per Process)', 
+                    fontsize=16, fontweight='bold')
+        
+        if n_processes == 1:
+            axes = [[axes]]
+        elif n_rows == 1:
+            axes = [axes]
+        
+        # Define bucket order for this analysis (simplified for readability)
+        bucket_order = [
+            "1 B", "2-4 B", "5-8 B", "9-16 B", "17-32 B", "33-64 B",
+            "65-128 B", "129-256 B", "257-512 B", "513-1023 B",
+            "1-2 KB", "2-4 KB", "4-8 KB", "8-16 KB", "16-32 KB", "32-64 KB",
+            "64-128 KB", "128-256 KB", "256-512 KB", "512KB-1MB",
+            "1-2 MB", "2-4 MB", "> 4 MB"
+        ]
+        
+        for idx, (pid, proc_data) in enumerate(top_procs):
+            row = idx // n_cols
+            col = idx % n_cols
+            ax = axes[row][col]
+            
+            # Collect data: syscall -> bucket -> count
+            syscall_bucket_data = defaultdict(lambda: defaultdict(int))
+            
+            for event in proc_data['events']:
+                syscall = event['syscall_name']
+                bucket = self.get_io_size_bucket(event['size'])
+                if bucket != "0 B":  # Exclude zero-size
+                    syscall_bucket_data[syscall][bucket] += 1
+            
+            if not syscall_bucket_data:
+                ax.text(0.5, 0.5, 'No I/O data', ha='center', va='center',
+                       transform=ax.transAxes)
+                ax.set_title(f'{proc_data["name"]} (PID: {pid})', 
+                           fontsize=11, fontweight='bold')
+                continue
+            
+            # Get unique syscalls and filter to populated buckets
+            syscalls = sorted(syscall_bucket_data.keys())
+            populated_buckets = []
+            for bucket in bucket_order:
+                if any(syscall_bucket_data[sc][bucket] > 0 for sc in syscalls):
+                    populated_buckets.append(bucket)
+            
+            # Create matrix for heatmap
+            heatmap_data = []
+            for syscall in syscalls:
+                row_data = [syscall_bucket_data[syscall][bucket] 
+                           for bucket in populated_buckets]
+                heatmap_data.append(row_data)
+            
+            if heatmap_data and populated_buckets:
+                heatmap_data = np.array(heatmap_data)
+                
+                # Create heatmap
+                im = ax.imshow(heatmap_data, cmap='YlOrRd', aspect='auto',
+                             interpolation='nearest')
+                
+                # Set ticks and labels
+                ax.set_xticks(np.arange(len(populated_buckets)))
+                ax.set_yticks(np.arange(len(syscalls)))
+                ax.set_xticklabels(populated_buckets, rotation=45, ha='right', fontsize=7)
+                ax.set_yticklabels(syscalls, fontsize=9)
+                
+                # Add text annotations for significant values
+                max_val = heatmap_data.max()
+                for i in range(len(syscalls)):
+                    for j in range(len(populated_buckets)):
+                        value = int(heatmap_data[i, j])
+                        if value > 0 and value > max_val * 0.05:  # Show only significant values
+                            text_color = "white" if value > max_val * 0.6 else "black"
+                            ax.text(j, i, value, ha="center", va="center",
+                                  color=text_color, fontsize=6, fontweight='bold')
+                
+                ax.set_title(f'{proc_data["name"]} (PID: {pid})\n'
+                           f'Syscall vs I/O Size Distribution',
+                           fontsize=11, fontweight='bold')
+                ax.set_xlabel('I/O Size Bucket', fontsize=9)
+                ax.set_ylabel('Syscall', fontsize=9)
+                
+                # Add colorbar
+                cbar = plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+                cbar.set_label('Count', rotation=270, labelpad=15, fontsize=8)
+                cbar.ax.tick_params(labelsize=7)
+        
+        # Remove empty subplots
+        for idx in range(len(top_procs), n_rows * n_cols):
+            row = idx // n_cols
+            col = idx % n_cols
+            fig.delaxes(axes[row][col])
+        
+        plt.tight_layout()
+        
+        if output_file:
+            plt.savefig(output_file, dpi=300, bbox_inches='tight')
+            print(f"Saved syscall I/O distribution to {output_file}")
+        else:
+            plt.show()
+        
+        plt.close()
+    
+    def plot_syscall_timeseries_per_process(self, output_file=None):
+        """Plot syscall time series (count over time) for each process"""
+        top_procs = self.get_top_processes(6)
+        
+        n_processes = len(top_procs)
+        n_cols = 2
+        n_rows = (n_processes + 1) // 2
+        
+        fig, axes = plt.subplots(n_rows, n_cols, figsize=(18, 5 * n_rows))
+        fig.suptitle('Syscall Activity Timeline (Per Process)', 
+                    fontsize=16, fontweight='bold')
+        
+        if n_processes == 1:
+            axes = [[axes]]
+        elif n_rows == 1:
+            axes = [axes]
+        
+        for idx, (pid, proc_data) in enumerate(top_procs):
+            row = idx // n_cols
+            col = idx % n_cols
+            ax = axes[row][col]
+            
+            events = proc_data['events']
+            
+            if not events:
+                ax.text(0.5, 0.5, 'No events', ha='center', va='center',
+                       transform=ax.transAxes)
+                ax.set_title(f'{proc_data["name"]} (PID: {pid})', 
+                           fontsize=11, fontweight='bold')
+                continue
+            
+            # Group events by syscall
+            syscall_events = defaultdict(list)
+            for event in events:
+                syscall_events[event['syscall_name']].append(event)
+            
+            # Normalize timestamps
+            min_ts = min(e['timestamp_ms'] for e in events)
+            
+            # Create time bins (100ms bins)
+            max_ts = max(e['timestamp_ms'] for e in events)
+            duration_ms = max_ts - min_ts
+            n_bins = min(int(duration_ms / 100) + 1, 200)  # Max 200 bins
+            
+            # Get unique syscalls and assign colors
+            unique_syscalls = sorted(syscall_events.keys())
+            colors = plt.cm.tab10(np.linspace(0, 1, len(unique_syscalls)))
+            syscall_colors = {sc: colors[i] for i, sc in enumerate(unique_syscalls)}
+            
+            # Plot stacked area chart
+            time_bins = np.linspace(0, duration_ms / 1000.0, n_bins)  # Convert to seconds
+            bin_width = (duration_ms / 1000.0) / n_bins
+            
+            # Calculate counts per bin for each syscall
+            syscall_counts = {}
+            for syscall, sc_events in syscall_events.items():
+                counts = np.zeros(n_bins)
+                for event in sc_events:
+                    time_sec = (event['timestamp_ms'] - min_ts) / 1000.0
+                    bin_idx = int(time_sec / bin_width)
+                    if bin_idx < n_bins:
+                        counts[bin_idx] += 1
+                syscall_counts[syscall] = counts
+            
+            # Stack the areas
+            bottom = np.zeros(n_bins)
+            for syscall in unique_syscalls:
+                counts = syscall_counts[syscall]
+                ax.fill_between(time_bins, bottom, bottom + counts,
+                               label=syscall, color=syscall_colors[syscall],
+                               alpha=0.7, linewidth=0)
+                bottom += counts
+            
+            ax.set_xlabel('Time (seconds)', fontsize=10)
+            ax.set_ylabel('Syscall Count per Bin', fontsize=10)
+            ax.set_title(f'{proc_data["name"]} (PID: {pid})\n'
+                        f'Syscall Activity Over Time',
+                        fontsize=11, fontweight='bold')
+            ax.legend(fontsize=8, loc='upper left', ncol=2)
+            ax.grid(True, alpha=0.3, axis='y')
+            ax.set_xlim(0, duration_ms / 1000.0)
+        
+        # Remove empty subplots
+        for idx in range(len(top_procs), n_rows * n_cols):
+            row = idx // n_cols
+            col = idx % n_cols
+            fig.delaxes(axes[row][col])
+        
+        plt.tight_layout()
+        
+        if output_file:
+            plt.savefig(output_file, dpi=300, bbox_inches='tight')
+            print(f"Saved syscall timeline to {output_file}")
+        else:
+            plt.show()
+        
+        plt.close()
+    
+    def plot_detailed_syscall_analysis(self, output_file=None):
+        """Comprehensive syscall analysis: distribution + timeline combined"""
+        top_procs = self.get_top_processes(4)
+        
+        fig = plt.figure(figsize=(20, 14))
+        gs = gridspec.GridSpec(4, 2, figure=fig, hspace=0.35, wspace=0.3)
+        
+        fig.suptitle('Detailed Syscall Analysis by Process', 
+                    fontsize=18, fontweight='bold')
+        
+        bucket_order = [
+            "1 B", "2-4 B", "5-8 B", "9-16 B", "17-32 B", "33-64 B",
+            "65-128 B", "129-256 B", "257-512 B", "513-1023 B",
+            "1-2 KB", "2-4 KB", "4-8 KB", "8-16 KB", "16-32 KB", "32-64 KB"
+        ]
+        
+        for proc_idx, (pid, proc_data) in enumerate(top_procs):
+            # Left column: Syscall I/O size distribution (heatmap)
+            ax_heat = fig.add_subplot(gs[proc_idx, 0])
+            
+            # Collect syscall -> bucket data
+            syscall_bucket_data = defaultdict(lambda: defaultdict(int))
+            for event in proc_data['events']:
+                syscall = event['syscall_name']
+                bucket = self.get_io_size_bucket(event['size'])
+                if bucket != "0 B":
+                    syscall_bucket_data[syscall][bucket] += 1
+            
+            if syscall_bucket_data:
+                syscalls = sorted(syscall_bucket_data.keys())
+                populated_buckets = [b for b in bucket_order 
+                                   if any(syscall_bucket_data[sc][b] > 0 for sc in syscalls)]
+                
+                if populated_buckets:
+                    heatmap_data = np.array([[syscall_bucket_data[sc][b] 
+                                            for b in populated_buckets] 
+                                           for sc in syscalls])
+                    
+                    im = ax_heat.imshow(heatmap_data, cmap='YlOrRd', aspect='auto')
+                    ax_heat.set_xticks(np.arange(len(populated_buckets)))
+                    ax_heat.set_yticks(np.arange(len(syscalls)))
+                    ax_heat.set_xticklabels(populated_buckets, rotation=45, 
+                                          ha='right', fontsize=7)
+                    ax_heat.set_yticklabels(syscalls, fontsize=8)
+                    
+                    # Annotations
+                    max_val = heatmap_data.max()
+                    for i in range(len(syscalls)):
+                        for j in range(len(populated_buckets)):
+                            value = int(heatmap_data[i, j])
+                            if value > max_val * 0.1:
+                                color = "white" if value > max_val * 0.6 else "black"
+                                ax_heat.text(j, i, value, ha="center", va="center",
+                                           color=color, fontsize=6, fontweight='bold')
+                    
+                    plt.colorbar(im, ax=ax_heat, fraction=0.046, pad=0.04)
+            
+            ax_heat.set_title(f'{proc_data["name"]} (PID: {pid})\n'
+                            f'I/O Size by Syscall',
+                            fontsize=10, fontweight='bold')
+            ax_heat.set_xlabel('I/O Size', fontsize=9)
+            ax_heat.set_ylabel('Syscall', fontsize=9)
+            
+            # Right column: Syscall timeline
+            ax_time = fig.add_subplot(gs[proc_idx, 1])
+            
+            events = proc_data['events']
+            if events:
+                syscall_events = defaultdict(list)
+                for event in events:
+                    syscall_events[event['syscall_name']].append(event)
+                
+                min_ts = min(e['timestamp_ms'] for e in events)
+                max_ts = max(e['timestamp_ms'] for e in events)
+                duration_ms = max_ts - min_ts
+                
+                n_bins = min(int(duration_ms / 100) + 1, 150)
+                time_bins = np.linspace(0, duration_ms / 1000.0, n_bins)
+                bin_width = (duration_ms / 1000.0) / n_bins
+                
+                unique_syscalls = sorted(syscall_events.keys())
+                colors = plt.cm.tab10(np.linspace(0, 1, len(unique_syscalls)))
+                
+                bottom = np.zeros(n_bins)
+                for sc_idx, syscall in enumerate(unique_syscalls):
+                    counts = np.zeros(n_bins)
+                    for event in syscall_events[syscall]:
+                        time_sec = (event['timestamp_ms'] - min_ts) / 1000.0
+                        bin_idx = int(time_sec / bin_width)
+                        if bin_idx < n_bins:
+                            counts[bin_idx] += 1
+                    
+                    ax_time.fill_between(time_bins, bottom, bottom + counts,
+                                        label=syscall, color=colors[sc_idx],
+                                        alpha=0.7)
+                    bottom += counts
+                
+                ax_time.legend(fontsize=7, loc='upper left', ncol=2)
+                ax_time.grid(True, alpha=0.3, axis='y')
+            
+            ax_time.set_title(f'{proc_data["name"]} (PID: {pid})\n'
+                            f'Syscall Timeline',
+                            fontsize=10, fontweight='bold')
+            ax_time.set_xlabel('Time (seconds)', fontsize=9)
+            ax_time.set_ylabel('Syscalls per Bin', fontsize=9)
+        
+        if output_file:
+            plt.savefig(output_file, dpi=300, bbox_inches='tight')
+            print(f"Saved detailed syscall analysis to {output_file}")
+        else:
+            plt.show()
+        
+        plt.close()
+        """Create a comprehensive dashboard with multiple visualizations"""
+        top_procs = self.get_top_processes(4)
+        
+        fig = plt.figure(figsize=(20, 12))
+        gs = gridspec.GridSpec(3, 3, figure=fig, hspace=0.3, wspace=0.3)
+        
+        fig.suptitle('Syscall Monitor Comprehensive Dashboard', 
+                    fontsize=18, fontweight='bold', y=0.995)
+        
+        # Plot 1: Overall syscall distribution (top-left, spanning 2 cols)
+        ax1 = fig.add_subplot(gs[0, :2])
+        syscall_counts = defaultdict(int)
+        for event in self.events:
+            syscall_counts[event['syscall_name']] += 1
+        
+        sorted_syscalls = sorted(syscall_counts.items(), key=lambda x: x[1], reverse=True)[:10]
+        syscalls, counts = zip(*sorted_syscalls)
+        
+        colors_sc = plt.cm.Set3(np.linspace(0, 1, len(syscalls)))
+        bars = ax1.barh(syscalls, counts, color=colors_sc, edgecolor='black', linewidth=1)
+        ax1.set_xlabel('Count', fontsize=11, fontweight='bold')
+        ax1.set_title('Top 10 Syscalls (All Processes)', fontsize=12, fontweight='bold')
+        ax1.grid(axis='x', alpha=0.3)
+        
+        # Add value labels
+        for bar, count in zip(bars, counts):
+            ax1.text(bar.get_width(), bar.get_y() + bar.get_height()/2, 
+                    f' {count}', va='center', fontsize=9)
+        
+        # Plot 2: Process activity (top-right)
+        ax2 = fig.add_subplot(gs[0, 2])
+        proc_events = [(proc_data['name'], len(proc_data['events'])) 
+                      for pid, proc_data in self.get_top_processes(8)]
+        proc_names, event_counts = zip(*proc_events)
+        
+        colors_proc = plt.cm.viridis(np.linspace(0, 1, len(proc_names)))
+        ax2.pie(event_counts, labels=proc_names, autopct='%1.1f%%',
+               colors=colors_proc, startangle=90, textprops={'fontsize': 8})
+        ax2.set_title('Process Activity Distribution', fontsize=12, fontweight='bold')
+        
+        # Plot 3 & 4: Time series for top 2 processes
+        for proc_idx in range(min(2, len(top_procs))):
+            pid, proc_data = top_procs[proc_idx]
+            ax = fig.add_subplot(gs[1, proc_idx])
+            
+            events = proc_data['events']
+            timestamps = [e['timestamp_ms'] for e in events]
+            sizes = [e['size'] for e in events]
+            
+            if timestamps:
+                min_ts = min(timestamps)
+                timestamps = [(t - min_ts) / 1000.0 for t in timestamps]
+            
+            ax.scatter(timestamps, sizes, alpha=0.5, s=15, color='darkblue')
+            ax.set_xlabel('Time (s)', fontsize=10)
+            ax.set_ylabel('I/O Size (bytes)', fontsize=10)
+            ax.set_title(f'{proc_data["name"]} (PID: {pid})', fontsize=11, fontweight='bold')
+            ax.set_yscale('log')
+            ax.grid(True, alpha=0.3)
+        
+        # Plot 5: I/O size bucket distribution
+        ax5 = fig.add_subplot(gs[1, 2])
+        
+        # Use more granular buckets for dashboard
+        bucket_order = ["1 B", "2-4 B", "5-8 B", "9-16 B", "17-32 B", "33-64 B",
+                       "65-128 B", "129-256 B", "257-512 B", "513-1023 B",
+                       "1-2 KB", "2-4 KB", "4-8 KB", "8-16 KB", "16-32 KB",
+                       "32-64 KB", "64-128 KB", "128-256 KB"]
+        bucket_counts = defaultdict(int)
+        
+        for event in self.events:
+            bucket = self.get_io_size_bucket(event['size'])
+            if bucket != "0 B":  # Exclude zero-size operations
+                bucket_counts[bucket] += 1
+        
+        # Filter to top 12 buckets for readability
+        sorted_buckets = sorted(bucket_counts.items(), key=lambda x: x[1], reverse=True)[:12]
+        buckets = [b[0] for b in sorted_buckets]
+        counts = [b[1] for b in sorted_buckets]
+        
+        if buckets:
+            colors_bucket = plt.cm.RdYlGn_r(np.linspace(0.2, 0.9, len(buckets)))
+            bars = ax5.bar(range(len(buckets)), counts, color=colors_bucket, edgecolor='black')
+            ax5.set_xticks(range(len(buckets)))
+            ax5.set_xticklabels(buckets, rotation=45, ha='right', fontsize=7)
+            ax5.set_ylabel('Count', fontsize=10)
+            ax5.set_title('Top I/O Size Buckets', fontsize=11, fontweight='bold')
+            ax5.grid(axis='y', alpha=0.3)
+            
+            # Add value labels on bars for top 5
+            for i, (bar, count) in enumerate(zip(bars[:5], counts[:5])):
+                ax5.text(bar.get_x() + bar.get_width()/2, bar.get_height(),
+                        f'{count}', ha='center', va='bottom', fontsize=7)
+        else:
+            ax5.text(0.5, 0.5, 'No I/O data', ha='center', va='center',
+                    transform=ax5.transAxes)
+        
+        # Plot 6-8: FD usage for top 3 processes
+        for proc_idx in range(min(3, len(top_procs))):
+            pid, proc_data = top_procs[proc_idx]
+            ax = fig.add_subplot(gs[2, proc_idx])
+            
+            fd_stats = defaultdict(int)
+            for event in proc_data['events']:
+                fd = event.get('fd')
+                if fd is not None and fd != 4294967295 and fd < 1000:
+                    fd_stats[fd] += 1
+            
+            if fd_stats:
+                sorted_fds = sorted(fd_stats.items(), key=lambda x: x[1], reverse=True)[:10]
+                fds, counts = zip(*sorted_fds)
+                
+                colors_fd = plt.cm.plasma(np.linspace(0, 1, len(fds)))
+                ax.bar([str(fd) for fd in fds], counts, color=colors_fd, edgecolor='black')
+                ax.set_xlabel('File Descriptor', fontsize=10)
+                ax.set_ylabel('Operations', fontsize=10)
+                ax.set_title(f'{proc_data["name"]} - FD Usage', fontsize=10, fontweight='bold')
+                ax.grid(axis='y', alpha=0.3)
+                ax.tick_params(axis='x', rotation=45, labelsize=8)
+            else:
+                ax.text(0.5, 0.5, 'No FD data', ha='center', va='center', 
+                       transform=ax.transAxes)
+                ax.set_title(f'{proc_data["name"]} - FD Usage', fontsize=10, fontweight='bold')
+        
+        # Add metadata text
+        metadata_text = f"Total Events: {len(self.events)} | "
+        metadata_text += f"Processes: {len(self.processes)} | "
+        metadata_text += f"Duration: {self.data['metadata'].get('monitoring_duration', 'N/A')}s"
+        fig.text(0.5, 0.01, metadata_text, ha='center', fontsize=10, 
+                style='italic', bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.3))
+        
+        if output_file:
+            plt.savefig(output_file, dpi=300, bbox_inches='tight')
+            print(f"Saved comprehensive dashboard to {output_file}")
+        else:
+            plt.show()
+        
+        plt.close()
+    
     def generate_all_plots(self, output_prefix=None):
         """Generate all visualization plots"""
         if output_prefix is None:
@@ -667,6 +1128,9 @@ class SyscallVisualizer:
         self.plot_io_size_buckets(f"{output_prefix}_size_buckets.png")
         self.plot_fd_analysis(f"{output_prefix}_fd_analysis.png")
         self.plot_offset_patterns(f"{output_prefix}_offset_patterns.png")
+        self.plot_syscall_io_distribution(f"{output_prefix}_syscall_io_dist.png")
+        self.plot_syscall_timeseries_per_process(f"{output_prefix}_syscall_timeline.png")
+        self.plot_detailed_syscall_analysis(f"{output_prefix}_syscall_detailed.png")
         
         print("=" * 60)
         print(f"All visualizations saved with prefix: {output_prefix}")
@@ -676,6 +1140,10 @@ class SyscallVisualizer:
         print(f"  - {output_prefix}_size_buckets.png (size distribution)")
         print(f"  - {output_prefix}_fd_analysis.png (file descriptor usage)")
         print(f"  - {output_prefix}_offset_patterns.png (access patterns)")
+        print(f"  - {output_prefix}_syscall_io_dist.png (syscall I/O size distribution)")
+        print(f"  - {output_prefix}_syscall_timeline.png (syscall activity timeline)")
+        print(f"  - {output_prefix}_syscall_detailed.png (detailed syscall analysis)")
+
 
 
 def main():
