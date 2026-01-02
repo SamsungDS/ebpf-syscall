@@ -206,4 +206,34 @@ int trace_pwrite_entry(struct pt_regs *ctx)
     return 0;
 }
 
+// mmap syscall tracepoint
+SEC("kprobe/__x64_sys_mmap")
+int trace_mmap_entry(struct pt_regs *ctx)
+{
+    u32 syscall_nr = 9; // mmap syscall
+    unsigned int fd = (unsigned int)PT_REGS_PARM5(ctx);
+    size_t length = (size_t)PT_REGS_PARM2(ctx);
+    loff_t offset = (loff_t)PT_REGS_PARM6(ctx);
+
+    update_stats(syscall_nr, length);
+    log_event(syscall_nr, fd, length, offset);
+
+    return 0;
+}
+
+//munmap syscall tracepoint
+SEC("kprobe/__x64_sys_munmap")
+int trace_munmap_entry(struct pt_regs *ctx)
+{
+    u32 syscall_nr = 11; //munmap syscall
+    unsigned int fd = (unsigned int)PT_REGS_PARM5(ctx);
+    size_t length = (size_t)PT_REGS_PARM2(ctx);
+    loff_t offset = (loff_t)PT_REGS_PARM6(ctx);
+
+    update_stats(syscall_nr, length);
+    log_event(syscall_nr, fd, length, offset);
+
+    return 0;
+}
+
 char _license[] SEC("license") = "GPL";

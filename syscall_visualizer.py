@@ -445,7 +445,7 @@ class SyscallVisualizer:
             
             # Collect offset data for positioned I/O syscalls
             positioned_io = [e for e in proc_data['events'] 
-                           if e['syscall_name'] in ['pread64', 'pwrite64', 'lseek'] 
+                           if e['syscall_name'] in ['pread64', 'pwrite64', 'lseek', 'mmap' , 'munmap']
                            and e.get('offset', 0) != 0]
             
             if not positioned_io:
