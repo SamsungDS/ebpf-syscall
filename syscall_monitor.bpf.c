@@ -249,7 +249,6 @@ int trace_readv_entry(struct pt_regs *ctx)
     log_event(syscall_nr, fd, count, pos);
 
     return 0;
-
 }
 
 // writev syscall tracepoint
@@ -265,7 +264,19 @@ int trace_writev_entry(struct pt_regs *ctx)
     log_event(syscall_nr, fd, count, pos);
 
     return 0;
+}
 
+// fsync syscall tracepoint
+SEC("kprobe/__x64_sys_fsync")
+int trace_fsync_entry(struct pt_regs *ctx)
+{
+    u32 syscall_nr = 74; // fsync
+    unsigned int fd = (unsigned int)PT_REGS_PARM1(ctx);
+
+    update_stats(syscall_nr, 1);
+    log_event(syscall_nr, fd, 1, 0);
+
+    return 0;
 }
 
 char _license[] SEC("license") = "GPL";

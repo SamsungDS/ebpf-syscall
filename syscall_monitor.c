@@ -79,6 +79,7 @@ static const char* get_syscall_name(uint32_t nr) {
         case 18: return "pwrite64";
 	case 19: return "readv";
 	case 20: return "writev";
+	case 74: return "fsync";
         case 257: return "openat";
         default: {
             static char buf[32];
