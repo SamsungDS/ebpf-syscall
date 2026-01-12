@@ -206,4 +206,77 @@ int trace_pwrite_entry(struct pt_regs *ctx)
     return 0;
 }
 
+// mmap syscall tracepoint
+SEC("kprobe/__x64_sys_mmap")
+int trace_mmap_entry(struct pt_regs *ctx)
+{
+    u32 syscall_nr = 9; // mmap syscall
+    unsigned int fd = (unsigned int)PT_REGS_PARM5(ctx);
+    size_t length = (size_t)PT_REGS_PARM2(ctx);
+    loff_t offset = (loff_t)PT_REGS_PARM6(ctx);
+
+    update_stats(syscall_nr, length);
+    log_event(syscall_nr, fd, length, offset);
+
+    return 0;
+}
+
+//munmap syscall tracepoint
+SEC("kprobe/__x64_sys_munmap")
+int trace_munmap_entry(struct pt_regs *ctx)
+{
+    u32 syscall_nr = 11; //munmap syscall
+    unsigned int fd = (unsigned int)PT_REGS_PARM5(ctx);
+    size_t length = (size_t)PT_REGS_PARM2(ctx);
+    loff_t offset = (loff_t)PT_REGS_PARM6(ctx);
+
+    update_stats(syscall_nr, length);
+    log_event(syscall_nr, fd, length, offset);
+
+    return 0;
+}
+
+// readv syscall tracepoint
+SEC("kprobe/__x64_sys_readv")
+int trace_readv_entry(struct pt_regs *ctx)
+{
+    u32 syscall_nr = 19; // readv
+    unsigned int fd = (unsigned int)PT_REGS_PARM1(ctx);
+    size_t count = (size_t)PT_REGS_PARM3(ctx);
+    loff_t pos = (loff_t)PT_REGS_PARM4(ctx);
+
+    update_stats(syscall_nr, count);
+    log_event(syscall_nr, fd, count, pos);
+
+    return 0;
+}
+
+// writev syscall tracepoint
+SEC("kprobe/__x64_sys_writev")
+int trace_writev_entry(struct pt_regs *ctx)
+{
+    u32 syscall_nr = 20; // writev
+    unsigned int fd = (unsigned int)PT_REGS_PARM1(ctx);
+    size_t count = (size_t)PT_REGS_PARM3(ctx);
+    loff_t pos = (loff_t)PT_REGS_PARM4(ctx);
+
+    update_stats(syscall_nr, count);
+    log_event(syscall_nr, fd, count, pos);
+
+    return 0;
+}
+
+// fsync syscall tracepoint
+SEC("kprobe/__x64_sys_fsync")
+int trace_fsync_entry(struct pt_regs *ctx)
+{
+    u32 syscall_nr = 74; // fsync
+    unsigned int fd = (unsigned int)PT_REGS_PARM1(ctx);
+
+    update_stats(syscall_nr, 1);
+    log_event(syscall_nr, fd, 1, 0);
+
+    return 0;
+}
+
 char _license[] SEC("license") = "GPL";
