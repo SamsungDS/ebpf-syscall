@@ -1343,6 +1343,617 @@ class PageMonitor:
 
 
 # =============================================================================
+# Step 4b: PageMon Visualizer (C-accelerated with terminal rendering)
+# =============================================================================
+
+class PageMonVisualizer:
+    """
+    C-accelerated page-level memory visualizer with terminal rendering.
+
+    Uses a compiled C helper (pagemon_viz) for fast bulk pagemap scanning,
+    soft-dirty tracking, and structured JSON output. Python renders the
+    output as terminal heatmaps, timelines, and region summaries.
+
+    Visualization modes:
+      snapshot   – one-shot page state scan (present/dirty/swapped)
+      softdirty  – soft-dirty clear+poll cycle with per-page bitmap
+      heatmap    – block-level dirty density grid (terminal heatmap)
+      timeline   – dirty page rate over time (ASCII sparkline)
+      region_all – scan all file-backed regions for a PID
+    """
+
+    # Terminal heatmap color palette (ANSI 256-color)
+    # Maps dirty density 0-100% to color codes
+    HEAT_CHARS = " ░▒▓█"
+    HEAT_COLORS = [
+        "\033[38;5;236m",   # 0%   — dark gray (cold)
+        "\033[38;5;22m",    # ~20% — dark green
+        "\033[38;5;28m",    # ~40% — green
+        "\033[38;5;178m",   # ~60% — yellow
+        "\033[38;5;208m",   # ~80% — orange
+        "\033[38;5;196m",   # 100% — red (hot)
+    ]
+    RESET = "\033[0m"
+
+    # C source file path (compiled on first use)
+    C_SOURCE_FILENAME = "pagemon_viz.c"
+    C_BINARY_NAME = "pagemon_viz"
+
+    def __init__(self, build_dir: str = "/tmp/io_path_observer"):
+        self.build_dir = Path(build_dir)
+        self._binary_path = None
+
+    def _find_c_source(self) -> Optional[Path]:
+        """Find pagemon_viz.c — check script dir, working dir, build dir."""
+        candidates = [
+            Path(__file__).parent / self.C_SOURCE_FILENAME,
+            Path.cwd() / self.C_SOURCE_FILENAME,
+            self.build_dir / self.C_SOURCE_FILENAME,
+        ]
+        for p in candidates:
+            if p.exists():
+                return p
+        return None
+
+    def _write_embedded_c_source(self) -> Path:
+        """Write the embedded C source to build_dir if not found on disk."""
+        self.build_dir.mkdir(parents=True, exist_ok=True)
+        src_path = self.build_dir / self.C_SOURCE_FILENAME
+
+        # Read from adjacent file if it exists
+        adjacent = Path(__file__).parent / self.C_SOURCE_FILENAME
+        if adjacent.exists():
+            return adjacent
+
+        # Otherwise generate a minimal inline version
+        print(f"[pagemon_viz] C source not found — writing to {src_path}")
+        print(f"[pagemon_viz] For full version, place {self.C_SOURCE_FILENAME} "
+              f"next to {Path(__file__).name}")
+        return src_path
+
+    def ensure_compiled(self) -> bool:
+        """Compile pagemon_viz.c if needed. Returns True if binary is ready."""
+        if self._binary_path and self._binary_path.exists():
+            return True
+
+        binary = self.build_dir / self.C_BINARY_NAME
+        self.build_dir.mkdir(parents=True, exist_ok=True)
+
+        # Check if already compiled and up-to-date
+        src_path = self._find_c_source()
+        if not src_path:
+            src_path = self._write_embedded_c_source()
+            if not src_path or not src_path.exists():
+                print("[pagemon_viz] ERROR: Cannot find pagemon_viz.c")
+                print(f"  Place it in: {Path(__file__).parent}/")
+                return False
+
+        if binary.exists():
+            # Check if source is newer than binary
+            if src_path.stat().st_mtime <= binary.stat().st_mtime:
+                self._binary_path = binary
+                return True
+
+        # Compile
+        print(f"[pagemon_viz] Compiling {src_path} → {binary} ...")
+        result = subprocess.run(
+            ["gcc", "-O2", "-Wall", "-o", str(binary), str(src_path), "-lm"],
+            capture_output=True, text=True,
+        )
+        if result.returncode != 0:
+            print(f"[pagemon_viz] Compilation FAILED:")
+            print(result.stderr)
+            return False
+
+        print(f"[pagemon_viz] Build OK: {binary}")
+        self._binary_path = binary
+        return True
+
+    def _run_c_tool(self, pid: int, mode: int, start: int = 0, end: int = 0,
+                     interval_ms: int = 1000, count: int = 10,
+                     block_kb: int = 0) -> Optional[dict]:
+        """Run the C pagemon_viz tool and parse JSON output."""
+        if not self.ensure_compiled():
+            return None
+
+        cmd = [
+            "sudo", str(self._binary_path),
+            str(pid), str(mode),
+            hex(start), hex(end),
+            str(interval_ms), str(count),
+            str(block_kb),
+        ]
+
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+        except subprocess.TimeoutExpired:
+            print("[pagemon_viz] Timeout waiting for C tool")
+            return None
+
+        if result.returncode != 0:
+            stderr = result.stderr.strip()
+            if stderr:
+                print(f"[pagemon_viz] {stderr}")
+            return None
+
+        try:
+            return json.loads(result.stdout)
+        except json.JSONDecodeError as e:
+            print(f"[pagemon_viz] JSON parse error: {e}")
+            if result.stdout[:200]:
+                print(f"  Raw output: {result.stdout[:200]}...")
+            return None
+
+    # ═══════════════════════════════════════════════════════════════════
+    # Public visualization methods
+    # ═══════════════════════════════════════════════════════════════════
+
+    def snapshot(self, pid: int, start: int, end: int):
+        """Mode 0: One-shot page state scan with visual map."""
+        print(f"\n  ┌── Page Snapshot: PID {pid} "
+              f"[{start:#x}–{end:#x}] ──")
+
+        data = self._run_c_tool(pid, mode=0, start=start, end=end)
+        if not data:
+            print("  │  (pagemon_viz unavailable — skipping visualization)")
+            print("  └──")
+            return
+
+        total = data.get("total_pages", 0)
+        present = data.get("present", 0)
+        dirty = data.get("dirty", 0)
+        swapped = data.get("swapped", 0)
+
+        print(f"  │  Total pages:  {total:,} ({total * 4:,} KB)")
+        print(f"  │  Present:      {present:,} ({data.get('resident_pct', 0):.1f}%)")
+        print(f"  │  Dirty:        {dirty:,} ({data.get('dirty_pct', 0):.1f}%)")
+        print(f"  │  Swapped:      {swapped:,}")
+        print(f"  │")
+
+        # Render page state map (compact 80-col)
+        pages = data.get("pages", "")
+        if isinstance(pages, list):
+            pages = "".join(str(p) for p in pages)
+        if pages:
+            self._render_page_map(pages)
+        print(f"  └──\n")
+
+    def heatmap(self, pid: int, start: int, end: int,
+                interval_ms: int = 500, iterations: int = 10):
+        """Mode 2: Block-level dirty density heatmap."""
+        size_kb = (end - start) // 1024
+        print(f"\n  ┌── Dirty Page Heatmap: PID {pid} ──")
+        print(f"  │  Region: {start:#x}–{end:#x} ({size_kb:,} KB)")
+        print(f"  │  Polling: {interval_ms}ms × {iterations} iterations")
+
+        data = self._run_c_tool(pid, mode=2, start=start, end=end,
+                                 interval_ms=interval_ms, count=iterations)
+        if not data:
+            print("  │  (pagemon_viz unavailable — skipping visualization)")
+            print("  └──")
+            return
+
+        cols = data.get("cols", 64)
+        block_size_kb = data.get("block_size_kb", 0)
+        print(f"  │  Grid: {cols}×N blocks, {block_size_kb} KB/block")
+
+        snapshots = data.get("snapshots", [])
+        for snap in snapshots:
+            dirty_kb = snap.get("dirty_kb", 0)
+            total_dirty = snap.get("total_dirty", 0)
+            blocks = snap.get("blocks", [])
+
+            print(f"  │")
+            print(f"  │  Iteration {snap['iter']}: "
+                  f"{total_dirty} dirty pages ({dirty_kb} KB)")
+
+            self._render_heatmap_grid(blocks, cols)
+
+        # Legend
+        print(f"  │")
+        print(f"  │  Legend: ", end="")
+        for i, ch in enumerate(self.HEAT_CHARS):
+            pct = i * 20
+            color = self.HEAT_COLORS[min(i, len(self.HEAT_COLORS) - 1)]
+            print(f"{color}{ch}{self.RESET}={pct}%  ", end="")
+        print()
+        print(f"  └──\n")
+
+    def timeline(self, pid: int, start: int, end: int,
+                 interval_ms: int = 500, iterations: int = 20):
+        """Mode 3: Dirty page rate over time with ASCII sparkline."""
+        size_kb = (end - start) // 1024
+        print(f"\n  ┌── Dirty Page Timeline: PID {pid} ──")
+        print(f"  │  Region: {start:#x}–{end:#x} ({size_kb:,} KB)")
+        print(f"  │  Sampling: {interval_ms}ms × {iterations}")
+
+        data = self._run_c_tool(pid, mode=3, start=start, end=end,
+                                 interval_ms=interval_ms, count=iterations)
+        if not data:
+            print("  │  (pagemon_viz unavailable — skipping visualization)")
+            print("  └──")
+            return
+
+        samples = data.get("samples", [])
+        if not samples:
+            print("  │  No samples collected")
+            print("  └──")
+            return
+
+        # Extract dirty counts for sparkline
+        dirty_counts = [s.get("dirty", 0) for s in samples]
+        rates = [s.get("dirty_rate_kb_s", 0) for s in samples]
+        max_dirty = max(dirty_counts) if dirty_counts else 1
+
+        # Table
+        print(f"  │")
+        print(f"  │  {'#':>4} {'Elapsed':>8} {'Dirty':>8} "
+              f"{'KB':>8} {'Rate KB/s':>10} {'Sparkline'}")
+        print(f"  │  {'─' * 62}")
+
+        spark_chars = "▁▂▃▄▅▆▇█"
+        for s in samples:
+            dirty = s.get("dirty", 0)
+            elapsed = s.get("elapsed_ms", 0)
+            dk = s.get("dirty_kb", 0)
+            rate = s.get("dirty_rate_kb_s", 0)
+            # Sparkline bar
+            bar_len = int(40 * dirty / max_dirty) if max_dirty > 0 else 0
+            si = min(len(spark_chars) - 1,
+                     int((len(spark_chars) - 1) * dirty / max_dirty)) if max_dirty > 0 else 0
+            color = self.HEAT_COLORS[min(si, len(self.HEAT_COLORS) - 1)]
+            bar = f"{color}{spark_chars[si] * bar_len}{self.RESET}"
+            print(f"  │  {s['iter']:>4} {elapsed:>7}ms {dirty:>8} "
+                  f"{dk:>7}K {rate:>9.0f} {bar}")
+
+        # Summary
+        avg_dirty = sum(dirty_counts) / len(dirty_counts) if dirty_counts else 0
+        avg_rate = sum(rates) / len(rates) if rates else 0
+        peak_rate = max(rates) if rates else 0
+        print(f"  │")
+        print(f"  │  Summary: avg={avg_dirty:.0f} dirty pages/sample, "
+              f"avg_rate={avg_rate:.0f} KB/s, peak={peak_rate:.0f} KB/s")
+        print(f"  └──\n")
+
+    def region_scan(self, pid: int, interval_ms: int = 1000, iterations: int = 5):
+        """Mode 4: Scan all file-backed regions for a PID."""
+        print(f"\n  ┌── Region Scan: PID {pid} (all file-backed mappings) ──")
+
+        data = self._run_c_tool(pid, mode=4, interval_ms=interval_ms,
+                                 count=iterations)
+        if not data:
+            print("  │  (pagemon_viz unavailable — skipping visualization)")
+            print("  └──")
+            return
+
+        regions = data.get("regions", [])
+        if not regions:
+            print("  │  No file-backed regions found")
+            print("  └──")
+            return
+
+        print(f"  │  Found {len(regions)} workload region(s):")
+        print(f"  │")
+        print(f"  │  {'Start':>16}  {'End':>16}  {'Perm':>5}  "
+              f"{'Size':>8}  {'Resid%':>6}  {'Dirty%':>6}  {'Path'}")
+        print(f"  │  {'─' * 78}")
+
+        for r in regions:
+            start = r.get("start", "")
+            end = r.get("end", "")
+            perms = r.get("perms", "")
+            path = r.get("pathname", "")
+            size_kb = r.get("size_kb", 0)
+            resident_pct = r.get("resident_pct", 0)
+            dirty_pct = r.get("dirty_pct", 0)
+
+            # Color-code dirty percentage
+            color = self.RESET
+            if dirty_pct > 75:
+                color = self.HEAT_COLORS[5]
+            elif dirty_pct > 50:
+                color = self.HEAT_COLORS[4]
+            elif dirty_pct > 25:
+                color = self.HEAT_COLORS[3]
+            elif dirty_pct > 5:
+                color = self.HEAT_COLORS[2]
+
+            sz_str = f"{size_kb}K" if size_kb < 1024 else f"{size_kb // 1024}M"
+            print(f"  │  {start:>16}  {end:>16}  {perms:>5}  "
+                  f"{sz_str:>8}  {resident_pct:>5.1f}%  "
+                  f"{color}{dirty_pct:>5.1f}%{self.RESET}  {path}")
+
+        # Tracking data
+        tracking = data.get("tracking", [])
+        if tracking:
+            print(f"  │")
+            print(f"  │  Soft-dirty tracking ({len(tracking)} samples, "
+                  f"{interval_ms}ms interval):")
+            print(f"  │  {'#':>4}  ", end="")
+            # Header: abbreviated file names
+            paths = set()
+            for t in tracking:
+                for rdata in t.get("regions", []):
+                    paths.add(rdata.get("path", ""))
+            path_list = sorted(paths)
+            for p in path_list:
+                short = os.path.basename(p)[:20]
+                print(f"  {short:>20}", end="")
+            print()
+            print(f"  │  {'─' * (6 + len(path_list) * 22)}")
+
+            for t in tracking:
+                print(f"  │  {t['iter']:>4}  ", end="")
+                region_data = {rd["path"]: rd for rd in t.get("regions", [])}
+                for p in path_list:
+                    rd = region_data.get(p, {})
+                    dk = rd.get("dirty_kb", 0)
+                    if dk > 0:
+                        color = self.HEAT_COLORS[min(4, dk // 100)]
+                        print(f"  {color}{dk:>18}KB{self.RESET}", end="")
+                    else:
+                        print(f"  {'—':>20}", end="")
+                print()
+
+        print(f"  └──\n")
+
+    def file_unified(self, pid: int, interval_ms: int = 500, iterations: int = 10):
+        """Mode 5: Unified file-offset heatmap (coalesced multi-mmap view)."""
+        print(f"\n  ┌── Unified File Heatmap: PID {pid} ──")
+        print(f"  │  (coalesced multi-mmap: groups VMAs by file, deduplicates overlaps)")
+
+        data = self._run_c_tool(pid, mode=5, interval_ms=interval_ms,
+                                 count=iterations)
+        if not data:
+            print("  │  (pagemon_viz unavailable — skipping visualization)")
+            print("  └──")
+            return
+
+        files = data.get("files", [])
+        if not files:
+            print("  │  No file-backed regions found")
+            print("  └──")
+            return
+
+        for fdata in files:
+            pathname = fdata.get("pathname", "<unknown>")
+            n_vmas = fdata.get("n_vmas", 0)
+            n_coal = fdata.get("n_coalesced", 0)
+            fspan_kb = fdata.get("file_span_kb", 0)
+            fpages = fdata.get("file_pages", 0)
+            block_kb = fdata.get("block_size_kb", 0)
+            cols = fdata.get("cols", 64)
+            off_range = fdata.get("file_offset_range", ["0x0", "0x0"])
+            dedup = fdata.get("overlap_dedup", False)
+
+            print(f"  │")
+            print(f"  │  File: {pathname}")
+            print(f"  │  VMAs: {n_vmas} → coalesced: {n_coal} span(s)"
+                  f"  |  dedup: {'on' if dedup else 'off'}")
+            fspan_str = f"{fspan_kb}K" if fspan_kb < 1024 else f"{fspan_kb // 1024}M"
+            print(f"  │  File offset: {off_range[0]}–{off_range[1]} "
+                  f"({fspan_str}, {fpages:,} pages)")
+            print(f"  │  Block size: {block_kb} KB/block, "
+                  f"X-axis = file offset (not VA)")
+
+            snapshots = fdata.get("snapshots", [])
+            for snap in snapshots:
+                dirty_kb = snap.get("dirty_kb", 0)
+                total_dirty = snap.get("total_dirty", 0)
+                blocks = snap.get("blocks", [])
+                print(f"  │")
+                print(f"  │  Iteration {snap['iter']}: "
+                      f"{total_dirty} dirty ({dirty_kb} KB)")
+                self._render_heatmap_grid(blocks, cols)
+
+        print(f"  │")
+        print(f"  │  Legend: ", end="")
+        for i, ch in enumerate(self.HEAT_CHARS):
+            pct = i * 20
+            color = self.HEAT_COLORS[min(i, len(self.HEAT_COLORS) - 1)]
+            print(f"{color}{ch}{self.RESET}={pct}%  ", end="")
+        print()
+        print(f"  │  X-axis: file offset (left=start, right=end)")
+        print(f"  │  Multi-mmap: all VMAs stitched into one view per file")
+        print(f"  └──\n")
+    # ═══════════════════════════════════════════════════════════════════
+
+    # ═══════════════════════════════════════════════════════════════════
+    # Terminal rendering helpers
+    # ═══════════════════════════════════════════════════════════════════
+
+    # Granularity presets: name → block_kb
+    GRANULARITY_PRESETS = {
+        "page":   4,       # 1 page/block (finest — 4 KB)
+        "fine":   64,      # 16 pages/block (64 KB)
+        "medium": 256,     # 64 pages/block (256 KB)
+        "coarse": 1024,    # 256 pages/block (1 MB)
+        "auto":   0,       # C code auto-calculates
+    }
+
+    @classmethod
+    def resolve_granularity(cls, name_or_kb: str) -> int:
+        """Convert granularity name or KB value to block_kb int."""
+        if name_or_kb in cls.GRANULARITY_PRESETS:
+            return cls.GRANULARITY_PRESETS[name_or_kb]
+        try:
+            return int(name_or_kb)
+        except ValueError:
+            return 0
+
+    @classmethod
+    def auto_granularity(cls, region_size_kb: int) -> tuple:
+        """Choose block_kb based on region size. Returns (block_kb, label)."""
+        if region_size_kb <= 256:         # ≤ 256 KB
+            return (4, "page (4 KB/block)")
+        elif region_size_kb <= 4096:      # ≤ 4 MB
+            return (16, "fine (16 KB/block)")
+        elif region_size_kb <= 65536:     # ≤ 64 MB
+            return (64, "fine (64 KB/block)")
+        elif region_size_kb <= 524288:    # ≤ 512 MB
+            return (256, "medium (256 KB/block)")
+        else:                             # > 512 MB
+            return (1024, "coarse (1 MB/block)")
+
+    def zoom_heatmap(self, pid: int, start: int, end: int,
+                     interval_ms: int = 500, iterations: int = 5,
+                     block_kb: int = 0):
+        """
+        Two-level visualization: coarse minimap + fine zoom on hottest region.
+
+        1. Coarse overview pass: 1 MB blocks → identify hot zone
+        2. Fine detail pass: page-level or 64 KB blocks on the hot zone
+        3. Render: minimap (top) with zoom bracket + detail (bottom)
+        """
+        size_kb = (end - start) // 1024
+        print(f"\n  ┌── Zoom Heatmap: PID {pid} ──")
+        print(f"  │  Region: {start:#x}–{end:#x} ({size_kb:,} KB)")
+
+        if size_kb < 128:
+            # Region too small for zoom — just do fine-grained single pass
+            print(f"  │  (small region — single fine-grained pass)")
+            self.heatmap(pid, start, end, interval_ms, iterations)
+            return
+
+        # ── Pass 1: Coarse overview (1 MB blocks, single iteration) ──
+        coarse_kb = 1024 if size_kb > 65536 else 256
+        print(f"  │  Pass 1: Overview ({coarse_kb} KB/block)")
+
+        overview = self._run_c_tool(pid, mode=2, start=start, end=end,
+                                     interval_ms=interval_ms, count=1,
+                                     block_kb=coarse_kb)
+        if not overview:
+            print("  │  (pagemon_viz unavailable)")
+            print("  └──")
+            return
+
+        cols = overview.get("cols", 64)
+        ppb = overview.get("pages_per_block", 1)
+        snaps = overview.get("snapshots", [])
+        if not snaps:
+            print("  │  No data from overview pass")
+            print("  └──")
+            return
+
+        blocks = snaps[0].get("blocks", [])
+        print(f"  │  Overview ({len(blocks)} blocks):")
+        self._render_heatmap_grid(blocks, cols)
+
+        # ── Find hottest contiguous region ──
+        if not blocks or max(blocks) == 0:
+            print(f"  │  No dirty blocks — nothing to zoom into")
+            print(f"  └──\n")
+            return
+
+        # Sliding window: find the densest 1/8th of the overview
+        window_size = max(4, len(blocks) // 8)
+        best_sum = 0
+        best_start_idx = 0
+        for i in range(len(blocks) - window_size + 1):
+            s = sum(blocks[i:i + window_size])
+            if s > best_sum:
+                best_sum = s
+                best_start_idx = i
+
+        # Calculate VA range for the zoom region
+        bytes_per_block = ppb * 4096
+        zoom_va_start = start + best_start_idx * bytes_per_block
+        zoom_va_end = min(end, zoom_va_start + window_size * bytes_per_block)
+        zoom_size_kb = (zoom_va_end - zoom_va_start) // 1024
+
+        # Render minimap with zoom bracket
+        print(f"  │")
+        bracket_start = best_start_idx
+        bracket_end = min(best_start_idx + window_size, len(blocks))
+        print(f"  │  Zoom target: blocks [{bracket_start}–{bracket_end}] "
+              f"= {zoom_va_start:#x}–{zoom_va_end:#x} ({zoom_size_kb:,} KB)")
+        print(f"  │  ", end="")
+        for i in range(min(len(blocks), cols)):
+            if bracket_start <= i < bracket_end:
+                print(f"\033[4m\033[38;5;196m▼\033[0m", end="")
+            else:
+                print(" ", end="")
+        print()
+
+        # ── Pass 2: Fine detail on hottest region ──
+        detail_kb, detail_label = self.auto_granularity(zoom_size_kb)
+        if block_kb > 0:
+            detail_kb = block_kb
+            detail_label = f"user ({block_kb} KB/block)"
+
+        print(f"  │")
+        print(f"  │  Pass 2: Zoom detail ({detail_label})")
+
+        detail = self._run_c_tool(pid, mode=2, start=zoom_va_start,
+                                   end=zoom_va_end,
+                                   interval_ms=interval_ms, count=iterations,
+                                   block_kb=detail_kb)
+        if not detail:
+            print("  │  (zoom pass failed)")
+            print("  └──")
+            return
+
+        detail_snaps = detail.get("snapshots", [])
+        detail_cols = detail.get("cols", 64)
+        for snap in detail_snaps:
+            dirty_kb = snap.get("dirty_kb", 0)
+            total_dirty = snap.get("total_dirty", 0)
+            dblocks = snap.get("blocks", [])
+            print(f"  │")
+            print(f"  │  Iter {snap['iter']}: {total_dirty} dirty ({dirty_kb} KB)")
+            self._render_heatmap_grid(dblocks, detail_cols)
+
+        print(f"  │")
+        print(f"  │  Legend: ", end="")
+        for i, ch in enumerate(self.HEAT_CHARS):
+            color = self.HEAT_COLORS[min(i, len(self.HEAT_COLORS) - 1)]
+            print(f"{color}{ch}{self.RESET}={i * 20}%  ", end="")
+        print()
+        print(f"  └──\n")
+
+    def _render_page_map(self, pages_str: str, width: int = 72):
+        """Render a compact page state map with color coding."""
+        # P=present D=dirty S=swapped F=file-mapped .=not present
+        color_map = {
+            '.': "\033[38;5;236m",  # dark gray
+            'P': "\033[38;5;34m",   # green
+            'D': "\033[38;5;196m",  # red
+            'S': "\033[38;5;33m",   # blue
+            'F': "\033[38;5;178m",  # yellow
+        }
+        print(f"  │  Page map (P=present D=dirty S=swapped F=file .=empty):")
+
+        # If too many pages, downsample
+        total = len(pages_str)
+        display_chars = width * 4  # 4 rows max
+        if total > display_chars:
+            stride = total // display_chars
+            sampled = pages_str[::stride][:display_chars]
+        else:
+            sampled = pages_str
+
+        for row_start in range(0, len(sampled), width):
+            row = sampled[row_start:row_start + width]
+            print(f"  │  ", end="")
+            for ch in row:
+                color = color_map.get(ch, self.RESET)
+                print(f"{color}{ch}{self.RESET}", end="")
+            print()
+
+    def _render_heatmap_grid(self, blocks: list, cols: int):
+        """Render a heatmap grid from block density values (0-100)."""
+        for row_start in range(0, len(blocks), cols):
+            row = blocks[row_start:row_start + cols]
+            print(f"  │  ", end="")
+            for density in row:
+                # Map 0-100 to character and color
+                idx = min(len(self.HEAT_CHARS) - 1, density // 20)
+                color = self.HEAT_COLORS[min(idx, len(self.HEAT_COLORS) - 1)]
+                print(f"{color}{self.HEAT_CHARS[idx]}{self.RESET}", end="")
+            print()
+
+
+# =============================================================================
 # Orchestrator: Full Pipeline
 # =============================================================================
 
@@ -1364,7 +1975,9 @@ class IOPathObserver:
     """
 
     def __init__(self, pid: int = None, comm: str = None,
-                 use_ebpf: bool = True, follow_forks: bool = True):
+                 use_ebpf: bool = True, follow_forks: bool = True,
+                 visualize: str = None, viz_interval: int = 500,
+                 viz_iterations: int = 10, viz_granularity: str = "auto"):
         self.pid = pid           # May be None for --comm mode
         self.comm = comm         # e.g. "fio"
         self.follow_forks = follow_forks
@@ -1372,6 +1985,13 @@ class IOPathObserver:
                                      follow_forks=follow_forks)
         self.use_ebpf = use_ebpf
         self.trace_records: list[IOTraceRecord] = []
+
+        # Visualization settings
+        self.visualize = visualize          # None, "snapshot", "heatmap", etc.
+        self.viz_interval = viz_interval
+        self.viz_iterations = viz_iterations
+        self.viz_block_kb = PageMonVisualizer.resolve_granularity(viz_granularity)
+        self._visualizer = PageMonVisualizer() if visualize else None
 
         # Per-PID helpers — created dynamically as PIDs are discovered
         self._fd_extractors: dict[int, FDExtractor] = {}
@@ -1494,11 +2114,17 @@ class IOPathObserver:
             sc_counts[ev.syscall] = sc_counts.get(ev.syscall, 0) + 1
 
         print(f"\n  {'Syscall':<16} {'Total':>8}", end="")
+        # Limit per-PID columns to top 10 most active PIDs
+        top_pids = sorted(pid_sc_counts.keys(),
+                          key=lambda p: sum(pid_sc_counts[p].values()),
+                          reverse=True)[:10]
         if len(all_pids) > 1:
-            for pid in sorted(all_pids):
+            for pid in top_pids:
                 print(f"  {'PID ' + str(pid):>10}", end="")
+            if len(all_pids) > 10:
+                print(f"  {'(+' + str(len(all_pids) - 10) + ')':>8}", end="")
         print()
-        print(f"  {'─' * (30 + (len(all_pids) * 12 if len(all_pids) > 1 else 0))}")
+        print(f"  {'─' * (30 + (len(top_pids) * 12))}")
 
         sc_examples = {}
         for ev in events:
@@ -1507,7 +2133,7 @@ class IOPathObserver:
         for sc, count in sorted(sc_counts.items(), key=lambda x: -x[1]):
             print(f"  {sc:<16} {count:>8}", end="")
             if len(all_pids) > 1:
-                for pid in sorted(all_pids):
+                for pid in top_pids:
                     c = pid_sc_counts.get(pid, {}).get(sc, 0)
                     print(f"  {c:>10}", end="")
             print()
@@ -1533,7 +2159,43 @@ class IOPathObserver:
                   f"{fd_str:>4} {len_str:>10} {off_str:>10} {extra}")
 
         # ────────────────────────────────────────────────────────────────
-        # Step 2: Extract FD and Length (per PID)
+        # Filter stale PIDs: FIO workers may have exited during tracing.
+        # Only keep PIDs whose /proc/<pid> still exists.
+        # ────────────────────────────────────────────────────────────────
+        live_pids = set()
+        stale_pids = set()
+        for pid in all_pids:
+            if os.path.exists(f"/proc/{pid}"):
+                live_pids.add(pid)
+            else:
+                stale_pids.add(pid)
+
+        if stale_pids:
+            print(f"\n  [!] {len(stale_pids)} PID(s) exited before post-processing "
+                  f"(short-lived workers)")
+            print(f"      Live: {len(live_pids)} PID(s) — "
+                  f"using these for Steps 2–4")
+
+        # Also find PIDs that actually emitted events (most useful subset)
+        active_pids = set()
+        pid_event_counts = {}
+        for ev in events:
+            active_pids.add(ev.pid)
+            pid_event_counts[ev.pid] = pid_event_counts.get(ev.pid, 0) + 1
+
+        # For Steps 2-4, use live PIDs that are also active
+        analysis_pids = live_pids & active_pids
+        if not analysis_pids and live_pids:
+            analysis_pids = live_pids  # fallback: use all live PIDs
+        if not analysis_pids and active_pids:
+            # All PIDs exited — use the ones with most events for event analysis
+            analysis_pids = active_pids
+
+        print(f"  Analysis PIDs: {len(analysis_pids)} "
+              f"(live + active) from {len(all_pids)} tracked")
+
+        # ────────────────────────────────────────────────────────────────
+        # Step 2: Extract FD and Length (per PID — live only)
         # ────────────────────────────────────────────────────────────────
         print(f"\n{'─' * 72}")
         print("[Step 2] Extracting FD Metadata & File Paths (all tracked PIDs) ...")
@@ -1544,11 +2206,16 @@ class IOPathObserver:
         opened_files = {}  # (pid, fd) → filename
         target_paths = set()
 
-        for pid in sorted(all_pids):
+        for pid in sorted(analysis_pids):
             pid_events = [ev for ev in events if ev.pid == pid]
             if not pid_events:
                 continue
 
+            # Only read /proc for live PIDs
+            if pid not in live_pids:
+                continue
+
+            self._ensure_pid_helpers(pid)
             extractor = self._fd_extractors[pid]
             pid_fds = {}
             for ev in pid_events:
@@ -1595,9 +2262,12 @@ class IOPathObserver:
         print("[Step 3] Cross-referencing /proc/<pid>/maps (all tracked PIDs) ...")
         print(f"{'─' * 72}")
 
-        # Parse maps for ALL tracked PIDs, cache per-PID
+        # Parse maps for live PIDs only, cache per-PID
         all_maps_cache = {}  # pid → list[MemoryMapping]
-        for pid in sorted(all_pids):
+        for pid in sorted(analysis_pids):
+            if pid not in live_pids:
+                continue
+            self._ensure_pid_helpers(pid)
             mapper = self._procfs_mappers[pid]
             maps = mapper.parse_maps()
             all_maps_cache[pid] = maps
@@ -1693,8 +2363,10 @@ class IOPathObserver:
         # FALLBACK: scan procfs directly for each PID's target file mappings
         if not mappings_to_monitor and target_paths:
             print(f"\n  [fallback] No mappings from syscall matching — "
-                  f"scanning /proc/*/maps for {len(all_pids)} PID(s) ...")
-            for pid in sorted(all_pids):
+                  f"scanning /proc/*/maps for {len(analysis_pids)} live PID(s) ...")
+            for pid in sorted(analysis_pids):
+                if pid not in live_pids:
+                    continue
                 mapper = self._procfs_mappers.get(pid)
                 maps = all_maps_cache.get(pid, [])
                 if not mapper:
@@ -1743,6 +2415,85 @@ class IOPathObserver:
             print(f"        • Workload uses O_DIRECT (bypasses page cache)")
             print(f"        • Target file not opened yet / child exited")
             print(f"        • Try --duration 20 to catch late forks\n")
+
+        # ────────────────────────────────────────────────────────────────
+        # Step 4b: C-Accelerated Visualization (if --visualize enabled)
+        # ────────────────────────────────────────────────────────────────
+        if self._visualizer and self.visualize:
+            print(f"\n{'─' * 72}")
+            print(f"[Step 4b] C-Accelerated Memory Visualization "
+                  f"(mode: {self.visualize}) ...")
+            print(f"{'─' * 72}")
+
+            viz_mode = self.visualize.lower()
+            viz_targets = []  # list of (pid, start, end, pathname)
+
+            # Collect visualization targets from mapped regions
+            if mappings_to_monitor:
+                for pid, m in mappings_to_monitor:
+                    viz_targets.append((pid, m.start_addr, m.end_addr, m.pathname))
+            else:
+                # Fallback: just use each tracked PID with auto-detection
+                for pid in sorted(all_pids):
+                    viz_targets.append((pid, 0, 0, "<auto-detect>"))
+
+            # Deduplicate by (pid, start)
+            seen = set()
+            unique_targets = []
+            for t in viz_targets:
+                key = (t[0], t[1])
+                if key not in seen:
+                    seen.add(key)
+                    unique_targets.append(t)
+
+            for pid, start, end, pathname in unique_targets:
+                label = pathname or f"PID {pid}"
+                print(f"\n  Target: PID {pid} — {label}")
+
+                if viz_mode in ("snapshot", "all"):
+                    self._visualizer.snapshot(pid, start, end)
+
+                if viz_mode in ("heatmap", "all"):
+                    self._visualizer.heatmap(
+                        pid, start, end,
+                        interval_ms=self.viz_interval,
+                        iterations=self.viz_iterations,
+                    )
+
+                if viz_mode in ("zoom", "all"):
+                    self._visualizer.zoom_heatmap(
+                        pid, start, end,
+                        interval_ms=self.viz_interval,
+                        iterations=self.viz_iterations,
+                        block_kb=self.viz_block_kb,
+                    )
+
+                if viz_mode in ("timeline", "all"):
+                    self._visualizer.timeline(
+                        pid, start, end,
+                        interval_ms=self.viz_interval,
+                        iterations=self.viz_iterations,
+                    )
+
+            # Region-all always scans entire PID
+            if viz_mode in ("region_all", "all"):
+                viz_live = sorted(live_pids)[:3] if live_pids else sorted(analysis_pids)[:3]
+                for pid in viz_live:
+                    self._visualizer.region_scan(
+                        pid,
+                        interval_ms=self.viz_interval,
+                        iterations=min(self.viz_iterations, 5),
+                    )
+
+            # File-unified: coalesced multi-mmap heatmap per file
+            if viz_mode in ("file_unified", "all"):
+                viz_live = sorted(live_pids)[:3] if live_pids else sorted(analysis_pids)[:3]
+                for pid in viz_live:
+                    self._visualizer.file_unified(
+                        pid,
+                        interval_ms=self.viz_interval,
+                        iterations=self.viz_iterations,
+                    )
 
         self.trace_records = records
         self._print_summary()
@@ -2112,6 +2863,22 @@ def main():
                         help="Export trace results to JSON file")
     parser.add_argument("--show-commands", action="store_true",
                         help="Show FIO run commands after generating configs")
+    parser.add_argument("--visualize", type=str, metavar="MODE", default=None,
+                        help="Enable pagemon C-accelerated visualization. "
+                             "Modes: snapshot, heatmap, timeline, region_all, "
+                             "file_unified, zoom, all. "
+                             "'zoom' does a coarse minimap then fine detail "
+                             "on the hottest region.")
+    parser.add_argument("--viz-interval", type=int, default=500,
+                        help="Visualization polling interval in ms (default: 500)")
+    parser.add_argument("--viz-iterations", type=int, default=10,
+                        help="Visualization iteration count (default: 10)")
+    parser.add_argument("--viz-granularity", type=str, default="auto",
+                        metavar="LEVEL",
+                        help="Heatmap block granularity. "
+                             "Presets: page (4KB), fine (64KB), medium (256KB), "
+                             "coarse (1MB), auto. Or a number in KB (e.g. 128). "
+                             "(default: auto)")
 
     args = parser.parse_args()
 
@@ -2195,6 +2962,10 @@ def main():
                 comm=target_comm,
                 use_ebpf=not args.strace,
                 follow_forks=not args.no_follow_forks,
+                visualize=args.visualize,
+                viz_interval=args.viz_interval,
+                viz_iterations=args.viz_iterations,
+                viz_granularity=args.viz_granularity,
             )
             observer.run_pipeline(
                 trace_duration=args.duration,

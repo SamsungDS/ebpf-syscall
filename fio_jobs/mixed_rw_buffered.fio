@@ -1,0 +1,23 @@
+# FIO Job: mixed_rw_buffered
+# Mixed buffered R/W - page cache behavior analysis
+# Generated: 2026-02-12T03:40:37.707847
+
+[global]
+filename=/tmp/fio_testfile
+size=1G
+runtime=30
+time_based
+group_reporting
+log_avg_msec=1000
+write_bw_log=mixed_rw_buffered
+write_lat_log=mixed_rw_buffered
+write_iops_log=mixed_rw_buffered
+
+[mixed_rw_buffered]
+ioengine=libaio
+rw=randrw
+rwmixread=70
+bs=8k
+iodepth=16
+direct=0
+numjobs=2

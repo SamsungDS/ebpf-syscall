@@ -1,0 +1,22 @@
+# FIO Job: random_read_4k
+# Random 4K read - IOPS and latency profiling
+# Generated: 2026-02-12T03:40:37.707657
+
+[global]
+filename=/tmp/fio_testfile
+size=1G
+runtime=30
+time_based
+group_reporting
+log_avg_msec=1000
+write_bw_log=random_read_4k
+write_lat_log=random_read_4k
+write_iops_log=random_read_4k
+
+[random_read_4k]
+ioengine=libaio
+rw=randread
+bs=4k
+iodepth=64
+direct=1
+numjobs=4

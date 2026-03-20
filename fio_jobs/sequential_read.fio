@@ -1,0 +1,22 @@
+# FIO Job: sequential_read
+# Sequential read - baseline throughput measurement
+# Generated: 2026-02-12T03:40:37.707498
+
+[global]
+filename=/tmp/fio_testfile
+size=1G
+runtime=30
+time_based
+group_reporting
+log_avg_msec=1000
+write_bw_log=sequential_read
+write_lat_log=sequential_read
+write_iops_log=sequential_read
+
+[sequential_read]
+ioengine=libaio
+rw=read
+bs=128k
+iodepth=32
+direct=1
+numjobs=1

@@ -1,0 +1,93 @@
+# Combined FIO Job - All I/O Profiles for Observability Testing
+# Generated: 2026-02-12T03:40:37.707934
+# Run profiles individually by name: fio combined_io_profiles.fio --section=<name>
+
+[global]
+filename=/tmp/fio_testfile
+size=1G
+runtime=30
+time_based
+group_reporting
+
+# --- Sequential read - baseline throughput measurement ---
+[sequential_read]
+stonewall
+ioengine=libaio
+rw=read
+bs=128k
+iodepth=32
+direct=1
+numjobs=1
+
+# --- Sequential write - writeback/flush characterization ---
+[sequential_write]
+stonewall
+ioengine=libaio
+rw=write
+bs=128k
+iodepth=32
+direct=1
+numjobs=1
+
+# --- Random 4K read - IOPS and latency profiling ---
+[random_read_4k]
+stonewall
+ioengine=libaio
+rw=randread
+bs=4k
+iodepth=64
+direct=1
+numjobs=4
+
+# --- Random 4K write - write amplification analysis ---
+[random_write_4k]
+stonewall
+ioengine=libaio
+rw=randwrite
+bs=4k
+iodepth=64
+direct=1
+numjobs=4
+
+# --- mmap sequential read - page fault tracing ---
+[mmap_seq_read]
+stonewall
+ioengine=mmap
+rw=read
+bs=4k
+iodepth=1
+direct=0
+numjobs=1
+
+# --- mmap random write - dirty page / msync tracing ---
+[mmap_rand_write]
+stonewall
+ioengine=mmap
+rw=randwrite
+bs=4k
+iodepth=1
+direct=0
+numjobs=1
+
+# --- Mixed buffered R/W - page cache behavior analysis ---
+[mixed_rw_buffered]
+stonewall
+ioengine=libaio
+rw=randrw
+rwmixread=70
+bs=8k
+iodepth=16
+direct=0
+numjobs=2
+
+# --- fsync-heavy write - journal/WAL pattern (DB-like) ---
+[sync_heavy_write]
+stonewall
+ioengine=libaio
+rw=write
+bs=16k
+iodepth=1
+direct=0
+fsync=1
+numjobs=1
+

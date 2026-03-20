@@ -1,0 +1,23 @@
+# FIO Job: mmap_rand_write
+# mmap random write - dirty page / msync tracing
+# Generated: 2026-02-12T03:40:37.707803
+
+[global]
+filename=/mnt/drives/nvme0n1/fio_testfile
+size=20G
+runtime=600
+time_based
+group_reporting
+log_avg_msec=1000
+write_bw_log=mmap_rand_write
+write_lat_log=mmap_rand_write
+write_iops_log=mmap_rand_write
+
+[mmap_rand_write]
+ioengine=mmap
+#mem=mmap:/mnt/drives/nvme0n1/fio_testfile
+rw=randwrite
+bs=4k
+iodepth=1
+direct=0
+numjobs=1

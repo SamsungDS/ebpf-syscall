@@ -1,0 +1,22 @@
+# FIO Job: mmap_seq_read
+# mmap sequential read - page fault tracing
+# Generated: 2026-02-12T03:40:37.707759
+
+[global]
+filename=/tmp/fio_testfile
+size=1G
+runtime=30
+time_based
+group_reporting
+log_avg_msec=1000
+write_bw_log=mmap_seq_read
+write_lat_log=mmap_seq_read
+write_iops_log=mmap_seq_read
+
+[mmap_seq_read]
+ioengine=mmap
+rw=read
+bs=4k
+iodepth=1
+direct=0
+numjobs=1

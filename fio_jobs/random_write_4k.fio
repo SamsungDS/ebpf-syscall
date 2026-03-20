@@ -1,0 +1,22 @@
+# FIO Job: random_write_4k
+# Random 4K write - write amplification analysis
+# Generated: 2026-02-12T03:40:37.707712
+
+[global]
+filename=/tmp/fio_testfile
+size=1G
+runtime=30
+time_based
+group_reporting
+log_avg_msec=1000
+write_bw_log=random_write_4k
+write_lat_log=random_write_4k
+write_iops_log=random_write_4k
+
+[random_write_4k]
+ioengine=libaio
+rw=randwrite
+bs=4k
+iodepth=64
+direct=1
+numjobs=4

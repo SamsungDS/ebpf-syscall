@@ -1,0 +1,23 @@
+# FIO Job: sync_heavy_write
+# fsync-heavy write - journal/WAL pattern (DB-like)
+# Generated: 2026-02-12T03:40:37.707891
+
+[global]
+filename=/tmp/fio_testfile
+size=1G
+runtime=30
+time_based
+group_reporting
+log_avg_msec=1000
+write_bw_log=sync_heavy_write
+write_lat_log=sync_heavy_write
+write_iops_log=sync_heavy_write
+
+[sync_heavy_write]
+ioengine=libaio
+rw=write
+bs=16k
+iodepth=1
+direct=0
+fsync=1
+numjobs=1
