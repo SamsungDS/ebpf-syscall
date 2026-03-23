@@ -25,6 +25,8 @@ struct syscall_event {
     uint64_t offset;
     char comm[MAX_COMM_LEN];
     char filename[256];
+    uint32_t open_flags_hex;
+    char open_flags_str[256];
 };
 
 // Syscall statistics
@@ -558,6 +560,8 @@ static void export_to_json(struct syscall_stat *stats, int stat_count,
             fprintf(fp, "      \"size\": %lu,\n", e->size);
             fprintf(fp, "      \"offset\": %lu\n", e->offset);
 	    fprintf(fp, "      \"filename\": \"%s\",\n", e->filename);
+	    fprintf(fp, "      \"open_flags_hex\": %u,\n", e->open_flags_hex);
+	    fprintf(fp, "      \"open_flags_str\": \"%s\"\n", e->open_flags_str);
             fprintf(fp, "    }%s\n", (i < event_count - 1) ? "," : "");
         }
         fprintf(fp, "  ]\n");
