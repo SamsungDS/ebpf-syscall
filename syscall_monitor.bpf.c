@@ -31,6 +31,13 @@
 #define O_SYNC      04000000
 #define O_PATH      010000000
 
+enum io_direction {
+	READ,
+	WRITE,
+	VREAD,
+	VWRITE
+};
+
 // Syscall event structure
 struct syscall_event {
     u64 timestamp;
@@ -43,6 +50,7 @@ struct syscall_event {
     char filename[256];
     u32 open_flags_hex;
     char open_flags_str[20];
+    enum io_direction ddir;
 };
 
 // Maps for syscall statistics
@@ -120,6 +128,14 @@ static __always_inline void log_event(u32 syscall_nr, u32 fd, u64 size, u64 offs
     memcpy(event->filename, filename , sizeof(event->filename));
     event->open_flags_hex = open_flags_hex;
     memcpy(event->open_flags_str, open_flags_str, sizeof(event->open_flags_str));
+    if (syscall_nr == 0 || syscall_nr == 17)
+        event->ddir = READ;
+    else if (syscall_nr == 1 || syscall_nr == 18)
+        event->ddir = WRITE;
+    else if (syscall_nr == 19)
+        event->ddir = VREAD;
+    else if (syscall_nr == 20)
+        event->ddir = VWRITE;
 
     bpf_ringbuf_submit(event, 0);
 }

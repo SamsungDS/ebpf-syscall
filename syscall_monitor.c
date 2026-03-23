@@ -15,6 +15,13 @@
 #define MAX_EVENTS 1000000  // Increased from 100000 to 1 million
 #define MAX_PROCESSES 1000
 
+enum io_direction {
+    READ,
+    WRITE,
+    VREAD,
+    VWRITE
+};
+
 // Syscall event structure (must match BPF program)
 struct syscall_event {
     uint64_t timestamp;
@@ -27,6 +34,7 @@ struct syscall_event {
     char filename[256];
     uint32_t open_flags_hex;
     char open_flags_str[256];
+    enum io_direction ddir;
 };
 
 // Syscall statistics
@@ -562,6 +570,7 @@ static void export_to_json(struct syscall_stat *stats, int stat_count,
 	    fprintf(fp, "      \"filename\": \"%s\",\n", e->filename);
 	    fprintf(fp, "      \"open_flags_hex\": %u,\n", e->open_flags_hex);
 	    fprintf(fp, "      \"open_flags_str\": \"%s\"\n", e->open_flags_str);
+	    fprintf(fp, "      \"io_direction\": \"%s\",\n", e->ddir == 0 ? "READ" : e->ddir == 1 ? "WRITE" : e->ddir == 2 ? "VREAD" : "VWRITE");
             fprintf(fp, "    }%s\n", (i < event_count - 1) ? "," : "");
         }
         fprintf(fp, "  ]\n");
