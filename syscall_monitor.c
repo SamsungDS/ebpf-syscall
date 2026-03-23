@@ -35,6 +35,8 @@ struct syscall_event {
     uint32_t open_flags_hex;
     char open_flags_str[256];
     enum io_direction ddir;
+    long ret;  /* holds the number of bytes transferred */
+    long error_code;  /* holds the error code returned by the syscall */
 };
 
 // Syscall statistics
@@ -571,6 +573,8 @@ static void export_to_json(struct syscall_stat *stats, int stat_count,
 	    fprintf(fp, "      \"open_flags_hex\": %u,\n", e->open_flags_hex);
 	    fprintf(fp, "      \"open_flags_str\": \"%s\"\n", e->open_flags_str);
 	    fprintf(fp, "      \"io_direction\": \"%s\",\n", e->ddir == 0 ? "READ" : e->ddir == 1 ? "WRITE" : e->ddir == 2 ? "VREAD" : "VWRITE");
+	    fprintf(fp, "      \"ret\": %ld,\n", e->ret);
+	    fprintf(fp, "      \"error_code\": %ld,\n", e->error_code);
             fprintf(fp, "    }%s\n", (i < event_count - 1) ? "," : "");
         }
         fprintf(fp, "  ]\n");
