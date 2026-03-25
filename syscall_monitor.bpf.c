@@ -5,6 +5,35 @@
 #include <bpf/bpf_tracing.h>
 #include <bpf/bpf_core_read.h>
 
+/*
+ * PT_REGS_PARM6 is missing in many libbpf versions because
+ * the 6th syscall arg doesn't pass through a standard calling
+ * convention register on all archs. Define it per-arch if absent.
+ */
+#ifndef PT_REGS_PARM6
+  #if defined(__TARGET_ARCH_x86)
+    #define PT_REGS_PARM6(x)       ((__u64)(x)->r9)
+    #define PT_REGS_PARM6_CORE(x)  BPF_CORE_READ((x), r9)
+  #elif defined(__TARGET_ARCH_arm64)
+    #define PT_REGS_PARM6(x)       ((__u64)(x)->regs[5])
+    #define PT_REGS_PARM6_CORE(x)  BPF_CORE_READ((x), regs[5])
+  #elif defined(__TARGET_ARCH_s390)
+    #define PT_REGS_PARM6(x)       ((__u64)(x)->gprs[7])
+    #define PT_REGS_PARM6_CORE(x)  BPF_CORE_READ((x), gprs[7])
+  #elif defined(__TARGET_ARCH_powerpc)
+    #define PT_REGS_PARM6(x)       ((__u64)(x)->gpr[8])
+    #define PT_REGS_PARM6_CORE(x)  BPF_CORE_READ((x), gpr[8])
+  #elif defined(__TARGET_ARCH_riscv)
+    #define PT_REGS_PARM6(x)       ((__u64)(x)->a5)
+    #define PT_REGS_PARM6_CORE(x)  BPF_CORE_READ((x), a5)
+  #elif defined(__TARGET_ARCH_loongarch)
+    #define PT_REGS_PARM6(x)       ((__u64)(x)->regs[9])
+    #define PT_REGS_PARM6_CORE(x)  BPF_CORE_READ((x), regs[9])
+  #else
+    #error "PT_REGS_PARM6: unsupported architecture"
+  #endif
+#endif
+
 #define MAX_COMM_LEN 16
 #define MAX_ENTRIES 8192
 
