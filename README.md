@@ -33,7 +33,8 @@ sudo apt-get install -y \
     linux-tools-$(uname -r) \
     build-essential \
     git \
-    curl
+    curl \
+    libcjson-dev
 
 # Verify installations
 clang --version
@@ -217,7 +218,7 @@ Detailed event logging enabled
 Monitoring syscalls for 60 seconds...
 Press Ctrl+C to stop early
 
-Monitoring... 59s elapsed, 1s remaining [93868 events captured]]
+Monitoring... 59s elapsed, 1s remaining [93868 events captured]
 Collecting results... Captured 93868 individual events
 
 =====================================================================================
@@ -475,4 +476,61 @@ Generated files:
   - syscall_analysis_20251009_050718_viz_offset_patterns.png (access patterns)
 
 Visualization complete!
+```
+
+## 5. Replaying Syscalls with syscall_replayer
+
+The `syscall_replayer` tool parses JSON log output from `syscall_monitor` and reconstructs syscall information for analysis and replay.
+
+### Build syscall_replayer
+```
+make syscall_replayer
+```
+
+### Usage
+After capturing events with `syscall_monitor` and exporting to JSON:
+
+```bash
+# Run syscall_monitor and export data
+sudo ./syscall_monitor
+# Export to JSON when prompted
+
+# Format the JSON file before feeding it to the parser
+#this will generate a file named syscalll_event_fixed.json
+python3 fix_json.py filename
+
+#Then parse the JSON with syscall_replayer
+./syscall_replayer
+```
+
+The replayer will:
+- Parse each JSON entry from the syscall log
+- Display parsed syscall information
+- Report any parsing errors with line numbers
+
+### Example Input Format
+The JSON input should follow this format:
+```json
+{"timestamp_ns": 1234567890, "timestamp_ms": 1234.567, "pid": 1234, "process_name": "test", "syscall_nr": 0, "syscall_name": "read", "fd": 3, "size": 4096, "offset": 0, "filename": "/tmp/test.txt", "io_direction": "read", "ret": 4096, "error_code": 0}
+```
+
+### Expected Output
+```
+Parsed successfully:
+timestamp_ns: 1304633334520541
+timestamp_ms: 1304633334.521
+pid: 499118
+process_name: node
+syscall_nr: 3
+syscall_name: close
+fd: -2147483648
+size: 1
+offset: 0
+filename: (empty)
+io_direction: READ
+open_flags_hex: 0x0
+open_flags_str: (empty)
+ret: 0
+error_code: 0
+Finished successfully
 ```
