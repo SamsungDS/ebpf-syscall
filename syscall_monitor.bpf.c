@@ -5,6 +5,7 @@
 #include <bpf/bpf_tracing.h>
 #include <bpf/bpf_core_read.h>
 
+
 /*
  * PT_REGS_PARM6 is missing in many libbpf versions because
  * the 6th syscall arg doesn't pass through a standard calling
@@ -156,9 +157,9 @@ static __always_inline void log_event(u32 syscall_nr, u32 fd, u64 size, u64 offs
     event->size = size;
     event->offset = offset;
     bpf_get_current_comm(&event->comm, sizeof(event->comm));
-    memcpy(event->filename, filename , sizeof(event->filename));
+    __builtin_memcpy(event->filename, filename , sizeof(event->filename));
     event->open_flags_hex = open_flags_hex;
-    memcpy(event->open_flags_str, open_flags_str, sizeof(event->open_flags_str));
+    __builtin_memcpy(event->open_flags_str, open_flags_str, sizeof(event->open_flags_str));
     if (syscall_nr == 0 || syscall_nr == 17)
         event->ddir = READ;
     else if (syscall_nr == 1 || syscall_nr == 18)
