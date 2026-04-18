@@ -1,0 +1,14 @@
+[package]
+name = "mmap-heatmap"
+version = "0.1.0"
+edition = "2021"
+license = "copyleft-next-0.3.1"
+description = "Sub-page change detection for file-backed mmap regions"
+
+[dependencies]
+libc = "0.2"
+
+[profile.release]
+strip = true
+lto = true
+opt-level = 2

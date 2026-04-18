@@ -1,0 +1,27 @@
+# Sequential 8-byte writes sweeping an 8 MiB mmap'd file.
+# Produces a visible wavefront moving across the mmap-heatmap
+# overview as fio writes linearly through the file. A full
+# sweep at 5000 IOPS takes about 200 seconds.
+#
+# scramble_buffers ensures every write produces different data
+# so the shadow diff detects byte-level changes.
+#
+# Usage:
+#   sudo fio examples/fio-sequential.fio &
+#   sudo mmap-heatmap -p $(pgrep -x fio | tail -1) -i 0.1
+
+[global]
+ioengine=mmap
+bs=8
+size=8m
+direct=0
+numjobs=1
+time_based
+runtime=300
+iodepth=1
+rate_iops=5000
+scramble_buffers=1
+refill_buffers
+
+[seq-write]
+rw=write

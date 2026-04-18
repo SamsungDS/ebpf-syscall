@@ -1,0 +1,24 @@
+# Zipf-distributed random 8-byte writes to an 8 MiB mmap'd file.
+# Most writes cluster on a small hot region (zipf theta=1.2) while
+# the rest of the file stays cold. Produces a visible hot/cold
+# gradient on the mmap-heatmap overview.
+#
+# Usage:
+#   sudo fio examples/fio-zipf.fio &
+#   sudo mmap-heatmap -p $(pgrep -x fio | tail -1) -i 0.1
+
+[global]
+ioengine=mmap
+bs=8
+size=8m
+direct=0
+numjobs=1
+time_based
+runtime=300
+iodepth=1
+refill_buffers
+rate_iops=1000
+
+[mmap-zipf]
+rw=randwrite
+random_distribution=zipf:1.2
