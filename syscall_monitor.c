@@ -733,19 +733,46 @@ int main(int argc, char **argv) {
     
     printf("\nCollecting results... Captured %d individual events\n", event_count);
     
-    // Collect aggregated syscall data from BPF maps
+    // Collect aggregated syscall data from BPF maps.
+    //
+    // bpf_map_get_next_key(map, key, next_key) returns the key that follows
+    // 'key' in iteration order. When 'key' exists in the map, the first key
+    // in the map is NEVER returned - the helper returns the one *after* it.
+    // When 'key' does not exist the helper returns the first key instead.
+    //
+    // The old code initialized 'key' to zero and walked from there. Because
+    // syscall number 0 is 'read' and the raw_syscalls/sys_exit tracepoint
+    // populates syscall_sizes[0] on every successful read(), the very first
+    // iteration would always get the key *after* 0, silently dropping the
+    // 'read' row from the aggregated stats. For idle / mostly-metadata
+    // workloads this was usually hidden because other syscalls were also
+    // present. But for workloads where syscall 0 is the *only* populated
+    // key - e.g. a tight stdin/stdout read loop - stat_count ends at 0, the
+    // function then prints "No syscall data collected" and bails without
+    // exporting JSON, even though the ring buffer received hundreds of
+    // thousands of events.
+    //
+    // The libbpf-documented way to start iteration is to pass NULL as the
+    // previous key, which asks the kernel for the first key unconditionally.
+    // Switch to that pattern and keep a separate backing uint32_t for
+    // subsequent calls. Also cache the two map fds so we're not re-deriving
+    // them on every iteration.
     struct syscall_stat stats[256] = {0};
     int stat_count = 0;
-    
-    uint32_t key = 0, next_key;
+
+    uint32_t next_key;
     uint64_t size_val, count_val;
-    
-    // Iterate through syscall_sizes map
-    while (bpf_map_get_next_key(bpf_map__fd(skel->maps.syscall_sizes), &key, &next_key) == 0) {
-        if (bpf_map_lookup_elem(bpf_map__fd(skel->maps.syscall_sizes), &next_key, &size_val) == 0) {
+    const uint32_t *prev_key = NULL;
+    uint32_t cur_key = 0;
+
+    int sizes_fd = bpf_map__fd(skel->maps.syscall_sizes);
+    int counts_fd = bpf_map__fd(skel->maps.syscall_counts);
+
+    while (bpf_map_get_next_key(sizes_fd, prev_key, &next_key) == 0) {
+        if (bpf_map_lookup_elem(sizes_fd, &next_key, &size_val) == 0) {
             count_val = 0;
-            bpf_map_lookup_elem(bpf_map__fd(skel->maps.syscall_counts), &next_key, &count_val);
-            
+            bpf_map_lookup_elem(counts_fd, &next_key, &count_val);
+
             if (stat_count < 256) {
                 stats[stat_count].syscall_nr = next_key;
                 strncpy(stats[stat_count].syscall_name, get_syscall_name(next_key), 31);
@@ -756,7 +783,8 @@ int main(int argc, char **argv) {
                 stat_count++;
             }
         }
-        key = next_key;
+        cur_key = next_key;
+        prev_key = &cur_key;
     }
     
     if (stat_count == 0) {
