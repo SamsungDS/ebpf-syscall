@@ -108,6 +108,43 @@ static void sig_handler(int sig) {
     running = false;
 }
 
+// Escape a string for JSON output: handles quote, backslash, and control chars.
+// Caller supplies a big-enough destination buffer; truncation is safe.
+static void json_escape(char *dst, size_t dst_sz, const char *src, size_t src_max) {
+    size_t o = 0;
+    if (dst_sz == 0) return;
+    for (size_t i = 0; i < src_max && src[i] != '\0'; i++) {
+        unsigned char c = (unsigned char)src[i];
+        const char *esc = NULL;
+        char ubuf[8];
+        switch (c) {
+            case '"':  esc = "\\\""; break;
+            case '\\': esc = "\\\\"; break;
+            case '\b': esc = "\\b"; break;
+            case '\f': esc = "\\f"; break;
+            case '\n': esc = "\\n"; break;
+            case '\r': esc = "\\r"; break;
+            case '\t': esc = "\\t"; break;
+            default:
+                if (c < 0x20) {
+                    snprintf(ubuf, sizeof(ubuf), "\\u%04x", c);
+                    esc = ubuf;
+                }
+                break;
+        }
+        if (esc) {
+            size_t n = strlen(esc);
+            if (o + n + 1 >= dst_sz) break;
+            memcpy(dst + o, esc, n);
+            o += n;
+        } else {
+            if (o + 2 >= dst_sz) break;
+            dst[o++] = (char)c;
+        }
+    }
+    dst[o] = '\0';
+}
+
 // Ring buffer event handler with dynamic reallocation
 static int handle_event(void *ctx, void *data, size_t data_sz) {
     const struct syscall_event *e = data;
@@ -559,22 +596,29 @@ static void export_to_json(struct syscall_stat *stats, int stat_count,
         fprintf(fp, "  \"raw_events\": [\n");
         for(int i = 0; i < event_count; i++) {
             struct syscall_event *e = &events[i];
+            char esc_comm[64];
+            char esc_filename[512];
+            char esc_flags[64];
+            json_escape(esc_comm, sizeof(esc_comm), e->comm, MAX_COMM_LEN);
+            json_escape(esc_filename, sizeof(esc_filename), e->filename, sizeof(e->filename));
+            json_escape(esc_flags, sizeof(esc_flags), e->open_flags_str, sizeof(e->open_flags_str));
             fprintf(fp, "    {\n");
             fprintf(fp, "      \"timestamp_ns\": %lu,\n", e->timestamp);
             fprintf(fp, "      \"timestamp_ms\": %.3f,\n", e->timestamp / 1000000.0);
             fprintf(fp, "      \"pid\": %u,\n", e->pid);
-            fprintf(fp, "      \"process_name\": \"%s\",\n", e->comm);
+            fprintf(fp, "      \"process_name\": \"%s\",\n", esc_comm);
             fprintf(fp, "      \"syscall_nr\": %u,\n", e->syscall_nr);
             fprintf(fp, "      \"syscall_name\": \"%s\",\n", get_syscall_name(e->syscall_nr));
             fprintf(fp, "      \"fd\": %u,\n", e->fd);
             fprintf(fp, "      \"size\": %lu,\n", e->size);
-            fprintf(fp, "      \"offset\": %lu\n", e->offset);
-	    fprintf(fp, "      \"filename\": \"%s\",\n", e->filename);
-	    fprintf(fp, "      \"open_flags_hex\": %u,\n", e->open_flags_hex);
-	    fprintf(fp, "      \"open_flags_str\": \"%s\"\n", e->open_flags_str);
-	    fprintf(fp, "      \"io_direction\": \"%s\",\n", e->ddir == 0 ? "READ" : e->ddir == 1 ? "WRITE" : e->ddir == 2 ? "VREAD" : "VWRITE");
-	    fprintf(fp, "      \"ret\": %ld,\n", e->ret);
-	    fprintf(fp, "      \"error_code\": %ld,\n", e->error_code);
+            fprintf(fp, "      \"offset\": %lu,\n", e->offset);
+            fprintf(fp, "      \"filename\": \"%s\",\n", esc_filename);
+            fprintf(fp, "      \"open_flags_hex\": %u,\n", e->open_flags_hex);
+            fprintf(fp, "      \"open_flags_str\": \"%s\",\n", esc_flags);
+            fprintf(fp, "      \"io_direction\": \"%s\",\n",
+                    e->ddir == 0 ? "READ" : e->ddir == 1 ? "WRITE" : e->ddir == 2 ? "VREAD" : "VWRITE");
+            fprintf(fp, "      \"ret\": %ld,\n", e->ret);
+            fprintf(fp, "      \"error_code\": %ld\n", e->error_code);
             fprintf(fp, "    }%s\n", (i < event_count - 1) ? "," : "");
         }
         fprintf(fp, "  ]\n");
