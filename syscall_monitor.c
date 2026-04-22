@@ -78,6 +78,13 @@ static int max_events = MAX_EVENTS;
 static bool detailed_logging = false;
 static int events_dropped = 0;
 
+// CLI-driven, non-interactive run options
+static bool opt_non_interactive = false;
+static int  opt_duration = -1;               // seconds; -1 = unset
+static int  opt_detailed_logging = -1;       // -1 unset, 0 off, 1 on
+static const char *opt_json_out = NULL;      // path or NULL
+static const char *opt_label = NULL;         // workload label or NULL
+
 // Syscall name mapping
 static const char* get_syscall_name(uint32_t nr) {
     switch(nr) {
@@ -540,7 +547,13 @@ static void export_to_json(struct syscall_stat *stats, int stat_count,
     fprintf(fp, "    \"total_events\": %d,\n", event_count);
     fprintf(fp, "    \"monitoring_duration\": %.3f,\n", duration);
     fprintf(fp, "    \"unique_syscalls\": %d,\n", stat_count);
-    fprintf(fp, "    \"unique_processes\": %d\n", process_count);
+    fprintf(fp, "    \"unique_processes\": %d,\n", process_count);
+    if (opt_label && opt_label[0] != '\0') {
+        char esc[256];
+        json_escape(esc, sizeof(esc), opt_label, 255);
+        fprintf(fp, "    \"workload_label\": \"%s\",\n", esc);
+    }
+    fprintf(fp, "    \"detailed_logging\": %s\n", detailed_logging ? "true" : "false");
     fprintf(fp, "  },\n");
     
     // Summary
@@ -669,10 +682,33 @@ int main(int argc, char **argv) {
             if (max_events < 1000) max_events = 1000;
             if (max_events > 10000000) max_events = 10000000;
             i++;
+        } else if (strcmp(argv[i], "--duration") == 0 && i + 1 < argc) {
+            opt_duration = atoi(argv[i + 1]);
+            if (opt_duration <= 0) opt_duration = 1;
+            if (opt_duration > 3600) opt_duration = 3600;
+            i++;
+        } else if (strcmp(argv[i], "--detailed") == 0) {
+            opt_detailed_logging = 1;
+        } else if (strcmp(argv[i], "--no-detailed") == 0) {
+            opt_detailed_logging = 0;
+        } else if (strcmp(argv[i], "--json-out") == 0 && i + 1 < argc) {
+            opt_json_out = argv[i + 1];
+            i++;
+        } else if (strcmp(argv[i], "--label") == 0 && i + 1 < argc) {
+            opt_label = argv[i + 1];
+            i++;
+        } else if (strcmp(argv[i], "--no-prompt") == 0) {
+            opt_non_interactive = true;
         } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
             printf("Usage: %s [OPTIONS]\n", argv[0]);
             printf("Options:\n");
             printf("  --max-events N    Set maximum events to capture (default: %d)\n", MAX_EVENTS);
+            printf("  --duration N      Monitoring duration in seconds (non-interactive)\n");
+            printf("  --detailed        Enable detailed per-event logging (ring buffer)\n");
+            printf("  --no-detailed     Disable detailed per-event logging\n");
+            printf("  --json-out PATH   Auto-export results to PATH as JSON (implies no prompt for export)\n");
+            printf("  --label NAME      Workload label stored in JSON metadata (e.g. random_read)\n");
+            printf("  --no-prompt       Skip all interactive prompts; use flag defaults\n");
             printf("  --help, -h        Show this help message\n");
             return 0;
         }
@@ -691,21 +727,28 @@ int main(int argc, char **argv) {
     
     // Setup libbpf logging
     libbpf_set_print(libbpf_print_fn);
-    
-    // Ask user about detailed logging
-    printf("Enable detailed event logging? (y/N): ");
-    fflush(stdout);
-    if (fgets(input, sizeof(input), stdin)) {
-        detailed_logging = (input[0] == 'y' || input[0] == 'Y');
+
+    // Resolve detailed-logging / duration from flags or (if interactive) prompts.
+    if (opt_detailed_logging >= 0) {
+        detailed_logging = (opt_detailed_logging == 1);
+    } else if (!opt_non_interactive) {
+        printf("Enable detailed event logging? (y/N): ");
+        fflush(stdout);
+        if (fgets(input, sizeof(input), stdin)) {
+            detailed_logging = (input[0] == 'y' || input[0] == 'Y');
+        }
     }
-    
-    // Get monitoring duration
-    printf("Enter monitoring duration in seconds (default %d): ", duration);
-    fflush(stdout);
-    if (fgets(input, sizeof(input), stdin) && strlen(input) > 1) {
-        int user_duration = atoi(input);
-        if (user_duration > 0 && user_duration <= 3600) {
-            duration = user_duration;
+
+    if (opt_duration > 0) {
+        duration = opt_duration;
+    } else if (!opt_non_interactive) {
+        printf("Enter monitoring duration in seconds (default %d): ", duration);
+        fflush(stdout);
+        if (fgets(input, sizeof(input), stdin) && strlen(input) > 1) {
+            int user_duration = atoi(input);
+            if (user_duration > 0 && user_duration <= 3600) {
+                duration = user_duration;
+            }
         }
     }
     
@@ -832,12 +875,17 @@ int main(int argc, char **argv) {
     }
     
     if (stat_count == 0) {
-        printf("\nNo syscall data collected.\n");
-        printf("Try running some file operations in another terminal:\n");
-        printf("  cat /etc/passwd\n");
-        printf("  ls -la\n");
-        printf("  echo 'test' > /tmp/test.txt\n");
-        goto cleanup;
+        printf("\nNo aggregated syscall map data collected.\n");
+        // When we have raw events from the ring buffer we should still honour
+        // --json-out; callers (feature_aggregator.py) depend on the file
+        // existing. Only bail early in the purely-no-data case.
+        if (event_count == 0 && !(opt_json_out && opt_json_out[0])) {
+            printf("Try running some file operations in another terminal:\n");
+            printf("  cat /etc/passwd\n");
+            printf("  ls -la\n");
+            printf("  echo 'test' > /tmp/test.txt\n");
+            goto cleanup;
+        }
     }
     
     // Sort by total size
@@ -908,24 +956,27 @@ int main(int argc, char **argv) {
         }
     }
     
-    // Ask about JSON export
-    printf("\nExport data to JSON? (Y/n): ");
-    fflush(stdout);
-    if (fgets(input, sizeof(input), stdin)) {
-        if (input[0] != 'n' && input[0] != 'N') {
-            printf("Enter filename (or press Enter for auto-generated): ");
-            fflush(stdout);
-            
-            char filename_input[256] = {0};
-            if (fgets(filename_input, sizeof(filename_input), stdin)) {
-                // Remove newline
-                size_t len = strlen(filename_input);
-                if (len > 0 && filename_input[len-1] == '\n') {
-                    filename_input[len-1] = '\0';
+    // JSON export: auto when --json-out is set; prompt only when interactive.
+    if (opt_json_out && opt_json_out[0] != '\0') {
+        export_to_json(stats, stat_count, processes, process_count, opt_json_out);
+    } else if (!opt_non_interactive) {
+        printf("\nExport data to JSON? (Y/n): ");
+        fflush(stdout);
+        if (fgets(input, sizeof(input), stdin)) {
+            if (input[0] != 'n' && input[0] != 'N') {
+                printf("Enter filename (or press Enter for auto-generated): ");
+                fflush(stdout);
+
+                char filename_input[256] = {0};
+                if (fgets(filename_input, sizeof(filename_input), stdin)) {
+                    size_t len = strlen(filename_input);
+                    if (len > 0 && filename_input[len-1] == '\n') {
+                        filename_input[len-1] = '\0';
+                    }
+
+                    export_to_json(stats, stat_count, processes, process_count,
+                                 strlen(filename_input) > 0 ? filename_input : NULL);
                 }
-                
-                export_to_json(stats, stat_count, processes, process_count, 
-                             strlen(filename_input) > 0 ? filename_input : NULL);
             }
         }
     }
