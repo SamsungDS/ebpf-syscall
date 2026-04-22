@@ -6,6 +6,31 @@
 #include <bpf/bpf_core_read.h>
 
 /*
+ * memcpy inside a BPF program is not a libbpf helper; it resolves to a
+ * normal C library call, which clang refuses to emit against the BPF
+ * target. Historically libbpf headers (and older clang versions) were
+ * lenient and allowed the implicit declaration to slip through, but
+ * clang 14+ with the BPF target rejects the implicit prototype:
+ *
+ *   syscall_monitor.bpf.c:159:5: error: call to undeclared library
+ *   function 'memcpy' with type 'void *(void *, const void *, unsigned
+ *   long)'; ISO C99 and later do not support implicit function
+ *   declarations
+ *
+ * This fails the build on Debian trixie (clang 19, kernel 6.16) even
+ * though the code was compiling fine on older toolchains.
+ *
+ * The compiler provides __builtin_memcpy, which clang happily lowers to
+ * the BPF memory moves the verifier already understands. Route every
+ * memcpy() in this translation unit through the builtin via a macro
+ * shim so the BPF source stays readable and future copies do not have
+ * to remember the quirk.
+ */
+#ifndef memcpy
+#define memcpy(dst, src, n) __builtin_memcpy((dst), (src), (n))
+#endif
+
+/*
  * PT_REGS_PARM6 is missing in many libbpf versions because
  * the 6th syscall arg doesn't pass through a standard calling
  * convention register on all archs. Define it per-arch if absent.
