@@ -3,7 +3,8 @@ ARCH = $(shell uname -m | sed 's/x86_64/x86/' | sed 's/aarch64/arm64/')
 
 # Directories
 LIBBPF_DIR = ./libbpf
-INCLUDES = -I$(LIBBPF_DIR)/src -I.
+LIBBPF_HDR_DIR = $(LIBBPF_DIR)/install_headers/usr/include
+INCLUDES = -I$(LIBBPF_HDR_DIR) -I$(LIBBPF_DIR)/src -I.
 LIBS_DIR = -L$(LIBBPF_DIR)/src
 LIBS = -lbpf -lelf -lz
 
@@ -30,6 +31,10 @@ setup:
 		git clone --depth 1 https://github.com/libbpf/libbpf.git $(LIBBPF_DIR); \
 	fi
 	@$(MAKE) -C $(LIBBPF_DIR)/src
+	@if [ ! -f "$(LIBBPF_HDR_DIR)/bpf/bpf_helpers.h" ]; then \
+		echo "Installing libbpf headers into $(LIBBPF_HDR_DIR)..."; \
+		$(MAKE) -C $(LIBBPF_DIR)/src install_headers DESTDIR=../install_headers prefix=/usr; \
+	fi
 	@echo "Checking for bpftool..."
 	@if ! command -v bpftool >/dev/null 2>&1; then \
 		echo "Installing bpftool..."; \
