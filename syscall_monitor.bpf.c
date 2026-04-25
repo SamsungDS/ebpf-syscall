@@ -198,27 +198,18 @@ static __always_inline void log_event(u32 syscall_nr, u32 fd, u64 size, u64 offs
     bpf_ringbuf_submit(event, 0);
 }
 
-// read syscall tracepoint
-SEC("kprobe/__x64_sys_read")
-int trace_read_entry(struct pt_regs *ctx)
+// read syscall: sys_enter tracepoint exposes typed args directly.
+// Using kprobe/__x64_sys_read here would attach to the syscall wrapper
+// whose only argument is 'struct pt_regs *regs', so PT_REGS_PARM* would
+// read garbage off the kprobe-time register state instead of the syscall
+// arguments. Tracepoints don't have that problem - they fire with the
+// already-decoded args.
+SEC("tracepoint/syscalls/sys_enter_read")
+int trace_read_entry(struct trace_event_raw_sys_enter *ctx)
 {
     u32 syscall_nr = 0; // read
-    int fd = (int)PT_REGS_PARM1(ctx);
-    size_t count = (size_t)PT_REGS_PARM3(ctx);
-
-    update_stats(syscall_nr, count);
-    log_event(syscall_nr, fd, count, 0, "", 0, "", -1,-1);
-
-    return 0;
-}
-
-// write syscall tracepoint
-SEC("kprobe/__x64_sys_write")
-int trace_write_entry(struct pt_regs *ctx)
-{
-    u32 syscall_nr = 1; // write
-    int fd = (int)PT_REGS_PARM1(ctx);
-    size_t count = (size_t)PT_REGS_PARM3(ctx);
+    int fd = (int)ctx->args[0];
+    size_t count = (size_t)ctx->args[2];
 
     update_stats(syscall_nr, count);
     log_event(syscall_nr, fd, count, 0, "", 0, "", -1, -1);
@@ -226,9 +217,21 @@ int trace_write_entry(struct pt_regs *ctx)
     return 0;
 }
 
-// open syscall tracepoint
-SEC("kprobe/__x64_sys_open")
-int trace_open_entry(struct pt_regs *ctx)
+SEC("tracepoint/syscalls/sys_enter_write")
+int trace_write_entry(struct trace_event_raw_sys_enter *ctx)
+{
+    u32 syscall_nr = 1; // write
+    int fd = (int)ctx->args[0];
+    size_t count = (size_t)ctx->args[2];
+
+    update_stats(syscall_nr, count);
+    log_event(syscall_nr, fd, count, 0, "", 0, "", -1, -1);
+
+    return 0;
+}
+
+SEC("tracepoint/syscalls/sys_enter_open")
+int trace_open_entry(struct trace_event_raw_sys_enter *ctx)
 {
     u32 syscall_nr = 2; // open
 
@@ -319,12 +322,11 @@ int trace_openat(struct trace_event_raw_sys_enter *ctx)
     return 0;
 }
 
-// close syscall tracepoint
-SEC("kprobe/__x64_sys_close")
-int trace_close_entry(struct pt_regs *ctx)
+SEC("tracepoint/syscalls/sys_enter_close")
+int trace_close_entry(struct trace_event_raw_sys_enter *ctx)
 {
     u32 syscall_nr = 3; // close
-    unsigned int fd = (unsigned int)PT_REGS_PARM1(ctx);
+    unsigned int fd = (unsigned int)ctx->args[0];
 
     update_stats(syscall_nr, 1);
     log_event(syscall_nr, fd, 1, 0, "", 0, "", -1, -1);
@@ -332,13 +334,12 @@ int trace_close_entry(struct pt_regs *ctx)
     return 0;
 }
 
-// lseek syscall tracepoint
-SEC("kprobe/__x64_sys_lseek")
-int trace_lseek_entry(struct pt_regs *ctx)
+SEC("tracepoint/syscalls/sys_enter_lseek")
+int trace_lseek_entry(struct trace_event_raw_sys_enter *ctx)
 {
     u32 syscall_nr = 8; // lseek
-    unsigned int fd = (unsigned int)PT_REGS_PARM1(ctx);
-    off_t offset = (off_t)PT_REGS_PARM2(ctx);
+    unsigned int fd = (unsigned int)ctx->args[0];
+    off_t offset = (off_t)ctx->args[1];
     u64 abs_offset = offset > 0 ? offset : -offset;
 
     update_stats(syscall_nr, abs_offset);
@@ -347,14 +348,13 @@ int trace_lseek_entry(struct pt_regs *ctx)
     return 0;
 }
 
-// pread64 syscall tracepoint
-SEC("kprobe/__x64_sys_pread64")
-int trace_pread_entry(struct pt_regs *ctx)
+SEC("tracepoint/syscalls/sys_enter_pread64")
+int trace_pread_entry(struct trace_event_raw_sys_enter *ctx)
 {
     u32 syscall_nr = 17; // pread64
-    unsigned int fd = (unsigned int)PT_REGS_PARM1(ctx);
-    size_t count = (size_t)PT_REGS_PARM3(ctx);
-    loff_t pos = (loff_t)PT_REGS_PARM4(ctx);
+    unsigned int fd = (unsigned int)ctx->args[0];
+    size_t count = (size_t)ctx->args[2];
+    loff_t pos = (loff_t)ctx->args[3];
 
     update_stats(syscall_nr, count);
     log_event(syscall_nr, fd, count, pos, "", 0, "", -1, -1);
@@ -362,14 +362,13 @@ int trace_pread_entry(struct pt_regs *ctx)
     return 0;
 }
 
-// pwrite64 syscall tracepoint
-SEC("kprobe/__x64_sys_pwrite64")
-int trace_pwrite_entry(struct pt_regs *ctx)
+SEC("tracepoint/syscalls/sys_enter_pwrite64")
+int trace_pwrite_entry(struct trace_event_raw_sys_enter *ctx)
 {
     u32 syscall_nr = 18; // pwrite64
-    unsigned int fd = (unsigned int)PT_REGS_PARM1(ctx);
-    size_t count = (size_t)PT_REGS_PARM3(ctx);
-    loff_t pos = (loff_t)PT_REGS_PARM4(ctx);
+    unsigned int fd = (unsigned int)ctx->args[0];
+    size_t count = (size_t)ctx->args[2];
+    loff_t pos = (loff_t)ctx->args[3];
 
     update_stats(syscall_nr, count);
     log_event(syscall_nr, fd, count, pos, "", 0, "", -1, -1);
@@ -377,14 +376,14 @@ int trace_pwrite_entry(struct pt_regs *ctx)
     return 0;
 }
 
-// mmap syscall tracepoint
-SEC("kprobe/__x64_sys_mmap")
-int trace_mmap_entry(struct pt_regs *ctx)
+// mmap(addr, length, prot, flags, fd, offset)
+SEC("tracepoint/syscalls/sys_enter_mmap")
+int trace_mmap_entry(struct trace_event_raw_sys_enter *ctx)
 {
-    u32 syscall_nr = 9; // mmap syscall
-    unsigned int fd = (unsigned int)PT_REGS_PARM5(ctx);
-    size_t length = (size_t)PT_REGS_PARM2(ctx);
-    loff_t offset = (loff_t)PT_REGS_PARM6(ctx);
+    u32 syscall_nr = 9; // mmap
+    size_t length = (size_t)ctx->args[1];
+    unsigned int fd = (unsigned int)ctx->args[4];
+    loff_t offset = (loff_t)ctx->args[5];
 
     update_stats(syscall_nr, length);
     log_event(syscall_nr, fd, length, offset, "", 0, "", -1, -1);
@@ -392,57 +391,51 @@ int trace_mmap_entry(struct pt_regs *ctx)
     return 0;
 }
 
-//munmap syscall tracepoint
-SEC("kprobe/__x64_sys_munmap")
-int trace_munmap_entry(struct pt_regs *ctx)
+// munmap(addr, length): no fd, no offset
+SEC("tracepoint/syscalls/sys_enter_munmap")
+int trace_munmap_entry(struct trace_event_raw_sys_enter *ctx)
 {
-    u32 syscall_nr = 11; //munmap syscall
-    unsigned int fd = (unsigned int)PT_REGS_PARM5(ctx);
-    size_t length = (size_t)PT_REGS_PARM2(ctx);
-    loff_t offset = (loff_t)PT_REGS_PARM6(ctx);
+    u32 syscall_nr = 11; // munmap
+    size_t length = (size_t)ctx->args[1];
 
     update_stats(syscall_nr, length);
-    log_event(syscall_nr, fd, length, offset, "", 0, "", -1, -1);
+    log_event(syscall_nr, 0, length, 0, "", 0, "", -1, -1);
 
     return 0;
 }
 
-// readv syscall tracepoint
-SEC("kprobe/__x64_sys_readv")
-int trace_readv_entry(struct pt_regs *ctx)
+// readv(fd, iov, iovcnt): record fd and iovcnt as a density signal.
+SEC("tracepoint/syscalls/sys_enter_readv")
+int trace_readv_entry(struct trace_event_raw_sys_enter *ctx)
 {
     u32 syscall_nr = 19; // readv
-    unsigned int fd = (unsigned int)PT_REGS_PARM1(ctx);
-    size_t count = (size_t)PT_REGS_PARM3(ctx);
-    loff_t pos = (loff_t)PT_REGS_PARM4(ctx);
+    unsigned int fd = (unsigned int)ctx->args[0];
+    size_t iovcnt = (size_t)ctx->args[2];
 
-    update_stats(syscall_nr, count);
-    log_event(syscall_nr, fd, count, pos, "", 0, "", -1, -1);
+    update_stats(syscall_nr, iovcnt);
+    log_event(syscall_nr, fd, iovcnt, 0, "", 0, "", -1, -1);
 
     return 0;
 }
 
-// writev syscall tracepoint
-SEC("kprobe/__x64_sys_writev")
-int trace_writev_entry(struct pt_regs *ctx)
+SEC("tracepoint/syscalls/sys_enter_writev")
+int trace_writev_entry(struct trace_event_raw_sys_enter *ctx)
 {
     u32 syscall_nr = 20; // writev
-    unsigned int fd = (unsigned int)PT_REGS_PARM1(ctx);
-    size_t count = (size_t)PT_REGS_PARM3(ctx);
-    loff_t pos = (loff_t)PT_REGS_PARM4(ctx);
+    unsigned int fd = (unsigned int)ctx->args[0];
+    size_t iovcnt = (size_t)ctx->args[2];
 
-    update_stats(syscall_nr, count);
-    log_event(syscall_nr, fd, count, pos, "", 0, "", -1, -1);
+    update_stats(syscall_nr, iovcnt);
+    log_event(syscall_nr, fd, iovcnt, 0, "", 0, "", -1, -1);
 
     return 0;
 }
 
-// fsync syscall tracepoint
-SEC("kprobe/__x64_sys_fsync")
-int trace_fsync_entry(struct pt_regs *ctx)
+SEC("tracepoint/syscalls/sys_enter_fsync")
+int trace_fsync_entry(struct trace_event_raw_sys_enter *ctx)
 {
     u32 syscall_nr = 74; // fsync
-    unsigned int fd = (unsigned int)PT_REGS_PARM1(ctx);
+    unsigned int fd = (unsigned int)ctx->args[0];
 
     update_stats(syscall_nr, 1);
     log_event(syscall_nr, fd, 1, 0, "", 0, "", -1, -1);
