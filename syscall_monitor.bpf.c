@@ -105,6 +105,15 @@ struct {
     __uint(max_entries, 8 * 1024 * 1024);  // 8MB ring buffer (increased from 256KB)
 } events SEC(".maps");
 
+// struct used to map the timestamps to pid_tgid
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, MAX_ENTRIES);
+    __type(key, u64);     // pid_tgid
+    __type(value, u64);   // timestamp captured at mmap entry
+} mmap_entry_map SEC(".maps");
+
+
 // Global flag to control detailed logging
 volatile const bool detailed_logging = true;
 volatile const unsigned int sampling_rate = 1;  // Sample 1 out of every N events (1 = capture all)
@@ -151,6 +160,30 @@ static __always_inline void log_event(u32 syscall_nr, u32 fd, u64 size, u64 offs
 
     event->timestamp = bpf_ktime_get_ns();
     event->pid = bpf_get_current_pid_tgid() >> 32;
+    u64 pid_tgid = bpf_get_current_pid_tgid();
+    if (syscall_nr == 9) {   /* mmap */
+        if (filename[0] == '\0') {
+            /*
+             * mmap ENTRY — capture fresh timestamp, save it
+             * in map keyed by pid_tgid for exit to reuse
+             */
+            u64 ts = bpf_ktime_get_ns();
+            event->timestamp = ts;
+            bpf_map_update_elem(&mmap_entry_map, &pid_tgid, &ts, BPF_ANY);
+
+        } else {
+            /*
+             * mmap EXIT — reuse the exact timestamp from entry
+             * so both log records are correlated by (pid_tgid, timestamp)
+             */
+            u64 *saved_ts = bpf_map_lookup_elem(&mmap_entry_map, &pid_tgid);
+            event->timestamp = saved_ts ? *saved_ts : bpf_ktime_get_ns();
+            bpf_map_delete_elem(&mmap_entry_map, &pid_tgid);  // cleanup
+        }
+    } else {
+        // all other syscalls — fresh timestamp
+        event->timestamp = bpf_ktime_get_ns();
+    }
     event->syscall_nr = syscall_nr;
     event->fd = fd;
     event->size = size;
@@ -407,6 +440,32 @@ int trace_mmap_entry(struct pt_regs *ctx)
 
     update_stats(syscall_nr, length);
     log_event(syscall_nr, fd, length, offset, "", 0, open_flags_str, -1, -1);
+
+    return 0;
+}
+
+/*mmap exit syscall tracepoint */
+SEC("kretprobe/__x64_sys_mmap")
+int trace_mmap_exit(struct pt_regs *ctx)
+{
+    u32 syscall_nr = 9; // mmap syscall
+    unsigned long ret_addr = (unsigned long)PT_REGS_RC(ctx);
+
+    char filename[256] = {};
+    if (ret_addr == (unsigned long)-1UL) {
+        filename[0] = '0'; filename[1] = 'x'; filename[2] = '0'; filename[3] = '\0';
+    } else {
+        const char hex[] = "0123456789abcdef";
+        filename[0] = '0';
+        filename[1] = 'x';
+        #pragma unroll
+        for (int i = 0; i < 16; i++)
+            filename[2 + i] = hex[(ret_addr >> ((15 - i) * 4)) & 0xF];
+        filename[18] = '\0';
+    }
+
+    update_stats(syscall_nr, 0);
+    log_event(syscall_nr, 0, 0, 0, filename, 0, "", -1, -1);
 
     return 0;
 }
