@@ -5,7 +5,6 @@
 #include <bpf/bpf_tracing.h>
 #include <bpf/bpf_core_read.h>
 
-
 /*
  * PT_REGS_PARM6 is missing in many libbpf versions because
  * the 6th syscall arg doesn't pass through a standard calling
@@ -79,7 +78,7 @@ struct syscall_event {
     char comm[MAX_COMM_LEN];
     char filename[256];
     u32 open_flags_hex;
-    char open_flags_str[20];
+    char open_flags_str[128];
     enum io_direction ddir;
     long ret;  /* holds the number of bytes transferred */
     long error_code;  /* holds the error code returned by the syscall */
@@ -131,7 +130,7 @@ static __always_inline void update_stats(u32 syscall_nr, u64 size)
     }
 }
 
-static __always_inline void log_event(u32 syscall_nr, u32 fd, u64 size, u64 offset, char filename[256], int open_flags_hex, char  open_flags_str[20], long ret, long error_code)
+static __always_inline void log_event(u32 syscall_nr, u32 fd, u64 size, u64 offset, char filename[256], int open_flags_hex, char  open_flags_str[128], long ret, long error_code)
 {
     struct syscall_event *event;
 
@@ -229,7 +228,7 @@ int trace_openat(struct trace_event_raw_sys_enter *ctx)
         return 0;
     }
 
-    char open_flags_str[80] = {0};
+    char open_flags_str[128] = {0};
 
     int accmode  = open_flags_hex & O_ACCMODE;
 
@@ -358,12 +357,56 @@ SEC("kprobe/__x64_sys_mmap")
 int trace_mmap_entry(struct pt_regs *ctx)
 {
     u32 syscall_nr = 9; // mmap syscall
-    unsigned int fd = (unsigned int)PT_REGS_PARM5(ctx);
-    size_t length = (size_t)PT_REGS_PARM2(ctx);
-    loff_t offset = (loff_t)PT_REGS_PARM6(ctx);
+    /*
+     * Safely read the inner pt_regs pointer via bpf_probe_read_kernel.
+     * Direct cast of PT_REGS_PARM1(ctx) gives a scalar the verifier
+     * won't allow dereferencing — read it through the helper instead.
+     */
+    struct pt_regs inner = {};
+    struct pt_regs *inner_ptr = (struct pt_regs *)PT_REGS_PARM1(ctx);
+    if (bpf_probe_read_kernel(&inner, sizeof(inner), inner_ptr) < 0)
+        return 0;
+
+    /* now read args from the local copy — all lvalues, verifier happy */
+    unsigned int fd        = (unsigned int)PT_REGS_PARM5(&inner);
+    size_t       length    = (size_t)PT_REGS_PARM2(&inner);
+    loff_t       offset    = (loff_t)PT_REGS_PARM6(&inner);
+    int          prot      = (int)PT_REGS_PARM3(&inner);
+    int          map_flags = (int)inner.r10;
+    char open_flags_str[128] = {};
+    __u32 pos    = 0;
+    int   need_sep = 0;
+
+     /*
+     * Pack prot and map_flags as "PROT:FLAGS" hex string — tiny, fixed size,
+     * no unrolled loops. Decoded in userspace parse_mmap_flags().
+     * e.g. prot=3, map_flags=2 → "0x00000003:0x00000002"
+     */
+
+    /* emit "0x" + 8 hex digits for prot */
+    const char hex[] = "0123456789abcdef";
+    open_flags_str[pos++] = '0';
+    open_flags_str[pos++] = 'x';
+    #pragma unroll
+    for (int i = 7; i >= 0; i--)
+        open_flags_str[pos++] = hex[((unsigned)prot >> (i * 4)) & 0xF];
+
+    open_flags_str[pos++] = ':';
+
+    /* emit "0x" + 8 hex digits for map_flags */
+    open_flags_str[pos++] = '0';
+    open_flags_str[pos++] = 'x';
+    #pragma unroll
+    for (int i = 7; i >= 0; i--)
+        open_flags_str[pos++] = hex[((unsigned)map_flags >> (i * 4)) & 0xF];
+
+    open_flags_str[pos] = '\0';
+    /* result: "0x00000003:0x00000002" — 21 bytes, fixed, verifier-friendly */
+
+    open_flags_str[pos] = '\0';
 
     update_stats(syscall_nr, length);
-    log_event(syscall_nr, fd, length, offset, "", 0, "", -1, -1);
+    log_event(syscall_nr, fd, length, offset, "", 0, open_flags_str, -1, -1);
 
     return 0;
 }

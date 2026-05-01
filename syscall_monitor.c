@@ -33,7 +33,7 @@ struct syscall_event {
     char comm[MAX_COMM_LEN];
     char filename[256];
     uint32_t open_flags_hex;
-    char open_flags_str[256];
+    char open_flags_str[128];
     enum io_direction ddir;
     long ret;  /* holds the number of bytes transferred */
     long error_code;  /* holds the error code returned by the syscall */
