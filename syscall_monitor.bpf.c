@@ -74,7 +74,7 @@ struct syscall_event {
     u32 syscall_nr;
     u32 fd;
     u64 size;
-    u64 offset;
+    s64 offset;
     char comm[MAX_COMM_LEN];
     char filename[256];
     u32 open_flags_hex;
@@ -345,12 +345,21 @@ SEC("kprobe/__x64_sys_lseek")
 int trace_lseek_entry(struct pt_regs *ctx)
 {
     u32 syscall_nr = 8; // lseek
-    unsigned int fd = (unsigned int)PT_REGS_PARM1(ctx);
-    off_t offset = (off_t)PT_REGS_PARM2(ctx);
-    u64 abs_offset = offset > 0 ? offset : -offset;
+    struct pt_regs inner = {};
+    struct pt_regs *inner_ptr = (struct pt_regs *)PT_REGS_PARM1(ctx);
+    if (bpf_probe_read_kernel(&inner, sizeof(inner), inner_ptr) < 0)
+        return 0;
+
+    struct pt_regs *p = &inner;
+
+    unsigned int fd     = (unsigned int)PT_REGS_PARM1(p);  /* rdi ✓ */
+    s64        offset = (s64)PT_REGS_PARM2(p);         /* rsi ✓ */
+    unsigned int whence = (unsigned int)PT_REGS_PARM3(p);  /* rdx ✓ */
+
+    u64 abs_offset = offset > 0 ? (u64)offset : (u64)-offset;
 
     update_stats(syscall_nr, abs_offset);
-    log_event(syscall_nr, fd, abs_offset, offset, "", 0, "", -1, -1);
+    log_event(syscall_nr, fd, abs_offset, (loff_t)offset, "", whence, "", -1, -1);
 
     return 0;
 }
