@@ -58,12 +58,12 @@ $(TARGET): syscall_monitor.c $(SKEL)
 	$(CC) $(CFLAGS) $(INCLUDES) syscall_monitor.c $(LIBS_DIR) $(LIBS) -o $@
 
 vmlinux.h:
-	@echo "Generating vmlinux.h..."
-	@if command -v bpftool >/dev/null 2>&1; then \
-		bpftool btf dump file /sys/kernel/btf/vmlinux format c > vmlinux.h; \
+	@echo "Generating vmlinux.h from running kernel..."
+	@if [ -n "$(BPFTOOL)" ] && [ -x "$(BPFTOOL)" ]; then \
+		$(BPFTOOL) btf dump file /sys/kernel/btf/vmlinux format c > vmlinux.h; \
 	else \
-		echo "bpftool not found, downloading vmlinux.h..."; \
-		curl -s https://raw.githubusercontent.com/libbpf/libbpf-bootstrap/master/vmlinux/vmlinux.h -o vmlinux.h; \
+		echo "ERROR: bpftool not found (tried BPFTOOL=$(BPFTOOL))"; \
+		exit 1; \
 	fi
 
 install-deps:
