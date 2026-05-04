@@ -1,32 +1,43 @@
 CC = gcc
 ARCH = $(shell uname -m | sed 's/x86_64/x86/' | sed 's/aarch64/arm64/')
 
-# Directories
-LIBBPF_DIR = ./libbpf
-LIBBPF_HDR_DIR = $(LIBBPF_DIR)/install_headers/usr/include
-INCLUDES = -I$(LIBBPF_HDR_DIR) -I$(LIBBPF_DIR)/src -I.
-LIBS_DIR = -L$(LIBBPF_DIR)/src
-LIBS = -lbpf -lelf -lz
+# Use system libbpf if available (libbpf-dev >= 1.0), else fall back to
+# building from source in ./libbpf/
+LIBBPF_SYSTEM := $(shell pkg-config --exists libbpf 2>/dev/null && echo yes || echo no)
+
+ifeq ($(LIBBPF_SYSTEM),yes)
+  INCLUDES  = $(shell pkg-config --cflags libbpf) -I.
+  LIBS_DIR  =
+  LIBS      = $(shell pkg-config --libs libbpf) -lelf -lz
+  BPFTOOL   = $(shell command -v bpftool || command -v /usr/sbin/bpftool)
+else
+  LIBBPF_DIR     = ./libbpf
+  LIBBPF_HDR_DIR = $(LIBBPF_DIR)/install_headers/usr/include
+  INCLUDES       = -I$(LIBBPF_HDR_DIR) -I$(LIBBPF_DIR)/src -I.
+  LIBS_DIR       = -L$(LIBBPF_DIR)/src
+  LIBS           = -lbpf -lelf -lz
+  BPFTOOL        = bpftool
+endif
 
 # Compiler flags
-CFLAGS = -g -O2 -Wall -Wextra
+CFLAGS     = -g -O2 -Wall -Wextra
 BPF_CFLAGS = -g -O2 -target bpf -D__TARGET_ARCH_$(ARCH)
-
-# Tools
-CLANG = clang
-BPFTOOL = bpftool
+CLANG      = clang
 
 # Targets
-TARGET = syscall_monitor
+TARGET  = syscall_monitor
 BPF_OBJ = syscall_monitor.bpf.o
-SKEL = syscall_monitor.skel.h
+SKEL    = syscall_monitor.skel.h
 
 .PHONY: all clean setup
 
 all: setup $(TARGET)
 
 setup:
-	@echo "Setting up libbpf..."
+ifeq ($(LIBBPF_SYSTEM),yes)
+	@echo "Using system libbpf ($(shell pkg-config --modversion libbpf))"
+else
+	@echo "Setting up libbpf from source..."
 	@if [ ! -d "$(LIBBPF_DIR)" ]; then \
 		git clone --depth 1 https://github.com/libbpf/libbpf.git $(LIBBPF_DIR); \
 	fi
@@ -35,13 +46,7 @@ setup:
 		echo "Installing libbpf headers into $(LIBBPF_HDR_DIR)..."; \
 		$(MAKE) -C $(LIBBPF_DIR)/src install_headers DESTDIR=../install_headers prefix=/usr; \
 	fi
-	@echo "Checking for bpftool..."
-	@if ! command -v bpftool >/dev/null 2>&1; then \
-		echo "Installing bpftool..."; \
-		sudo apt-get update && sudo apt-get install -y linux-tools-common linux-tools-generic || \
-		sudo yum install -y bpftool || \
-		echo "Please install bpftool manually"; \
-	fi
+endif
 
 $(BPF_OBJ): syscall_monitor.bpf.c vmlinux.h
 	$(CLANG) $(BPF_CFLAGS) $(INCLUDES) -c syscall_monitor.bpf.c -o $@
