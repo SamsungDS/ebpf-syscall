@@ -694,8 +694,8 @@ long dispatch_one(const syscall_opt *opt, struct fd_map *fdmap, struct mmap_map 
 		    return -ENOMEM;
 		ret = read(replayed_fd, buf, (size_t)opt->size);
 		free(buf); buf = NULL;
-	    }
-	    break;
+	        }
+	        break;
 	case 1: /*write*/
 	    if (replayed_fd >= 0) {
 		buf = calloc(1, opt->size);
@@ -703,8 +703,8 @@ long dispatch_one(const syscall_opt *opt, struct fd_map *fdmap, struct mmap_map 
 		    return -ENOMEM;
 		ret = write(replayed_fd, buf, (size_t)opt->size);
 		free(buf); buf = NULL;
-	    }
-	    break;
+	        }
+	        break;
 	case 2: /*open*/
 		ret = open(opt->filename, opt->open_flags_hex, 0644);
 		if (ret >= 0)
@@ -717,9 +717,29 @@ long dispatch_one(const syscall_opt *opt, struct fd_map *fdmap, struct mmap_map 
 		fd_map_set(fdmap, opt->fd, -1);
 	        break;
 	case 8: /*lseek*/
-	        if (replayed_fd >= 0)
-		        ret = lseek(replayed_fd, (off_t)opt->offset, SEEK_SET);
-	       break;
+	        if (opt->ret == -1) {
+                        fprintf(stderr,
+                        "[replayer] lseek ts=%lu pid=%u: original failed, skipping\n",
+                        (unsigned long)opt->timestamp_ns, opt->pid);
+                        return -2;
+                }
+
+                if (replayed_fd < 0) {
+                        fprintf(stderr,
+                        "[replayer] lseek ts=%lu: fd=%d not in fd_map, skipping\n",
+                        (unsigned long)opt->timestamp_ns, opt->fd);
+                        return -2;
+               }
+
+		int whence = (int)opt->open_flags_hex;
+		off_t result = lseek(replayed_fd, (off_t)opt->offset, whence);
+                if (result == (off_t)-1) {
+                        ret = -1;
+                        break;
+                }
+
+                ret = (long)result;
+	        break;
 	case 9: /* mmap*/
 	        if (opt->filename[0] == '\0')
                         goto case_mmap_entry;
@@ -755,7 +775,7 @@ long dispatch_one(const syscall_opt *opt, struct fd_map *fdmap, struct mmap_map 
                       fprintf(stderr,
                     "[replayer] munmap cap=0x%016lx replay=%p  len=%ld  OK\n",
                     (unsigned long)cap_addr, replay_addr, (long)opt->size);
-               }
+                }
 
 	        break;
 	}
@@ -799,13 +819,13 @@ long dispatch_one(const syscall_opt *opt, struct fd_map *fdmap, struct mmap_map 
 		    return -ENOMEM;
 		ret = writev(replayed_fd, iov, iovcnt);
 		free_iov(iov);
-	    }
-	    break;
+	                }
+	        break;
 	case 74: /*fsync */
 	        if (replayed_fd >= 0) {
 		        ret = fsync(replayed_fd);
-	        }
-	    break;
+	                }
+	        break;
         case 257: /** openat  */
 		{ /* openat */
              int dirfd;
@@ -1055,7 +1075,7 @@ void *dispatcher_thread(void *arg)
 
 int main(void)
 {
-	FILE *fp = fopen("test_syscall_log.json", "r");
+	FILE *fp = fopen("test_lseek_fsync_prw.json", "r");
 	if (!fp) {
 		fprintf(stderr, "Error opening file\n");
 		return -1;
