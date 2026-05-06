@@ -496,8 +496,10 @@ sudo ./syscall_monitor
 # Export to JSON when prompted
 
 # Format the JSON file before feeding it to the parser
-#this will generate a file named syscalll_event_fixed.json
-python3 fix_json.py filename
+#this will generate a file named syscall_event_fixed.json
+# this script filters the process that is intended to be replayed
+#hence pass the process name as an option
+python3 fix_json.py filename fio
 
 #Then parse the JSON with syscall_replayer
 ./syscall_replayer
