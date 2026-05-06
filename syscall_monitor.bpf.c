@@ -211,11 +211,18 @@ SEC("kprobe/__x64_sys_read")
 int trace_read_entry(struct pt_regs *ctx)
 {
     u32 syscall_nr = 0; // read
-    int fd = (int)PT_REGS_PARM1(ctx);
-    size_t count = (size_t)PT_REGS_PARM3(ctx);
+    struct pt_regs inner = {};
+    struct pt_regs *inner_ptr = (struct pt_regs *)PT_REGS_PARM1(ctx);
+    if (bpf_probe_read_kernel(&inner, sizeof(inner), inner_ptr) < 0)
+        return 0;
 
-    update_stats(syscall_nr, count);
-    log_event(syscall_nr, fd, count, 0, "", 0, "", -1,-1);
+    struct pt_regs *p = &inner;
+    unsigned int fd   = (unsigned int)PT_REGS_PARM1(p);  /* rdi ✓ */
+    size_t       size = (size_t)PT_REGS_PARM3(p);        /* rdx ✓ */
+    /* read has no offset — positional read uses file position */
+
+    update_stats(syscall_nr, size);
+    log_event(syscall_nr, fd, size, 0, "", 0, "", -1,-1);
 
     return 0;
 }
@@ -225,11 +232,18 @@ SEC("kprobe/__x64_sys_write")
 int trace_write_entry(struct pt_regs *ctx)
 {
     u32 syscall_nr = 1; // write
-    int fd = (int)PT_REGS_PARM1(ctx);
-    size_t count = (size_t)PT_REGS_PARM3(ctx);
+    struct pt_regs inner = {};
+    struct pt_regs *inner_ptr = (struct pt_regs *)PT_REGS_PARM1(ctx);
+    if (bpf_probe_read_kernel(&inner, sizeof(inner), inner_ptr) < 0)
+        return 0;
 
-    update_stats(syscall_nr, count);
-    log_event(syscall_nr, fd, count, 0, "", 0, "", -1, -1);
+    struct pt_regs *p = &inner;
+    unsigned int fd   = (unsigned int)PT_REGS_PARM1(p);  /* rdi ✓ */
+    size_t       size = (size_t)PT_REGS_PARM3(p);        /* rdx ✓ */
+    /* write has no offset — positional write uses file position */
+
+    update_stats(syscall_nr, size);
+    log_event(syscall_nr, fd, size, 0, "", 0, "", -1, -1);
 
     return 0;
 }
@@ -332,7 +346,13 @@ SEC("kprobe/__x64_sys_close")
 int trace_close_entry(struct pt_regs *ctx)
 {
     u32 syscall_nr = 3; // close
-    unsigned int fd = (unsigned int)PT_REGS_PARM1(ctx);
+    struct pt_regs inner = {};
+    struct pt_regs *inner_ptr = (struct pt_regs *)PT_REGS_PARM1(ctx);
+    if (bpf_probe_read_kernel(&inner, sizeof(inner), inner_ptr) < 0)
+        return 0;
+    struct pt_regs *p = &inner;
+
+    unsigned int fd = (unsigned int)PT_REGS_PARM1(p);  /* rdi */
 
     update_stats(syscall_nr, 1);
     log_event(syscall_nr, fd, 1, 0, "", 0, "", -1, -1);
@@ -369,12 +389,22 @@ SEC("kprobe/__x64_sys_pread64")
 int trace_pread_entry(struct pt_regs *ctx)
 {
     u32 syscall_nr = 17; // pread64
-    unsigned int fd = (unsigned int)PT_REGS_PARM1(ctx);
-    size_t count = (size_t)PT_REGS_PARM3(ctx);
-    loff_t pos = (loff_t)PT_REGS_PARM4(ctx);
+    struct pt_regs inner = {};
+    struct pt_regs *inner_ptr = (struct pt_regs *)PT_REGS_PARM1(ctx);
+    if (bpf_probe_read_kernel(&inner, sizeof(inner), inner_ptr) < 0)
+        return 0;
 
-    update_stats(syscall_nr, count);
-    log_event(syscall_nr, fd, count, pos, "", 0, "", -1, -1);
+    struct pt_regs *p = &inner;
+
+    unsigned int fd     = (unsigned int)PT_REGS_PARM1(p);  /* rdi ✓ */
+    u64          buf    = (u64)PT_REGS_PARM2(p);           /* rsi — buf ptr, not logged */
+    size_t       size   = (size_t)PT_REGS_PARM3(p);        /* rdx ✓ */
+
+    /* pread64 arg4 = offset uses r10 not rcx — same as mmap arg4 */
+    loff_t offset = (loff_t)inner.r10;
+
+    update_stats(syscall_nr, size);
+    log_event(syscall_nr, fd, size, offset, "", 0, "", -1, -1);
 
     return 0;
 }
@@ -384,12 +414,19 @@ SEC("kprobe/__x64_sys_pwrite64")
 int trace_pwrite_entry(struct pt_regs *ctx)
 {
     u32 syscall_nr = 18; // pwrite64
-    unsigned int fd = (unsigned int)PT_REGS_PARM1(ctx);
-    size_t count = (size_t)PT_REGS_PARM3(ctx);
-    loff_t pos = (loff_t)PT_REGS_PARM4(ctx);
+    struct pt_regs inner = {};
+    struct pt_regs *inner_ptr = (struct pt_regs *)PT_REGS_PARM1(ctx);
+    if (bpf_probe_read_kernel(&inner, sizeof(inner), inner_ptr) < 0)
+        return 0;
 
-    update_stats(syscall_nr, count);
-    log_event(syscall_nr, fd, count, pos, "", 0, "", -1, -1);
+    struct pt_regs *p = &inner;
+
+    unsigned int fd     = (unsigned int)PT_REGS_PARM1(p);
+    size_t       size   = (size_t)PT_REGS_PARM3(p);
+    loff_t       offset = (loff_t)inner.r10;   /* arg4 = r10 ✓ */
+
+    update_stats(syscall_nr, size);
+    log_event(syscall_nr, fd, size, offset, "", 0, "", -1, -1);
 
     return 0;
 }
@@ -483,13 +520,29 @@ int trace_mmap_exit(struct pt_regs *ctx)
 SEC("kprobe/__x64_sys_munmap")
 int trace_munmap_entry(struct pt_regs *ctx)
 {
-    u32 syscall_nr = 11; //munmap syscall
-    unsigned int fd = (unsigned int)PT_REGS_PARM5(ctx);
-    size_t length = (size_t)PT_REGS_PARM2(ctx);
-    loff_t offset = (loff_t)PT_REGS_PARM6(ctx);
+    u32 syscall_nr = 11;
+    /* read only the two registers we need — not full pt_regs */
+    struct pt_regs *inner_ptr = (struct pt_regs *)PT_REGS_PARM1(ctx);
+
+    unsigned long addr   = 0;
+    size_t        length = 0;
+
+    /* read addr (rdi = offset 112) and length (rsi = offset 104) directly */
+    bpf_probe_read_kernel(&addr,   sizeof(addr),   &inner_ptr->di);
+    bpf_probe_read_kernel(&length, sizeof(length),  &inner_ptr->si);
+
+    /* encode addr as hex into filename[] — replayer uses it as cap_addr key */
+    char filename[256] = {};
+    const char hex[] = "0123456789abcdef";
+    filename[0] = '0';
+    filename[1] = 'x';
+    #pragma unroll
+    for (int i = 0; i < 16; i++)
+        filename[2 + i] = hex[(addr >> ((15 - i) * 4)) & 0xF];
+    filename[18] = '\0';
 
     update_stats(syscall_nr, length);
-    log_event(syscall_nr, fd, length, offset, "", 0, "", -1, -1);
+    log_event(syscall_nr, -1, length, 0, filename, 0, "", -1, -1);
 
     return 0;
 }
@@ -498,13 +551,18 @@ int trace_munmap_entry(struct pt_regs *ctx)
 SEC("kprobe/__x64_sys_readv")
 int trace_readv_entry(struct pt_regs *ctx)
 {
-    u32 syscall_nr = 19; // readv
-    unsigned int fd = (unsigned int)PT_REGS_PARM1(ctx);
-    size_t count = (size_t)PT_REGS_PARM3(ctx);
-    loff_t pos = (loff_t)PT_REGS_PARM4(ctx);
+    u32 syscall_nr = 19;
+    struct pt_regs inner = {};
+    struct pt_regs *inner_ptr = (struct pt_regs *)PT_REGS_PARM1(ctx);
+    if (bpf_probe_read_kernel(&inner, sizeof(inner), inner_ptr) < 0)
+        return 0;
+
+    struct pt_regs *p = &inner;
+    unsigned int fd    = (unsigned int)PT_REGS_PARM1(p);  /* rdi */
+    unsigned long count = (unsigned long)PT_REGS_PARM3(p); /* rdx = iovcnt */
 
     update_stats(syscall_nr, count);
-    log_event(syscall_nr, fd, count, pos, "", 0, "", -1, -1);
+    log_event(syscall_nr, fd, count, 0, "", 0, "", -1, -1);
 
     return 0;
 }
@@ -514,12 +572,17 @@ SEC("kprobe/__x64_sys_writev")
 int trace_writev_entry(struct pt_regs *ctx)
 {
     u32 syscall_nr = 20; // writev
-    unsigned int fd = (unsigned int)PT_REGS_PARM1(ctx);
-    size_t count = (size_t)PT_REGS_PARM3(ctx);
-    loff_t pos = (loff_t)PT_REGS_PARM4(ctx);
+    struct pt_regs inner = {};
+    struct pt_regs *inner_ptr = (struct pt_regs *)PT_REGS_PARM1(ctx);
+    if (bpf_probe_read_kernel(&inner, sizeof(inner), inner_ptr) < 0)
+        return 0;
+
+    struct pt_regs *p = &inner;
+    unsigned int fd    = (unsigned int)PT_REGS_PARM1(p);  /* rdi ✓ */
+    unsigned long count = (unsigned long)PT_REGS_PARM3(p); /* rdx = iovcnt ✓ */
 
     update_stats(syscall_nr, count);
-    log_event(syscall_nr, fd, count, pos, "", 0, "", -1, -1);
+    log_event(syscall_nr, fd, count, 0, "", 0, "", -1, -1);
 
     return 0;
 }
@@ -543,18 +606,22 @@ int trace_sys_exit(struct trace_event_raw_sys_exit *ctx)
 {
     u32 syscall_nr  = ctx->id;   // syscall number
     long ret = ctx->ret; // return value
-    long error_code = 0;
-    if (ret < 0 ) {
-	error_code  = -ret;
-    }
+    long error_code  = (ret < 0) ? ret : 0;   /* negative errno or 0 */
 
-    if (syscall_nr == 0 || syscall_nr == 1 || syscall_nr == 2 ||
-    syscall_nr == 257 || syscall_nr == 3 || syscall_nr == 8
-    || syscall_nr == 17 || syscall_nr == 18 || syscall_nr == 9 ||
-    syscall_nr == 11 || syscall_nr == 19 || syscall_nr == 20 || syscall_nr == 74) {
-        update_stats(syscall_nr, 1);
-        log_event(syscall_nr, -1, 1, 0,"", 0, "", ret, error_code);
-    }
+    /* filter to tracked syscalls only */
+    if (syscall_nr != 0  && syscall_nr != 1  && syscall_nr != 2  &&
+        syscall_nr != 3  && syscall_nr != 8  && syscall_nr != 9  &&
+        syscall_nr != 11 && syscall_nr != 17 && syscall_nr != 18 &&
+        syscall_nr != 19 && syscall_nr != 20 && syscall_nr != 74 &&
+        syscall_nr != 257)
+        return 0;
+
+    /*
+     * Exit record — fd=-1, size=1, offset=0 signals to the replayer
+     * that this is an exit record and should be skipped.
+     * Contains only ret and error_code — no syscall args.
+     */
+    log_event(syscall_nr, -1, 1, 0, "", 0, "", ret, error_code);
 
     return 0;
 }
