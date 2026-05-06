@@ -1175,6 +1175,14 @@ int main(void)
 			}
 
 			if (callsys_from_json(json_buffer, entry) == 0) {
+				/* filter out sys_exit tracepoint as ret and error code not needed for replay */
+				if ((int)entry->fd == -1      &&
+                                        entry->size   == 1       &&
+                                        entry->offset == 0       &&
+                                        entry->filename[0] == '\0') {
+                                        free(entry);
+                                        continue;
+                                }
 				printf("[parser] Enqueuing syscall: pid=%d syscall_nr=%d fd=%d\n",
 				       entry->pid, entry->syscall_nr, entry->fd);
 				callsys_printf(entry);    /*Uncomment only to print the parsed struct members */
