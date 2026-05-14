@@ -23,6 +23,7 @@
 #define RING_BUF_SIZE  4096  /* number of ring buffer entries */
 #define FD_MAP_BUCKETS 65536
 #define MAX_FD  65536
+#define MAX_TRACKED_PIDS 64
 
 #ifndef IOV_MAX
 #define IOV_MAX 1024   /* Linux kernel limit for iovec count */
@@ -77,6 +78,14 @@ struct fd_map {
 	struct fd_map_entry buckets[FD_MAP_BUCKETS];
 	pthread_mutex_t lock;
 };
+
+typedef struct {
+    uint32_t      pid;
+    struct fd_map *map;
+} pid_fdmap_entry_t;
+
+static pid_fdmap_entry_t pid_fdmap_table[MAX_TRACKED_PIDS];
+
 
 struct dispatcher_ctx {
 	struct ring_buf *rb;
@@ -303,6 +312,7 @@ int callsys_from_json(const char *utf8_json, syscall_opt *opt)
     if (!json) {
 	const char *err = cJSON_GetErrorPtr();
 	fprintf(stderr, "Error parsing JSON: %s\n", err ? err : "Unknown error");
+	fprintf(stderr, "Failed input (first 200 chars): %.200s\n", utf8_json);
 	return -1;
     }
 
@@ -494,6 +504,39 @@ void fd_map_set(struct fd_map *fdmap, int32_t captured_fd, int32_t replayed_fd)
 	}
 	pthread_mutex_unlock(&fdmap->lock);
 	return;
+}
+
+/* ── per-pid fd_map lookup/create ─────────────────────────────────── */
+static struct fd_map *get_fdmap_for_pid(uint32_t pid)
+{
+    for (int i = 0; i < MAX_TRACKED_PIDS; i++) {
+        if (pid_fdmap_table[i].pid == pid)
+            return pid_fdmap_table[i].map;
+    }
+    for (int i = 0; i < MAX_TRACKED_PIDS; i++) {
+        if (pid_fdmap_table[i].pid == 0) {
+            pid_fdmap_table[i].pid = pid;
+            pid_fdmap_table[i].map = calloc(1, sizeof(struct fd_map));
+            fd_map_init(pid_fdmap_table[i].map);
+            fprintf(stderr,
+                "[replayer] new fd_map for pid=%u (slot %d)\n", pid, i);
+            return pid_fdmap_table[i].map;
+        }
+    }
+    fprintf(stderr, "[replayer] pid_fdmap_table full\n");
+    return NULL;
+}
+
+static void free_all_pid_fdmaps(void)
+{
+    for (int i = 0; i < MAX_TRACKED_PIDS; i++) {
+        if (pid_fdmap_table[i].pid != 0) {
+            fd_map_destroy(pid_fdmap_table[i].map);
+            free(pid_fdmap_table[i].map);
+            pid_fdmap_table[i].pid = 0;
+            pid_fdmap_table[i].map = NULL;
+        }
+    }
 }
 
 /* ================================================================== */
@@ -707,12 +750,17 @@ long dispatch_one(const syscall_opt *opt, struct fd_map *fdmap, struct mmap_map 
     long ret = -1;
     void *buf = NULL;
 
-    /*if (opt->syscall_nr == 9 && opt->filename[0] != '\0')
-        goto case_mmap_exit;*/
+   /* ── get per-pid fd_map ── */
+    struct fd_map *pidmap = get_fdmap_for_pid((uint32_t)opt->pid);
+    if (!pidmap) return -2;
 
-    int replayed_fd = resolve_fd(fdmap, opt);
+    int replayed_fd = resolve_fd(pidmap, opt);
     if (replayed_fd < 0 && opt->syscall_nr != 2 && opt->syscall_nr != 257 && opt->syscall_nr != 11
         && opt->syscall_nr != 9) {
+	fprintf(stderr,
+        "[replayer] SKIP-FDMAP ts=%lu pid=%u %-12s fd=%d\n",
+        (unsigned long)opt->timestamp_ns,
+        opt->pid, opt->syscall_name, opt->fd);
 	return -2;  /* Skip: fd not mapped for this operation */
     }
 
@@ -738,19 +786,16 @@ long dispatch_one(const syscall_opt *opt, struct fd_map *fdmap, struct mmap_map 
 	case 2: /*open*/
 		ret = open(opt->filename, opt->open_flags_hex, 0644);
 		if (ret >= 0)
-		    fd_map_set(fdmap, opt->ret, (int32_t) ret); /* map captured retval fd -> replayed fd */
+		    fd_map_set(pidmap, opt->ret, (int32_t) ret); /* map captured retval fd -> replayed fd */
 	        break;
 	case 3: /* close */
 	        if (replayed_fd == -1 || replayed_fd ==-2)
 		        return -2;
 		ret = close(replayed_fd);
-		fd_map_set(fdmap, opt->fd, -1);
+		fd_map_set(pidmap, opt->fd, -1);
 	        break;
 	case 8: /*lseek*/
-	        if (opt->ret == -1) {
-                        fprintf(stderr,
-                        "[replayer] lseek ts=%lu pid=%u: original failed, skipping\n",
-                        (unsigned long)opt->timestamp_ns, opt->pid);
+	        if ((int)opt->fd == -1 && opt->size == 1) { /*skip lseek exit tracepoint */
                         return -2;
                 }
 
@@ -897,7 +942,7 @@ long dispatch_one(const syscall_opt *opt, struct fd_map *fdmap, struct mmap_map 
 		} else if (opt->fd == AT_FDCWD) {        /* -100, parsed correctly by JSON */
                         dirfd = AT_FDCWD;
                 } else if (opt->fd >= 0) {
-                        dirfd = fd_map_get(fdmap, opt->fd);
+                        dirfd = fd_map_get(pidmap, opt->fd);
                         if (dirfd < 0) {
                                 fprintf(stderr,
                                 "[replayer] openat ts=%lu: dirfd=%d not in fd_map, "
@@ -926,7 +971,7 @@ long dispatch_one(const syscall_opt *opt, struct fd_map *fdmap, struct mmap_map 
                 * since the captured workload may have had stdin closed.
                 */
                 if (opt->ret >= 0) {
-                        fd_map_set(fdmap, opt->ret, ret);
+                        fd_map_set(pidmap, opt->ret, ret); /*was fdmap*/
                         fprintf(stderr,
                         "[replayer] openat '%s' cap_fd=%d → replay_fd=%ld\n",
                         opt->filename, opt->ret, ret);
@@ -967,7 +1012,7 @@ case_mmap_entry:
                 map_flags |= MAP_ANONYMOUS;
                 resolved_fd = -1;
         } else {
-                resolved_fd = fd_map_get(fdmap, opt->fd);
+                resolved_fd = fd_map_get(pidmap, opt->fd);
                 if (resolved_fd < 0) {
                 fprintf(stderr,
                     "[replayer] mmap entry ts=%lu: fd=%d not in fd_map, "
@@ -1009,6 +1054,15 @@ case_mmap_exit:
                 "pid=%u, skipping\n",
                 (unsigned long)opt->timestamp_ns, opt->pid);
                  return -2;
+        }
+
+	/* guard — zero mmap_len means entry was corrupted or library mmap */
+        if (p->mmap_len == 0) {
+        fprintf(stderr,
+            "[replayer] mmap exit ts=%lu: mmap_len=0, skipping\n",
+            (unsigned long)opt->timestamp_ns);
+        mmap_pending_clear(opt->pid, opt->timestamp_ns);
+        return -2;   /* ← skip, not fail */
         }
 
         /* cap_addr is the kernel-assigned address from the original run */
@@ -1079,11 +1133,11 @@ void *dispatcher_thread(void *arg)
             fprintf(stderr,
                     "[replayer] FAIL ts=%-16lu pid=%-6d %-12s "
                     "fd=%-4d size=%-8ld off=%-8ld "
-                    "errno=%d (%s)\n",
+                    "errno=%d (%s) filename='%s'\n",
                     (unsigned long)op.timestamp_ns,
                     op.pid, op.syscall_name,
                     op.fd, (long)op.size, (long)op.offset,
-                    actual_err, strerror(actual_err));
+                    actual_err, strerror(actual_err), op.filename);
             ctx->syscalls_failed_verification++;
         } else {
 	  /*
@@ -1096,7 +1150,8 @@ void *dispatcher_thread(void *arg)
         int is_mismatch = 0;
         if (ctx->verify &&
             op.syscall_nr != 9  && op.syscall_nr != 11 &&
-            op.syscall_nr != 2  && op.syscall_nr != 257) {
+            op.syscall_nr != 2  && op.syscall_nr != 257 &&
+	    op.ret != -1) { /* if captured ret is  -1 then it means entry only probe so cant consider that mismatch*/
 
             if (actual_ret != (long)op.ret) {
                 is_mismatch = 1;
@@ -1104,15 +1159,15 @@ void *dispatcher_thread(void *arg)
         }
 
         if (is_mismatch) {
-            /* do NOT print OK — print MISMATCH only */
+            /* print MISMATCH only when captured and replay have non negative return values */
             fprintf(stderr,
                     "[replayer] MISMATCH ts=%-16lu pid=%-6d %-12s "
                     "fd=%-4d size=%-8ld off=%-8ld "
-                    "got ret=%-6ld expected ret=%-6d\n",
+                    "got ret=%-6ld expected ret=%-6d filename='%s'\n",
                     (unsigned long)op.timestamp_ns,
                     op.pid, op.syscall_name,
                     op.fd, (long)op.size, (long)op.offset,
-                    actual_ret, op.ret);
+                    actual_ret, op.ret, op.filename);
             ctx->syscalls_replayed_failed++;
         } else {
             /* exact match or exempted syscall — print OK */
@@ -1143,7 +1198,7 @@ void *dispatcher_thread(void *arg)
 
 int main(void)
 {
-	FILE *fp = fopen("test_readwrtev_mmap.json", "r");
+	FILE *fp = fopen("fio_replay.json", "r");
 	if (!fp) {
 		fprintf(stderr, "Error opening file\n");
 		return -1;
@@ -1248,11 +1303,10 @@ int main(void)
                                         entry->offset == 0       &&
                                         entry->filename[0] == '\0') {
                                         free(entry);
-                                        continue;
+                                        //continue;
+					goto reset;
                                 }
-				printf("[parser] Enqueuing syscall: pid=%d syscall_nr=%d fd=%d\n",
-				       entry->pid, entry->syscall_nr, entry->fd);
-				callsys_printf(entry);    /*Uncomment only to print the parsed struct members */
+				//callsys_printf(entry);    /*Uncomment only to print the parsed struct members */
 				/* Enqueue the parsed entry to the ring buffer */
 				if (ring_buf_enqueue(rb, entry) != 0) {
 					fprintf(stderr, "Error enqueuing entry to ring buffer\n");
@@ -1263,6 +1317,7 @@ int main(void)
 				errors++;
 				free(entry);
 			}
+		   reset:
 			// Reset for next object
 			json_buffer[0] = '\0';
 			json_buf_used = 0;
@@ -1284,6 +1339,7 @@ int main(void)
 	/* Wait for dispatcher thread to complete */
 	pthread_join(dispatcher_tid, NULL);
 
+	free_all_pid_fdmaps();
         mmap_map_destroy(mmap);
 	fd_map_destroy(fdmap);
 	ring_buf_destroy(rb);
