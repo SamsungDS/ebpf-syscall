@@ -1055,33 +1055,67 @@ case_mmap_exit:
                 (unsigned long)opt->timestamp_ns, opt->pid);
                  return -2;
         }
-
-	/* guard — zero mmap_len means entry was corrupted or library mmap */
+	/* guard — zero mmap_len means corrupted/skipped entry */
         if (p->mmap_len == 0) {
-        fprintf(stderr,
-            "[replayer] mmap exit ts=%lu: mmap_len=0, skipping\n",
-            (unsigned long)opt->timestamp_ns);
+         fprintf(stderr,
+                "[replayer] mmap exit ts=%lu: mmap_len=0, skipping\n",
+                (unsigned long)opt->timestamp_ns);
         mmap_pending_clear(opt->pid, opt->timestamp_ns);
-        return -2;   /* ← skip, not fail */
-        }
+        return -2;
+   }
+        mmap_pending_t pending_p = *p; /* p points to hash table slot */
+	mmap_pending_clear(opt->pid, opt->timestamp_ns); /* clear early to avoid stale entry if replay fails */
 
-        /* cap_addr is the kernel-assigned address from the original run */
+	/*strip flags while debugging that cause operation not permitted*/
+	pending_p.map_flags &= ~MAP_FIXED;   /* 0x10 */
+        pending_p.map_flags &= ~0x0800;      /* MAP_DENYWRITE */
+
+	/*
+        * Validate resolved_fd — if invalid or closed force MAP_ANONYMOUS.
+        * Handles stale fds from failed library openat (ENOENT).
+        * fd=0 placeholder in exit records also caught here.
+        */
+        int fd_valid = 0;
+        if (pending_p.resolved_fd >= 0) {
+           struct stat st;
+           if (fstat(pending_p.resolved_fd, &st) == 0)
+                fd_valid = 1;
+       }
+        if (!fd_valid && !(pending_p.map_flags & MAP_ANONYMOUS)) {
+              fprintf(stderr,
+            "[replayer] mmap exit ts=%lu: resolved_fd=%d invalid "
+             "— forcing MAP_ANONYMOUS\n", (unsigned long)opt->timestamp_ns,
+        pending_p.resolved_fd);
+        pending_p.map_flags   |=  MAP_ANONYMOUS;
+        pending_p.map_flags   &= ~MAP_SHARED;
+        pending_p.map_flags   |=  MAP_PRIVATE;
+        pending_p.resolved_fd  =  -1;
+        pending_p.offset       =  0;
+    }
+
+	fprintf(stderr,
+		"[replayer] mmap_exit debug: pid=%u ts=%lu prot=0x%x flags=0x%x "
+		"len=%zu fd=%d offset=%ld\n",
+		opt->pid, (unsigned long)opt->timestamp_ns,
+		pending_p.prot, pending_p.map_flags, pending_p.mmap_len,
+		pending_p.resolved_fd, (long)pending_p.offset);
+
+	/* cap_addr is the kernel-assigned address from the original run */
         uint64_t cap_addr = parse_hex_addr(opt->filename);
 
         /* replay the mmap */
         void *addr = mmap(NULL,
-                      p->mmap_len,
-                      p->prot,
-                      p->map_flags,
-                      p->resolved_fd,
-                      (off_t)p->offset);
-        mmap_pending_t pending_p = *p;
-        mmap_pending_clear(opt->pid, opt->timestamp_ns);
+                      pending_p.mmap_len,
+                      pending_p.prot,
+                      pending_p.map_flags,
+                      pending_p.resolved_fd,
+                      (off_t)pending_p.offset);
+        int mmap_errno = errno;
 
         if (addr == MAP_FAILED) {
                 fprintf(stderr,
                 "[replayer] mmap exit ts=%lu: mmap() failed: %s\n",
-                (unsigned long)opt->timestamp_ns, strerror(errno));
+                (unsigned long)opt->timestamp_ns, strerror(mmap_errno));
                 ret = -1;
 		goto mmap_done;
         }
