@@ -486,11 +486,12 @@ class BlktraceAnalyzer:
         geometry:    SSDGeometry instance for IU/NPWG/AWUN analysis. If None
                      or all fields are 0, IU charts are skipped.
     """
-    def __init__(self, events, time_bucket=0.1, lba_bins=256, geometry=None):
+    def __init__(self, events, time_bucket=0.1, lba_bins=256, geometry=None, lba_extent=None):
         self.events = events
         self.time_bucket = time_bucket
         self.lba_bins = lba_bins
         self.geom = geometry or SSDGeometry()
+        self.lba_extent = lba_extent
         if not events: raise ValueError("No events to analyze")
         self.t0 = events[0].timestamp
         self.t_end = events[-1].timestamp
@@ -826,6 +827,85 @@ class BlktraceAnalyzer:
             if ev.is_read: hr[si,ti]+=1
             elif ev.is_write: hw[si,ti]+=1
         return ha,hr,hw,mx
+
+    def _accumulate_lba_bins(self, io_ev, extent=True):
+        """Accumulate per-bin LBA statistics from Q events.
+
+        extent=False : original behaviour — each request lands entirely in the
+                       bin containing its START sector.
+        extent=True  : each request is mapped across its full extent
+                       [sector, sector + nblocks). Bytes are split proportionally
+                       to the sectors falling in each overlapped bin (sum of split
+                       bytes == request size, so byte totals are conserved). Each
+                       overlapped bin also gets +1 'touch' in io_count / r/w_count.
+
+        Bin width is derived from the furthest sector any request TOUCHES
+        (max(sector + nblocks)), not just max start sector, so the last bin
+        actually covers the tail of large trailing writes.
+
+        NOTE on counts in extent mode: io_count / read_count / write_count become
+        per-bin TOUCH counts. A request spanning N bins adds 1 to each, so summed
+        counts can exceed the number of requests. Byte columns remain conserved.
+
+        Returns (arrs_dict, bin_centers_sectors, max_sector_touched).
+        """
+        nb = self.lba_bins
+        keys = ("io_count", "total_bytes", "write_bytes",
+                "read_bytes", "write_count", "read_count")
+        arrs = {k: np.zeros(nb) for k in keys}
+        if not io_ev:
+            return arrs, np.array([0.0]), 0
+        starts = np.array([e.sector for e in io_ev], dtype=np.float64)
+        counts = np.array([e.nblocks for e in io_ev], dtype=np.float64)
+        is_w = np.array([e.is_write for e in io_ev])
+        sizes = counts * SECTOR_SIZE
+        ends = starts + counts                      # exclusive end sector
+        # Robust bin range. A few stray sectors far outside the working set
+        # (cross-region writes, trace artifacts) would blow up the bin width
+        # and collapse all real I/O into bin 0. Scale to the working set by
+        # excluding ends that sit far above the median; np.clip below still
+        # folds true outliers into the last bin so their bytes are not lost.
+        med = np.median(ends)
+        inliers = ends[ends <= med * 8] if med > 0 else ends
+        mx = float(inliers.max()) if inliers.size else float(ends.max())
+        if mx <= 0:
+            mx = float(ends.max())
+        w = mx / nb                                  # bin width in sectors
+
+        def add(idx, sz, wr):
+            np.add.at(arrs["io_count"], idx, 1.0)
+            np.add.at(arrs["total_bytes"], idx, sz)
+            np.add.at(arrs["write_bytes"], idx, np.where(wr, sz, 0.0))
+            np.add.at(arrs["read_bytes"], idx, np.where(~wr, sz, 0.0))
+            np.add.at(arrs["write_count"], idx, np.where(wr, 1.0, 0.0))
+            np.add.at(arrs["read_count"], idx, np.where(~wr, 1.0, 0.0))
+
+        if not extent:
+            idx = np.clip((starts / w).astype(int), 0, nb - 1)
+            add(idx, sizes, is_w)
+        else:
+            start_bin = np.clip((starts / w).astype(int), 0, nb - 1)
+            end_bin = np.clip(np.ceil(ends / w).astype(int) - 1, 0, nb - 1)
+            single = start_bin == end_bin
+            # fast path: requests contained in one bin (the vast majority)
+            add(start_bin[single], sizes[single], is_w[single])
+            # slow path: requests spanning >1 bin — split by sector overlap
+            for i in np.where(~single)[0]:
+                s, e = starts[i], ends[i]; wr = is_w[i]
+                for b in range(int(start_bin[i]), int(end_bin[i]) + 1):
+                    ov = min(e, (b + 1) * w) - max(s, b * w)   # overlap in sectors
+                    if ov <= 0:
+                        continue
+                    byts = ov * SECTOR_SIZE                     # proportional bytes
+                    arrs["io_count"][b] += 1.0
+                    arrs["total_bytes"][b] += byts
+                    if wr:
+                        arrs["write_bytes"][b] += byts; arrs["write_count"][b] += 1.0
+                    else:
+                        arrs["read_bytes"][b] += byts; arrs["read_count"][b] += 1.0
+
+        bin_centers = (np.arange(nb) + 0.5) * w
+        return arrs, bin_centers, mx
 
     def compute_lba_histogram(self):
         """1D LBA access frequency histogram from Q events.
@@ -1410,6 +1490,8 @@ Examples:
     g.add_argument("--geometry-json",type=str,default="",help="Load geometry from JSON file")
     parser.add_argument("--time-bucket",type=float,default=0.1,help="Time bucket seconds (default:0.1)")
     parser.add_argument("--lba-bins",type=int,default=256,help="LBA bins for heatmap (default:256)")
+    parser.add_argument("--lba-start-only", action="store_true",
+                        help="Bin LBA by start sector only (disable full-extent mapping)")
     parser.add_argument("--output-dir",default="./blktrace_results",help="Output directory")
     parser.add_argument("--no-dashboard",action="store_true")
     parser.add_argument("--summary-only",action="store_true")
@@ -1490,7 +1572,8 @@ Step 6: Run analyzer
     if not events: print("\n  ERROR: No parseable events found."); sys.exit(1)
 
     analyzer = BlktraceAnalyzer(events, time_bucket=args.time_bucket,
-                                 lba_bins=args.lba_bins, geometry=geom)
+                                 lba_bins=args.lba_bins, geometry=geom,
+				 lba_extent=not args.lba_start_only)
     analyzer.print_summary()
     if args.summary_only: return
 
