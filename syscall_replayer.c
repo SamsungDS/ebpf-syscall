@@ -70,8 +70,10 @@ int ring_buf_dequeue(struct ring_buf *rb, syscall_opt *opt);
 
 struct fd_map_entry {
 	int32_t captured_fd;
-	int32_t replayed_fd;
-	int valid;
+	int32_t replayed_fds[64];  /* stack — handles concurrent threads
+	                              opening same cap_fd simultaneously */
+	int     stack_top;         /* index of top (-1 = empty)         */
+	int     valid;
 };
 
 struct fd_map {
@@ -104,6 +106,7 @@ void *dispatcher_thread(void *arg);
 void fd_map_init(struct fd_map *fdmap);
 int fd_map_get(struct fd_map *fdmap, int32_t captured_fd);
 void fd_map_set(struct fd_map *fdmap, int32_t captured_fd, int32_t replayed_fd);
+void fd_map_clear_fd(struct fd_map *fdmap, int32_t captured_fd, int32_t replayed_fd);
 void fd_map_destroy(struct fd_map *fdmap);
 
 /* ------------------------------------------------------------------ */
@@ -450,7 +453,9 @@ static inline uint32_t _fd_hash(uint32_t key)
 void fd_map_init(struct fd_map *fdmap)
 {
 	if (!fdmap) return;
-	memset(fdmap->buckets , 0 , sizeof(fdmap->buckets));
+	memset(fdmap->buckets, 0, sizeof(fdmap->buckets));
+	for (int i = 0; i < FD_MAP_BUCKETS; i++)
+		fdmap->buckets[i].stack_top = -1;
 	pthread_mutex_init(&fdmap->lock, NULL);
 }
 
@@ -462,48 +467,100 @@ void fd_map_destroy(struct fd_map *fdmap)
 int fd_map_get(struct fd_map *fdmap, int32_t captured_fd)
 {
 	if (!fdmap) return -1;
-	uint32_t key = (uint32_t)captured_fd;
-	uint32_t slot = _fd_hash(key);
-	int result  = -1;
+	uint32_t slot = _fd_hash((uint32_t)captured_fd);
+	int result    = -1;
 
 	pthread_mutex_lock(&fdmap->lock);
-
 	for (uint32_t i = 0; i < FD_MAP_BUCKETS; i++) {
 		uint32_t idx = (slot + i) & (FD_MAP_BUCKETS - 1);
 		struct fd_map_entry *entry = &fdmap->buckets[idx];
-		if (!entry->valid) {
-			break; /* Not found */
-		}
-		if (entry->valid && entry->captured_fd == captured_fd) {
-			result = entry->replayed_fd;
+		if (!entry->valid)
+			break;
+		if (entry->captured_fd == captured_fd) {
+			if (entry->stack_top >= 0)
+				result = entry->replayed_fds[entry->stack_top];
 			break;
 		}
 	}
-
 	pthread_mutex_unlock(&fdmap->lock);
-	return result; /* Not found */
+	return result;
 }
 
 void fd_map_set(struct fd_map *fdmap, int32_t captured_fd, int32_t replayed_fd)
 {
 	if (!fdmap) return;
-	uint32_t key = (uint32_t)captured_fd;
-	uint32_t slot = _fd_hash(key);
+	uint32_t slot = _fd_hash((uint32_t)captured_fd);
 
 	pthread_mutex_lock(&fdmap->lock);
-
 	for (uint32_t i = 0; i < FD_MAP_BUCKETS; i++) {
 		uint32_t idx = (slot + i) & (FD_MAP_BUCKETS - 1);
 		struct fd_map_entry *entry = &fdmap->buckets[idx];
+
 		if (!entry->valid || entry->captured_fd == captured_fd) {
 			entry->captured_fd = captured_fd;
-			entry->replayed_fd = replayed_fd;
-			entry->valid = 1;
+			entry->valid       = 1;
+
+			if (replayed_fd < 0) {
+				/* close — pop top of stack */
+				if (entry->stack_top >= 0)
+					entry->stack_top--;
+				if (entry->stack_top < 0)
+					entry->valid = 0;
+			} else {
+				/* open — push onto stack */
+				if (entry->stack_top < 63) {
+					entry->stack_top++;
+					entry->replayed_fds[entry->stack_top] = replayed_fd;
+				} else {
+					fprintf(stderr,
+						"[replayer] fd_map stack full "
+						"cap_fd=%d\n", captured_fd);
+					entry->replayed_fds[entry->stack_top] = replayed_fd;
+				}
+			}
 			break;
 		}
 	}
 	pthread_mutex_unlock(&fdmap->lock);
-	return;
+}
+
+/* Pop a specific replayed_fd from the stack on close.
+ * Used instead of fd_map_set(fdmap, cap_fd, -1) so that
+ * concurrent threads each closing their own replay_fd
+ * only remove their own entry rather than blindly popping
+ * the top regardless of which thread is closing. */
+void fd_map_clear_fd(struct fd_map *fdmap, int32_t captured_fd,
+                     int32_t replayed_fd)
+{
+	if (!fdmap) return;
+	uint32_t slot = _fd_hash((uint32_t)captured_fd);
+
+	pthread_mutex_lock(&fdmap->lock);
+	for (uint32_t i = 0; i < FD_MAP_BUCKETS; i++) {
+		uint32_t idx = (slot + i) & (FD_MAP_BUCKETS - 1);
+		struct fd_map_entry *entry = &fdmap->buckets[idx];
+
+		if (!entry->valid)
+			break;
+
+		if (entry->captured_fd == captured_fd) {
+			/* find and remove the specific replayed_fd */
+			for (int j = entry->stack_top; j >= 0; j--) {
+				if (entry->replayed_fds[j] == replayed_fd) {
+					/* shift remaining entries down */
+					for (int k = j; k < entry->stack_top; k++)
+						entry->replayed_fds[k] =
+							entry->replayed_fds[k + 1];
+					entry->stack_top--;
+					if (entry->stack_top < 0)
+						entry->valid = 0;
+					break;
+				}
+			}
+			break;
+		}
+	}
+	pthread_mutex_unlock(&fdmap->lock);
 }
 
 /* ── per-pid fd_map lookup/create ─────────────────────────────────── */
@@ -789,11 +846,12 @@ long dispatch_one(const syscall_opt *opt, struct fd_map *fdmap, struct mmap_map 
 		    fd_map_set(pidmap, opt->ret, (int32_t) ret); /* map captured retval fd -> replayed fd */
 	        break;
 	case 3: /* close */
-	        if (replayed_fd == -1 || replayed_fd ==-2)
-		        return -2;
+	        if (replayed_fd < 0)
+			return -2;
 		ret = close(replayed_fd);
-		fd_map_set(pidmap, opt->fd, -1);
-	        break;
+		if (ret == 0)
+			fd_map_clear_fd(pidmap, opt->fd, replayed_fd);
+		break;
 	case 8: /*lseek*/
 	        if ((int)opt->fd == -1 && opt->size == 1) { /*skip lseek exit tracepoint */
                         return -2;
