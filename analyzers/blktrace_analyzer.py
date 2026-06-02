@@ -491,7 +491,7 @@ class BlktraceAnalyzer:
         self.time_bucket = time_bucket
         self.lba_bins = lba_bins
         self.geom = geometry or SSDGeometry()
-        self.lba_extent = lba_extent
+        self.lba_extent = True if lba_extent is None else bool(lba_extent)
         if not events: raise ValueError("No events to analyze")
         self.t0 = events[0].timestamp
         self.t_end = events[-1].timestamp
@@ -1152,7 +1152,7 @@ class BlktraceAnalyzer:
                 print(f"    min={arr.min():.1f}us  p50={np.median(arr):.1f}us  p95={np.percentile(arr,95):.1f}us  p99={np.percentile(arr,99):.1f}us  max={arr.max():.1f}us")
         _,qt,_,_ = self.compute_queue_depth()
         if len(qt)>0: print(f"\n  Queue depth      : max={qt.max()}  mean={qt.mean():.1f}")
-	# LBA Hotness Views
+        # LBA Hotness Views
         hv = self.compute_lba_hotness_views(top_n=5)
         if hv["count_hot"]:
             mode = "full-extent" if hv.get("extent", True) else "start-sector"
@@ -1221,6 +1221,62 @@ def plot_queue_depth(a, od):
     fig.tight_layout(); fig.savefig(os.path.join(od,"01_queue_depth.png"),dpi=150,bbox_inches="tight"); plt.close(fig)
     print("  Saved: 01_queue_depth.png")
 
+def export_lba_hotspots(a, od, top_n=50):
+    """Write 02_lba_hotspots.csv and 02_lba_hotspots.json using extent-aware hotspot data.
+
+    Uses compute_lba_hotness_views() so the export honours the --lba-start-only flag
+    and reflects the same full-extent binning used in the plot_lba_hotness_views chart.
+    Three ranked views are written: count_hot, byte_hot, and intersection.
+    """
+    import csv
+    views = a.compute_lba_hotness_views(top_n=top_n)
+    mode = "full-extent" if views.get("extent", True) else "start-sector"
+    if not views["count_hot"] and not views["byte_hot"]:
+        return
+
+    def _enrich(entries, view_name):
+        rows = []
+        for rank, e in enumerate(entries, 1):
+            total = e["io_count"]
+            rows.append({
+                "view": view_name,
+                "rank": rank,
+                "bin_index": e["bin"],
+                "lba_offset_gb": round(e["lba_offset_gb"], 6),
+                "io_count": total,
+                "read_count": e["read_count"],
+                "write_count": e["write_count"],
+                "total_bytes": e["total_bytes"],
+                "read_bytes": e["read_bytes"],
+                "write_bytes": e["write_bytes"],
+                "read_pct": round(e["read_count"] / max(1, total) * 100, 2),
+                "write_pct": round(e["write_count"] / max(1, total) * 100, 2),
+            })
+        return rows
+
+    all_rows = (
+        _enrich(views["count_hot"], "count_hot") +
+        _enrich(views["byte_hot"], "byte_hot") +
+        _enrich(views["intersection"], "intersection")
+    )
+
+    # JSON
+    with open(os.path.join(od, "02_lba_hotspots.json"), "w") as f:
+        json.dump({"binning": mode, "hotspots": all_rows}, f, indent=2)
+    print("  Saved: 02_lba_hotspots.json")
+
+    # CSV
+    fields = ["view", "rank", "bin_index", "lba_offset_gb",
+              "io_count", "read_count", "write_count",
+              "total_bytes", "read_bytes", "write_bytes",
+              "read_pct", "write_pct"]
+    with open(os.path.join(od, "02_lba_hotspots.csv"), "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=fields)
+        w.writeheader()
+        for r in all_rows:
+            w.writerow(r)
+    print("  Saved: 02_lba_hotspots.csv")
+
 def plot_lba_hotspots(a, od):
     fig = plt.figure(figsize=(14,10)); gs = GridSpec(2,2,figure=fig,hspace=0.35,wspace=0.3)
     ha,hr,hw,mx = a.compute_lba_heatmap()
@@ -1245,6 +1301,7 @@ def plot_lba_hotspots(a, od):
         t.auto_set_font_size(False); t.set_fontsize(9); t.scale(1,1.4)
         ax3.set_title("Top LBA Hotspots",fontsize=13,fontweight="bold",pad=10)
     fig.savefig(os.path.join(od,"02_lba_hotspots.png"),dpi=150,bbox_inches="tight"); plt.close(fig)
+    export_lba_hotspots(a, od)
     print("  Saved: 02_lba_hotspots.png")
 
 def plot_lba_hotness_views(a, od):
@@ -1708,7 +1765,7 @@ Step 6: Run analyzer
 
     analyzer = BlktraceAnalyzer(events, time_bucket=args.time_bucket,
                                  lba_bins=args.lba_bins, geometry=geom,
-				 lba_extent=not args.lba_start_only)
+                                 lba_extent=not args.lba_start_only)
     analyzer.print_summary()
     if args.summary_only: return
 
