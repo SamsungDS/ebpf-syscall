@@ -17,7 +17,6 @@ Modes
   live       Real-time /proc/diskstats + nvme-cli  (zero overhead)
   fio        Parse fio --output-format=json results
   demo       Synthetic data — no hardware needed (testing / CI)
-
 """
 
 import os, sys, re, time, subprocess, argparse, json, math, textwrap
@@ -58,7 +57,15 @@ except Exception:
 SECTOR_BYTES  = 512
 MiB           = 1024 * 1024
 GiB           = 1024 ** 3
-SCRIPT_VER    = "1.3.0"
+SCRIPT_VER    = "1.3.1"
+
+# Maximum raw events passed to any scatter / per-point plot.
+# Larger datasets are randomly downsampled to this count before plotting
+# to stay well inside matplotlib Agg's ~2M primitive limit.
+MAX_PLOT_EVENTS = 500_000
+
+# Cap the qd_ts list — only every Nth sample is kept for large traces.
+MAX_QD_SAMPLES  = 200_000
 
 PALETTE = dict(
     read       = '#4fc3f7',
@@ -124,12 +131,38 @@ SIZE_LABELS = ['512B','1K','2K','4K','8K','16K','32K',
 # ─────────────────────────────────────────────────────────────────────────────
 
 class BlktraceParser:
-    """Parse blkparse text-decoded output into a structured DataFrame."""
+    """
+    Parse blkparse text output into a structured DataFrame.
 
-    def __init__(self, filepath: str):
-        self.filepath = filepath
+    QD fix
+    ------
+    The original code matched Q→C events by LBA.  This breaks when the
+    I/O scheduler merges two adjacent requests: the completion LBA is that
+    of the *first* sector of the merged bio, which may not match any queued
+    LBA exactly.  We now track inflight using the sequence number (field 3
+    on each blkparse line) as the correlation key, falling back to LBA when
+    the sequence number is unavailable.
+
+    Large-trace handling
+    --------------------
+    For traces with > MAX_PLOT_EVENTS completions we reservoir-sample during
+    parsing so the in-memory DataFrame stays ≤ MAX_PLOT_EVENTS rows.
+    Histograms and timeline aggregations are computed from ALL events before
+    sampling, so statistical accuracy is preserved.
+    """
+
+    def __init__(self, filepath: str, max_events: int = MAX_PLOT_EVENTS):
+        self.filepath   = filepath
+        self.max_events = max_events
         self.events: list   = []
-        self.qd_ts: list    = []   # [(abs_time, inflight), ...]
+        self.qd_ts: list    = []
+        # Pre-computed histogram arrays (all events, not downsampled)
+        self.size_hist_r  = np.zeros(32, dtype=np.uint64)
+        self.size_hist_w  = np.zeros(32, dtype=np.uint64)
+        self.lat_hist_r   = np.zeros(32, dtype=np.uint64)
+        self.lat_hist_w   = np.zeros(32, dtype=np.uint64)
+        self._n_total     = 0      # total completions before sampling
+        self._sampled     = False
         self._parse()
 
     def _rw_flag(self, rwbs: str) -> str:
@@ -137,50 +170,140 @@ class BlktraceParser:
         if 'W' in rwbs: return 'W'
         return 'O'
 
+    @staticmethod
+    def _log2b(v: int) -> int:
+        if v <= 0: return 0
+        return min(v.bit_length() - 1, 31)
+
     def _parse(self):
         print(f"  Parsing : {self.filepath}")
-        q_pending  = {}   # lba -> (ts, rw)
-        inflight   = 0
-        line_count = 0
 
-        with open(self.filepath, 'r', errors='replace') as fh:
+        # ── Tracking dicts ──────────────────────────────────────────────────
+        # Key: (seq, lba) tuple for robustness; seq alone is unique per CPU
+        # but blkparse merges all CPUs, so (seq, lba) is safer.
+        q_seq: dict  = {}   # seq  → (ts, rw, lba)   primary   key
+        q_lba: dict  = {}   # lba  → (ts, rw)         fallback  key
+
+        inflight    = 0
+        line_count  = 0
+        comp_count  = 0
+        qd_stride   = 1        # record every Nth QD sample (grows for big traces)
+        qd_counter  = 0
+
+        # Reservoir sampler state
+        reservoir   = []
+        reservoir_k = self.max_events
+        rng         = random.Random(42)
+
+        def _add_event(ev: dict):
+            nonlocal comp_count
+            comp_count += 1
+            # Reservoir sampling (Algorithm R)
+            if comp_count <= reservoir_k:
+                reservoir.append(ev)
+            else:
+                j = rng.randint(0, comp_count - 1)
+                if j < reservoir_k:
+                    reservoir[j] = ev
+
+        # blkparse line regex already compiled as _BLK_RE
+        # Extended to also capture the sequence number (group 0 before ts)
+        _BLK_RE_SEQ = re.compile(
+            r'^\s*\d+,\d+\s+'      # device
+            r'\d+\s+'              # cpu
+            r'(\d+)\s+'            # seq     (g1)
+            r'([\d.]+)\s+'         # ts      (g2)
+            r'\d+\s+'              # pid
+            r'([A-Z]+)\s+'         # action  (g3)
+            r'([A-Z0-9]+)\s+'      # rwbs    (g4)
+            r'(\d+)\s+\+\s+(\d+)' # lba+sec (g5,g6)
+        )
+
+        with open(self.filepath, 'r', errors='replace', buffering=1 << 20) as fh:
             for raw in fh:
-                m = _BLK_RE.match(raw)
+                m = _BLK_RE_SEQ.match(raw)
                 if not m:
                     continue
                 line_count += 1
-                ts_s, action, rwbs, lba_s, secs_s = m.groups()
-                ts   = float(ts_s)
-                lba  = int(lba_s)
-                secs = int(secs_s)
-                rw   = self._rw_flag(rwbs)
+                seq_s, ts_s, action, rwbs, lba_s, secs_s = m.groups()
+                seq    = int(seq_s)
+                ts     = float(ts_s)
+                lba    = int(lba_s)
+                secs   = int(secs_s)
+                rw     = self._rw_flag(rwbs)
                 size_b = secs * SECTOR_BYTES
 
                 if action == 'Q':
-                    q_pending[lba] = (ts, rw)
-                    inflight += 1
-                    self.qd_ts.append((ts, inflight))
+                    q_seq[seq] = (ts, rw, lba)
+                    q_lba[lba] = (ts, rw)
+                    inflight   += 1
+                    qd_counter += 1
+                    if qd_counter % qd_stride == 0:
+                        self.qd_ts.append((ts, inflight))
+                        # Dynamically widen stride to cap qd_ts list size
+                        if len(self.qd_ts) >= MAX_QD_SAMPLES:
+                            # Halve the list, double the stride going forward
+                            self.qd_ts = self.qd_ts[::2]
+                            qd_stride *= 2
 
                 elif action == 'C':
                     lat_ms = None
-                    if lba in q_pending:
-                        q_ts, q_rw = q_pending.pop(lba)
+                    # Try sequence-number match first (most accurate)
+                    entry = q_seq.pop(seq, None)
+                    if entry:
+                        q_ts, q_rw, q_lba_val = entry
+                        q_lba.pop(q_lba_val, None)
                         lat_ms = (ts - q_ts) * 1000.0
                         rw     = q_rw
+                    else:
+                        # Fallback: LBA match (handles pre-5.x kernels without seq)
+                        entry2 = q_lba.pop(lba, None)
+                        if entry2:
+                            q_ts, q_rw = entry2
+                            lat_ms = (ts - q_ts) * 1000.0
+                            rw     = q_rw
+
                     inflight = max(0, inflight - 1)
-                    self.qd_ts.append((ts, inflight))
-                    self.events.append(dict(
+                    qd_counter += 1
+                    if qd_counter % qd_stride == 0:
+                        self.qd_ts.append((ts, inflight))
+
+                    # Update pre-computed histograms (all events)
+                    sb = self._log2b(size_b)
+                    if rw == 'R':
+                        self.size_hist_r[sb] += 1
+                    else:
+                        self.size_hist_w[sb] += 1
+                    if lat_ms is not None and lat_ms > 0:
+                        lat_ns = int(lat_ms * 1e6)
+                        lb = self._log2b(lat_ns)
+                        if rw == 'R':
+                            self.lat_hist_r[lb] += 1
+                        else:
+                            self.lat_hist_w[lb] += 1
+
+                    _add_event(dict(
                         ts=ts, action='C', rw=rw,
                         lba=lba, size_b=size_b, lat_ms=lat_ms
                     ))
 
                 elif action == 'D':
-                    self.events.append(dict(
+                    _add_event(dict(
                         ts=ts, action='D', rw=rw,
                         lba=lba, size_b=size_b, lat_ms=None
                     ))
 
-        print(f"  Lines   : {line_count:,}  |  Completions: {len(self.events):,}")
+        self._n_total = comp_count
+        self._sampled = comp_count > reservoir_k
+        self.events   = reservoir
+
+        sampled_note = (f"  Sampled : {len(self.events):,} / {comp_count:,} "
+                        f"({len(self.events)/max(comp_count,1)*100:.1f}%) — "
+                        f"reservoir sampling, histograms use full {comp_count:,} events"
+                        if self._sampled else "")
+        print(f"  Lines   : {line_count:,}  |  Completions: {comp_count:,}")
+        if sampled_note:
+            print(sampled_note)
 
     def to_dataframe(self) -> pd.DataFrame:
         if not self.events:
@@ -189,7 +312,11 @@ class BlktraceParser:
                 "Did you run:  blkparse <trace_prefix> -o <output.txt> ?\n"
                 "Or use --demo to generate synthetic data."
             )
-        return pd.DataFrame(self.events)
+        df = pd.DataFrame(self.events)
+        df.attrs['sampled']    = self._sampled
+        df.attrs['n_total']    = self._n_total
+        df.attrs['n_sampled']  = len(self.events)
+        return df
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -898,13 +1025,39 @@ class IOAnalyzerPlotter:
 
     # ── utility ───────────────────────────────────────────────────────────────
 
-    def _save(self, fig, name: str):
+    def _save(self, fig, name: str, large: bool = False):
         p = self.out / f"{name}.png"
-        fig.savefig(p, dpi=150, bbox_inches='tight',
+        dpi = 100 if large else 150   # lower DPI for large-trace plots
+        fig.savefig(p, dpi=dpi, bbox_inches='tight',
                     facecolor=PALETTE['bg'], edgecolor='none')
         plt.close(fig)
         print(f"    ✓  {p.name}")
         return p
+
+    @staticmethod
+    def _downsample(df: pd.DataFrame, n: int = MAX_PLOT_EVENTS,
+                    seed: int = 42) -> tuple:
+        """
+        Return (df_plot, note_str).
+        If df has > n rows, randomly sample n rows for plotting.
+        Histograms / aggregations should be computed BEFORE calling this.
+        """
+        if len(df) <= n:
+            return df, ''
+        sampled = df.sample(n=n, random_state=seed)
+        pct  = n / len(df) * 100
+        note = (f"  ⚡ Large trace: plotting {n:,} / {len(df):,} events "
+                f"({pct:.1f}%)  — histograms computed from full dataset")
+        return sampled, note
+
+    @staticmethod
+    def _sample_tag(df: pd.DataFrame) -> str:
+        """Subtitle suffix shown when a DataFrame was downsampled."""
+        if df.attrs.get('sampled'):
+            n  = df.attrs.get('n_sampled', len(df))
+            nt = df.attrs.get('n_total',   len(df))
+            return f'  [sampled {n:,}/{nt:,}]'
+        return ''
 
     @staticmethod
     def _kib_fmt(x, _):
@@ -930,6 +1083,13 @@ class IOAnalyzerPlotter:
         df_c = df[df['action'] == 'C'].copy()
         if df_c.empty: return
 
+        # Aggregation uses all sampled events; scatter uses downsampled subset
+        df_scatter, ds_note = self._downsample(df_c)
+        if ds_note:
+            print(ds_note)
+        large = len(df) > MAX_PLOT_EVENTS
+        stag  = self._sample_tag(df)
+
         t0 = df_c['ts'].min()
         df_c['t'] = df_c['ts'] - t0
         bkt = 0.1                                           # 100 ms buckets
@@ -945,7 +1105,7 @@ class IOAnalyzerPlotter:
         fig = plt.figure(figsize=(20, 15))
         gs  = gridspec.GridSpec(3, 3, figure=fig, hspace=0.48, wspace=0.35)
         fig.suptitle(f'NVMe I/O Analysis  ·  {device}  ·  '
-                     f'{datetime.now():%Y-%m-%d %H:%M}',
+                     f'{datetime.now():%Y-%m-%d %H:%M}{stag}',
                      fontsize=14, color=PALETTE['accent'], fontweight='bold',
                      y=0.98)
 
@@ -981,9 +1141,9 @@ class IOAnalyzerPlotter:
         ax_qd.set_title('Queue Depth Over Time'); ax_qd.set_ylabel('In-Flight I/Os')
         ax_qd.set_xlabel('Time (s)'); ax_qd.grid(True)
 
-        # Latency scatter
+        # Latency scatter (downsampled)
         ax_lsc = fig.add_subplot(gs[1, 2])
-        df_lat = df_c[df_c['lat_ms'].notna()]
+        df_lat = df_scatter[df_scatter['lat_ms'].notna()]
         for rw, col, lab in [('R', PALETTE['read'],  'Read'),
                               ('W', PALETTE['write'], 'Write')]:
             d = df_lat[df_lat['rw'] == rw]
@@ -1042,7 +1202,7 @@ class IOAnalyzerPlotter:
             cell.set_text_props(color=PALETTE['fg'])
         ax_sum.set_title('Trace Summary', color=PALETTE['accent'], pad=15)
 
-        self._save(fig, '01_dashboard')
+        self._save(fig, '01_dashboard', large=large)
 
     # ── 2. Latency Analysis ────────────────────────────────────────────────────
 
@@ -1051,17 +1211,22 @@ class IOAnalyzerPlotter:
         df_c = df[(df['action']=='C') & df['lat_ms'].notna()].copy()
         if df_c.empty: return
 
+        df_plot, ds_note = self._downsample(df_c)
+        if ds_note: print(ds_note)
+        large = len(df_c) > MAX_PLOT_EVENTS
+        stag  = self._sample_tag(df)
+
         fig, axes = plt.subplots(2, 2, figsize=(16, 12))
-        fig.suptitle('Latency Analysis', fontsize=14,
+        fig.suptitle(f'Latency Analysis{stag}', fontsize=14,
                      color=PALETTE['accent'], fontweight='bold')
 
         rw_pairs = [('R', 'Read', PALETTE['read']),
                     ('W', 'Write', PALETTE['write'])]
 
-        # Histogram
+        # Histogram (downsampled for speed, shape preserved)
         ax = axes[0, 0]
         for rw, lab, col in rw_pairs:
-            d = df_c[df_c['rw']==rw]['lat_ms'].values
+            d = df_plot[df_plot['rw']==rw]['lat_ms'].values
             if not len(d): continue
             lo = max(d.min(), 1e-4); hi = d.max() * 1.01
             bins = np.logspace(np.log10(lo), np.log10(hi), 64)
@@ -1103,10 +1268,10 @@ class IOAnalyzerPlotter:
         ax.set_title('Latency Percentiles (ms)'); ax.set_ylabel('ms')
         ax.legend(); ax.grid(True, axis='y')
 
-        # Latency vs I/O size
+        # Latency vs I/O size (downsampled)
         ax = axes[1, 1]
         for rw, lab, col in rw_pairs:
-            d = df_c[df_c['rw']==rw]
+            d = df_plot[df_plot['rw']==rw]
             if d.empty: continue
             ax.scatter(d['size_b']/1024, d['lat_ms'],
                        s=1.5, alpha=0.15, color=col, label=lab, rasterized=True)
@@ -1117,7 +1282,7 @@ class IOAnalyzerPlotter:
         ax.legend(fontsize=8, markerscale=6); ax.grid(True)
 
         fig.tight_layout()
-        self._save(fig, '02_latency')
+        self._save(fig, '02_latency', large=large)
 
     # ── 3. I/O Size Distribution ───────────────────────────────────────────────
 
@@ -1195,6 +1360,11 @@ class IOAnalyzerPlotter:
         print("  → LBA heatmap ...")
         df_c = df[df['action']=='C'].copy()
         if df_c.empty: return
+        # Downsample for heatmap binning — 500K points is more than enough
+        # for LBA zone resolution; using all 41M would take minutes
+        df_c, ds_note = self._downsample(df_c, n=MAX_PLOT_EVENTS)
+        if ds_note: print(ds_note)
+        stag = self._sample_tag(df)
 
         t0   = df_c['ts'].min()
         df_c['t'] = df_c['ts'] - t0
@@ -1210,7 +1380,7 @@ class IOAnalyzerPlotter:
              '#00ff88','#ffdd00','#ff4500','#ff0088'])
 
         fig, axes = plt.subplots(1, 2, figsize=(20, 8))
-        fig.suptitle('LBA Hotspot Heatmap  (time × LBA zone)',
+        fig.suptitle(f'LBA Hotspot Heatmap  (time × LBA zone){stag}',
                      fontsize=14, color=PALETTE['accent'], fontweight='bold')
 
         for ax, rw, title in [(axes[0], 'R', 'Read  Hotspots'),
@@ -1254,8 +1424,14 @@ class IOAnalyzerPlotter:
 
     def plot_queue_depth(self, df: pd.DataFrame, qd_ts: list):
         print("  → queue depth analysis ...")
+        stag = self._sample_tag(df)
+        # Cap qd_ts for plotting — already downsampled during parse but cap here too
+        if len(qd_ts) > MAX_QD_SAMPLES:
+            step   = len(qd_ts) // MAX_QD_SAMPLES
+            qd_ts  = qd_ts[::step]
+
         fig, axes = plt.subplots(2, 2, figsize=(16, 10))
-        fig.suptitle('Queue Depth Analysis', fontsize=14,
+        fig.suptitle(f'Queue Depth Analysis{stag}', fontsize=14,
                      color=PALETTE['accent'], fontweight='bold')
 
         t0 = df['ts'].min() if not df.empty else 0
@@ -2404,12 +2580,16 @@ def main():
 
     # ── blktrace ──
     p = sub.add_parser('blktrace', help='Parse blkparse text output')
-    p.add_argument('--input',     required=True, help='blkparse decoded text file')
-    p.add_argument('--device',    default='nvme0n1')
-    p.add_argument('--output',    default='io_analysis')
-    p.add_argument('--lba-bins',  type=int, default=128)
-    p.add_argument('--time-bins', type=int, default=100)
-    p.add_argument('--smart',     action='store_true')
+    p.add_argument('--input',      required=True, help='blkparse decoded text file')
+    p.add_argument('--device',     default='nvme0n1')
+    p.add_argument('--output',     default='io_analysis')
+    p.add_argument('--lba-bins',   type=int, default=128)
+    p.add_argument('--time-bins',  type=int, default=100)
+    p.add_argument('--smart',      action='store_true')
+    p.add_argument('--max-events', type=int, default=MAX_PLOT_EVENTS,
+                   help=f'Max events kept for plotting (default {MAX_PLOT_EVENTS:,}). '
+                        'Larger traces are reservoir-sampled. Histograms always '
+                        'use the full dataset.')
 
     # ── live ──
     p = sub.add_parser('live', help='Real-time collection')
@@ -2457,7 +2637,7 @@ def main():
 
     # ── blktrace ──────────────────────────────────────────────────────────────
     if args.mode == 'blktrace':
-        bp = BlktraceParser(args.input)
+        bp = BlktraceParser(args.input, max_events=args.max_events)
         df = bp.to_dataframe()
         _print_blktrace_summary(df, bp.qd_ts)
         pl.plot_blktrace_dashboard(df, bp.qd_ts, args.device)
