@@ -486,11 +486,12 @@ class BlktraceAnalyzer:
         geometry:    SSDGeometry instance for IU/NPWG/AWUN analysis. If None
                      or all fields are 0, IU charts are skipped.
     """
-    def __init__(self, events, time_bucket=0.1, lba_bins=256, geometry=None):
+    def __init__(self, events, time_bucket=0.1, lba_bins=256, geometry=None, lba_extent=None):
         self.events = events
         self.time_bucket = time_bucket
         self.lba_bins = lba_bins
         self.geom = geometry or SSDGeometry()
+        self.lba_extent = True if lba_extent is None else bool(lba_extent)
         if not events: raise ValueError("No events to analyze")
         self.t0 = events[0].timestamp
         self.t_end = events[-1].timestamp
@@ -827,6 +828,143 @@ class BlktraceAnalyzer:
             elif ev.is_write: hw[si,ti]+=1
         return ha,hr,hw,mx
 
+    def _accumulate_lba_bins(self, io_ev, extent=True):
+        """Accumulate per-bin LBA statistics from Q events.
+
+        extent=False : original behaviour — each request lands entirely in the
+                       bin containing its START sector.
+        extent=True  : each request is mapped across its full extent
+                       [sector, sector + nblocks). Bytes are split proportionally
+                       to the sectors falling in each overlapped bin (sum of split
+                       bytes == request size, so byte totals are conserved). Each
+                       overlapped bin also gets +1 'touch' in io_count / r/w_count.
+
+        Bin width is derived from the furthest sector any request TOUCHES
+        (max(sector + nblocks)), not just max start sector, so the last bin
+        actually covers the tail of large trailing writes.
+
+        NOTE on counts in extent mode: io_count / read_count / write_count become
+        per-bin TOUCH counts. A request spanning N bins adds 1 to each, so summed
+        counts can exceed the number of requests. Byte columns remain conserved.
+
+        Returns (arrs_dict, bin_centers_sectors, max_sector_touched).
+        """
+        nb = self.lba_bins
+        keys = ("io_count", "total_bytes", "write_bytes",
+                "read_bytes", "write_count", "read_count")
+        arrs = {k: np.zeros(nb) for k in keys}
+        if not io_ev:
+            return arrs, np.array([0.0]), 0
+        starts = np.array([e.sector for e in io_ev], dtype=np.float64)
+        counts = np.array([e.nblocks for e in io_ev], dtype=np.float64)
+        is_w = np.array([e.is_write for e in io_ev])
+        sizes = counts * SECTOR_SIZE
+        ends = starts + counts                      # exclusive end sector
+        # Robust bin range. A few stray sectors far outside the working set
+        # (cross-region writes, trace artifacts) would blow up the bin width
+        # and collapse all real I/O into bin 0. Scale to the working set by
+        # excluding ends that sit far above the median; np.clip below still
+        # folds true outliers into the last bin so their bytes are not lost.
+        med = np.median(ends)
+        inliers = ends[ends <= med * 8] if med > 0 else ends
+        mx = float(inliers.max()) if inliers.size else float(ends.max())
+        if mx <= 0:
+            mx = float(ends.max())
+        w = mx / nb                                  # bin width in sectors
+
+        def add(idx, sz, wr):
+            np.add.at(arrs["io_count"], idx, 1.0)
+            np.add.at(arrs["total_bytes"], idx, sz)
+            np.add.at(arrs["write_bytes"], idx, np.where(wr, sz, 0.0))
+            np.add.at(arrs["read_bytes"], idx, np.where(~wr, sz, 0.0))
+            np.add.at(arrs["write_count"], idx, np.where(wr, 1.0, 0.0))
+            np.add.at(arrs["read_count"], idx, np.where(~wr, 1.0, 0.0))
+
+        if not extent:
+            idx = np.clip((starts / w).astype(int), 0, nb - 1)
+            add(idx, sizes, is_w)
+        else:
+            start_bin = np.clip((starts / w).astype(int), 0, nb - 1)
+            end_bin = np.clip(np.ceil(ends / w).astype(int) - 1, 0, nb - 1)
+            single = start_bin == end_bin
+            # fast path: requests contained in one bin (the vast majority)
+            add(start_bin[single], sizes[single], is_w[single])
+            # slow path: requests spanning >1 bin — split by sector overlap
+            for i in np.where(~single)[0]:
+                s, e = starts[i], ends[i]; wr = is_w[i]
+                for b in range(int(start_bin[i]), int(end_bin[i]) + 1):
+                    ov = min(e, (b + 1) * w) - max(s, b * w)   # overlap in sectors
+                    if ov <= 0:
+                        continue
+                    byts = ov * SECTOR_SIZE                     # proportional bytes
+                    arrs["io_count"][b] += 1.0
+                    arrs["total_bytes"][b] += byts
+                    if wr:
+                        arrs["write_bytes"][b] += byts; arrs["write_count"][b] += 1.0
+                    else:
+                        arrs["read_bytes"][b] += byts; arrs["read_count"][b] += 1.0
+
+        bin_centers = (np.arange(nb) + 0.5) * w
+        return arrs, bin_centers, mx
+
+    def compute_lba_hotness_views(self, top_n=15, extent=None):
+        """Three complementary LBA hotness rankings to separate metadata-style
+        hotness (many small I/Os) from data-style hotness (fewer large I/Os).
+
+        Extent-aware: each request contributes to every bin its
+        [sector, sector + nblocks) range overlaps (see _accumulate_lba_bins).
+        extent=None -> use self.lba_extent (set from --lba-start-only flag).
+
+        Rankings (each highest-first):
+          count_hot    — top_n bins by io_count. Frequent small metadata/journal
+                         regions surface here.
+          byte_hot     — top_n bins by total_bytes. Large data regions surface
+                         here, even if touched rarely.
+          intersection — the count_hot set RE-RANKED by write_bytes (desc).
+                         Answers: among frequently used LBA ranges, which have
+                         the maximum bytes written? High-count + low here = hot
+                         but light (metadata); high in both = write-heavy hotspot.
+
+        Returns dict with 'count_hot', 'byte_hot', 'intersection' (lists of
+        per-bin dicts), 'extent' (bool), and 'per_bin' (parallel numpy arrays).
+        """
+        if extent is None:
+            extent = getattr(self, "lba_extent", True)
+        io_ev = [e for e in self.events
+                 if e.action == ACTION_QUEUE and e.sector > 0 and e.nblocks > 0]
+        empty = {"count_hot": [], "byte_hot": [], "intersection": [], "extent": extent,
+                 "per_bin": {"io_count": np.array([]), "total_bytes": np.array([]),
+                             "write_bytes": np.array([]), "lba_offset_gb": np.array([])}}
+        if not io_ev:
+            return empty
+        arrs, bin_centers, mx = self._accumulate_lba_bins(io_ev, extent=extent)
+        if mx <= 0:
+            return empty
+        io_count, total_bytes = arrs["io_count"], arrs["total_bytes"]
+        write_bytes, read_bytes = arrs["write_bytes"], arrs["read_bytes"]
+        write_count, read_count = arrs["write_count"], arrs["read_count"]
+        gb = bin_centers * SECTOR_SIZE / GB
+
+        def entry(b):
+            return {"bin": int(b), "lba_offset_gb": float(gb[b]),
+                    "io_count": int(round(io_count[b])), "total_bytes": int(total_bytes[b]),
+                    "write_bytes": int(write_bytes[b]), "read_bytes": int(read_bytes[b]),
+                    "write_count": int(round(write_count[b])), "read_count": int(round(read_count[b]))}
+
+        nonzero = np.where(io_count > 0)[0]
+        n = min(top_n, len(nonzero))
+        count_order = nonzero[np.argsort(io_count[nonzero])[::-1]][:n]
+        byte_order  = nonzero[np.argsort(total_bytes[nonzero])[::-1]][:n]
+        inter_order = count_order[np.argsort(write_bytes[count_order])[::-1]]
+        return {
+            "count_hot":    [entry(b) for b in count_order],
+            "byte_hot":     [entry(b) for b in byte_order],
+            "intersection": [entry(b) for b in inter_order],
+            "extent": extent,
+            "per_bin": {"io_count": io_count, "total_bytes": total_bytes,
+                        "write_bytes": write_bytes, "lba_offset_gb": gb},
+        }
+
     def compute_lba_histogram(self):
         """1D LBA access frequency histogram from Q events.
 
@@ -1014,6 +1152,21 @@ class BlktraceAnalyzer:
                 print(f"    min={arr.min():.1f}us  p50={np.median(arr):.1f}us  p95={np.percentile(arr,95):.1f}us  p99={np.percentile(arr,99):.1f}us  max={arr.max():.1f}us")
         _,qt,_,_ = self.compute_queue_depth()
         if len(qt)>0: print(f"\n  Queue depth      : max={qt.max()}  mean={qt.mean():.1f}")
+        # LBA Hotness Views
+        hv = self.compute_lba_hotness_views(top_n=5)
+        if hv["count_hot"]:
+            mode = "full-extent" if hv.get("extent", True) else "start-sector"
+            print(f"\n{'─'*72}\n  LBA HOTNESS VIEWS (top 5, {mode} binning)")
+            print(f"\n  Count-hot (by I/O count):")
+            for i, e in enumerate(hv["count_hot"], 1):
+                avg = e["total_bytes"] / max(1, e["io_count"])
+                print(f"    #{i} {e['lba_offset_gb']:8.2f} GB  {e['io_count']:>9,} I/Os  avg={avg/KB:6.1f}K  wr={e['write_bytes']/MB:8.2f} MB")
+            print(f"\n  Byte-hot (by total bytes):")
+            for i, e in enumerate(hv["byte_hot"], 1):
+                print(f"    #{i} {e['lba_offset_gb']:8.2f} GB  {e['total_bytes']/MB:8.2f} MB  {e['io_count']:>9,} I/Os")
+            print(f"\n  Intersection (count-hot, ranked by write bytes):")
+            for i, e in enumerate(hv["intersection"], 1):
+                print(f"    #{i} {e['lba_offset_gb']:8.2f} GB  wr={e['write_bytes']/MB:8.2f} MB  {e['io_count']:>9,} I/Os")
         # IU/LBS Summary
         if self.geom.has_iu or self.geom.has_npwg or self.geom.has_awun:
             print(f"\n{'─'*72}\n  {self.geom.summary()}")
@@ -1068,6 +1221,62 @@ def plot_queue_depth(a, od):
     fig.tight_layout(); fig.savefig(os.path.join(od,"01_queue_depth.png"),dpi=150,bbox_inches="tight"); plt.close(fig)
     print("  Saved: 01_queue_depth.png")
 
+def export_lba_hotspots(a, od, top_n=50):
+    """Write 02_lba_hotspots.csv and 02_lba_hotspots.json using extent-aware hotspot data.
+
+    Uses compute_lba_hotness_views() so the export honours the --lba-start-only flag
+    and reflects the same full-extent binning used in the plot_lba_hotness_views chart.
+    Three ranked views are written: count_hot, byte_hot, and intersection.
+    """
+    import csv
+    views = a.compute_lba_hotness_views(top_n=top_n)
+    mode = "full-extent" if views.get("extent", True) else "start-sector"
+    if not views["count_hot"] and not views["byte_hot"]:
+        return
+
+    def _enrich(entries, view_name):
+        rows = []
+        for rank, e in enumerate(entries, 1):
+            total = e["io_count"]
+            rows.append({
+                "view": view_name,
+                "rank": rank,
+                "bin_index": e["bin"],
+                "lba_offset_gb": round(e["lba_offset_gb"], 6),
+                "io_count": total,
+                "read_count": e["read_count"],
+                "write_count": e["write_count"],
+                "total_bytes": e["total_bytes"],
+                "read_bytes": e["read_bytes"],
+                "write_bytes": e["write_bytes"],
+                "read_pct": round(e["read_count"] / max(1, total) * 100, 2),
+                "write_pct": round(e["write_count"] / max(1, total) * 100, 2),
+            })
+        return rows
+
+    all_rows = (
+        _enrich(views["count_hot"], "count_hot") +
+        _enrich(views["byte_hot"], "byte_hot") +
+        _enrich(views["intersection"], "intersection")
+    )
+
+    # JSON
+    with open(os.path.join(od, "02_lba_hotspots.json"), "w") as f:
+        json.dump({"binning": mode, "hotspots": all_rows}, f, indent=2)
+    print("  Saved: 02_lba_hotspots.json")
+
+    # CSV
+    fields = ["view", "rank", "bin_index", "lba_offset_gb",
+              "io_count", "read_count", "write_count",
+              "total_bytes", "read_bytes", "write_bytes",
+              "read_pct", "write_pct"]
+    with open(os.path.join(od, "02_lba_hotspots.csv"), "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=fields)
+        w.writeheader()
+        for r in all_rows:
+            w.writerow(r)
+    print("  Saved: 02_lba_hotspots.csv")
+
 def plot_lba_hotspots(a, od):
     fig = plt.figure(figsize=(14,10)); gs = GridSpec(2,2,figure=fig,hspace=0.35,wspace=0.3)
     ha,hr,hw,mx = a.compute_lba_heatmap()
@@ -1092,7 +1301,70 @@ def plot_lba_hotspots(a, od):
         t.auto_set_font_size(False); t.set_fontsize(9); t.scale(1,1.4)
         ax3.set_title("Top LBA Hotspots",fontsize=13,fontweight="bold",pad=10)
     fig.savefig(os.path.join(od,"02_lba_hotspots.png"),dpi=150,bbox_inches="tight"); plt.close(fig)
+    export_lba_hotspots(a, od)
     print("  Saved: 02_lba_hotspots.png")
+
+def plot_lba_hotness_views(a, od):
+    views = a.compute_lba_hotness_views(top_n=15)
+    ch, bh, it = views["count_hot"], views["byte_hot"], views["intersection"]
+    if not ch and not bh: return
+    mode = "full-extent" if views.get("extent", True) else "start-sector"
+    fig = plt.figure(figsize=(18, 12)); gs = GridSpec(2, 2, figure=fig, hspace=0.4, wspace=0.3)
+    fig.suptitle(f"LBA Hotness Views ({mode} binning): Count-Hot vs Byte-Hot vs Write-Byte Intersection",
+                 fontsize=15, fontweight="bold")
+
+    # Count-hot (read/write I/O count, stacked)
+    ax = fig.add_subplot(gs[0, 0])
+    if ch:
+        lab = [f"{e['lba_offset_gb']:.2f} GB" for e in ch][::-1]
+        rc = [e["read_count"] for e in ch][::-1]; wc = [e["write_count"] for e in ch][::-1]
+        y = np.arange(len(lab))
+        ax.barh(y, rc, color=COLORS["read"], alpha=0.8, label="Read I/Os")
+        ax.barh(y, wc, left=rc, color=COLORS["write"], alpha=0.8, label="Write I/Os")
+        ax.set_yticks(y); ax.set_yticklabels(lab, fontsize=8); ax.legend(fontsize=8)
+    setup_ax(ax, "Count-Hot: Top Ranges by I/O Count", "I/O Count (touches)", "LBA Offset")
+
+    # Byte-hot (read/write bytes, stacked)
+    ax = fig.add_subplot(gs[0, 1])
+    if bh:
+        lab = [f"{e['lba_offset_gb']:.2f} GB" for e in bh][::-1]
+        rb = [e["read_bytes"]/MB for e in bh][::-1]; wb = [e["write_bytes"]/MB for e in bh][::-1]
+        y = np.arange(len(lab))
+        ax.barh(y, rb, color=COLORS["read"], alpha=0.8, label="Read MB")
+        ax.barh(y, wb, left=rb, color=COLORS["write"], alpha=0.8, label="Write MB")
+        ax.set_yticks(y); ax.set_yticklabels(lab, fontsize=8); ax.legend(fontsize=8)
+    setup_ax(ax, "Byte-Hot: Top Ranges by Total Bytes", "Bytes (MB)", "LBA Offset")
+
+    # Intersection: write bytes within the count-hot set
+    ax = fig.add_subplot(gs[1, 0])
+    if it:
+        lab = [f"{e['lba_offset_gb']:.2f} GB" for e in it][::-1]
+        wb = [e["write_bytes"]/MB for e in it][::-1]
+        y = np.arange(len(lab))
+        ax.barh(y, wb, color=COLORS["write"], alpha=0.85)
+        ax.set_yticks(y); ax.set_yticklabels(lab, fontsize=8)
+    setup_ax(ax, "Intersection: Write Bytes within Count-Hot Set",
+             "Write Bytes (MB)", "LBA Offset")
+
+    # Scatter: count vs bytes per bin — the metadata/data separation
+    ax = fig.add_subplot(gs[1, 1])
+    pb = views["per_bin"]; ic = pb["io_count"]; tb = pb["total_bytes"]; wbb = pb["write_bytes"]
+    m = ic > 0
+    if np.any(m):
+        wfrac = np.where(tb[m] > 0, wbb[m]/tb[m], 0.0)
+        sct = ax.scatter(ic[m], tb[m]/MB, c=wfrac, cmap="coolwarm",
+                         vmin=0, vmax=1, s=25, alpha=0.75, edgecolors="none")
+        ax.set_xscale("log"); ax.set_yscale("log")
+        plt.colorbar(sct, ax=ax, label="Write byte fraction", shrink=0.8)
+        ax.text(0.97, 0.03, "many small I/Os\n(metadata-like)", transform=ax.transAxes,
+                ha="right", va="bottom", fontsize=8, style="italic", alpha=0.6)
+        ax.text(0.03, 0.97, "few large I/Os\n(data-like)", transform=ax.transAxes,
+                ha="left", va="top", fontsize=8, style="italic", alpha=0.6)
+    setup_ax(ax, "Hotness Map: I/O Count vs Bytes (per LBA bin)",
+             "I/O Count (log)", "Total Bytes MB (log)")
+
+    fig.savefig(os.path.join(od, "09_lba_hotness.png"), dpi=150, bbox_inches="tight"); plt.close(fig)
+    print("  Saved: 09_lba_hotness.png")
 
 def plot_io_sizes(a, od):
     fig,axes = plt.subplots(1,3,figsize=(16,5)); fig.suptitle("I/O Size Distribution",fontsize=15,fontweight="bold")
@@ -1410,6 +1682,8 @@ Examples:
     g.add_argument("--geometry-json",type=str,default="",help="Load geometry from JSON file")
     parser.add_argument("--time-bucket",type=float,default=0.1,help="Time bucket seconds (default:0.1)")
     parser.add_argument("--lba-bins",type=int,default=256,help="LBA bins for heatmap (default:256)")
+    parser.add_argument("--lba-start-only", action="store_true",
+                        help="Bin LBA by start sector only (disable full-extent mapping)")
     parser.add_argument("--output-dir",default="./blktrace_results",help="Output directory")
     parser.add_argument("--no-dashboard",action="store_true")
     parser.add_argument("--summary-only",action="store_true")
@@ -1490,7 +1764,8 @@ Step 6: Run analyzer
     if not events: print("\n  ERROR: No parseable events found."); sys.exit(1)
 
     analyzer = BlktraceAnalyzer(events, time_bucket=args.time_bucket,
-                                 lba_bins=args.lba_bins, geometry=geom)
+                                 lba_bins=args.lba_bins, geometry=geom,
+                                 lba_extent=not args.lba_start_only)
     analyzer.print_summary()
     if args.summary_only: return
 
@@ -1500,6 +1775,7 @@ Step 6: Run analyzer
     if not args.no_dashboard: plot_combined_dashboard(analyzer, args.output_dir)
     plot_queue_depth(analyzer, args.output_dir)
     plot_lba_hotspots(analyzer, args.output_dir)
+    plot_lba_hotness_views(analyzer, args.output_dir)
     plot_io_sizes(analyzer, args.output_dir)
     plot_throughput(analyzer, args.output_dir)
     plot_latency(analyzer, args.output_dir)
