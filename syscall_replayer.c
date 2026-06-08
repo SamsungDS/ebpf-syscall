@@ -11,8 +11,16 @@
 #include <sys/uio.h>
 #include <sys/types.h>
 #include <stdbool.h>
+#include <time.h>
 #include <limits.h>
 
+static inline uint64_t now_ns(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ULL
+         + (uint64_t)ts.tv_nsec;
+}
 
 #define MAX_PROCNAME 256
 #define MAX_SYSCALLNAME 64
@@ -94,6 +102,7 @@ struct dispatcher_ctx {
 	struct fd_map *fdmap;
 	struct mmap_map *mmap;
 	int verify;
+	int paced;
 	uint64_t syscalls_total;
 	uint64_t syscalls_replayed_ok;
 	uint64_t syscalls_replayed_failed;
@@ -1204,6 +1213,9 @@ void *dispatcher_thread(void *arg)
     struct dispatcher_ctx *ctx = (struct dispatcher_ctx *)arg;
     struct ring_buf       *rb  = ctx->rb;
     syscall_opt            op;
+    uint64_t replay_start_ns  = 0;
+    uint64_t capture_start_ns = 0;
+    int      first_record     = 1;
 
     for (;;) {
         int rc = ring_buf_dequeue(rb, &op);
@@ -1211,6 +1223,42 @@ void *dispatcher_thread(void *arg)
             break;  /* Shutdown and queue empty */
         if (rc != 0)
             continue;  /* Empty, waiting or error */
+
+	/*
+         * Sleep long enough so that the elapsed wall-clock time
+         * since replay started matches the elapsed capture time
+         * for this record.
+        */
+        if (ctx->paced) {
+            if (first_record) {
+                replay_start_ns  = now_ns();
+                capture_start_ns = op.timestamp_ns;
+                first_record     = 0;
+            } else {
+                uint64_t capture_elapsed_ns =
+                    op.timestamp_ns - capture_start_ns;
+
+                uint64_t replay_elapsed_ns =
+                    now_ns() - replay_start_ns;
+
+                /* If we are ahead of the original timeline: sleep.
+                 * If we are behind (slow disk / long syscall): skip
+                 * the sleep and catch up immediately.              */
+                if (capture_elapsed_ns > replay_elapsed_ns) {
+                    uint64_t sleep_ns =
+                        capture_elapsed_ns - replay_elapsed_ns;
+
+                    if (sleep_ns > 1000000000ULL)
+                        sleep_ns = 1000000000ULL;
+
+                    struct timespec ts = {
+                        .tv_sec  = (time_t)(sleep_ns / 1000000000ULL),
+                        .tv_nsec = (long)  (sleep_ns % 1000000000ULL)
+                    };
+                    nanosleep(&ts, NULL);
+                }
+            }
+        }
 
         ctx->syscalls_total++;
 
@@ -1288,14 +1336,25 @@ void *dispatcher_thread(void *arg)
 }
 /* main */
 
-int main(void)
+int main(int argc, char *argv[])
 {
-	FILE *fp = fopen("fio_replay.json", "r");
+	const char *json_file = "fio_replay.json";
+	int paced = 0;
+
+	for (int i = 1; i < argc; i++) {
+		if (strcmp(argv[i], "--paced") == 0) {
+			paced = 1;
+		} else if (argv[i][0] != '-') {
+			json_file = argv[i];
+		}
+	}
+
+	FILE *fp = fopen(json_file, "r");
 	if (!fp) {
-		fprintf(stderr, "Error opening file\n");
+		fprintf(stderr, "Error opening file '%s'\n", json_file);
 		return -1;
 	}
-	printf("[main] Starting syscall replayer...\n");
+	printf("[main] Starting syscall replayer -file=%s paced=%s \n", json_file, paced ? "yes" : "no");
 
 	char line[LINE_BUF];
 	char *json_buffer = calloc(1, JSON_BUFFER_SIZE);
@@ -1334,6 +1393,7 @@ int main(void)
 	ctx.fdmap  = fdmap;
 	ctx.mmap = mmap;
 	ctx.verify = 1;
+	ctx.paced = paced;
 
 	/* Create and start dispatcher thread before parsing */
 	pthread_create(&dispatcher_tid, NULL, dispatcher_thread, &ctx);
