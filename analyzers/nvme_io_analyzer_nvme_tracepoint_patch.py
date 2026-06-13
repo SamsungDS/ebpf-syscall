@@ -57,12 +57,23 @@ except Exception:
 SECTOR_BYTES  = 512
 MiB           = 1024 * 1024
 GiB           = 1024 ** 3
-SCRIPT_VER    = "1.3.2-nvme-tp"
+SCRIPT_VER    = "1.3.3-nvme-tp"
 
 # Maximum raw events passed to any scatter / per-point plot.
 # Larger datasets are randomly downsampled to this count before plotting
 # to stay well inside matplotlib Agg's ~2M primitive limit.
 MAX_PLOT_EVENTS = 500_000
+
+# Maximum matched NVMe tracepoint records kept in memory for per-event
+# timeline/heatmap plots and percentile sampling.  Histograms and counters
+# are still maintained for the full capture.
+MAX_NVME_PLOT_SAMPLES = 200_000
+
+# Safety cap for unmatched nvme_setup_cmd entries.  In normal operation this
+# stays near device queue depth; the cap/timeout protect long captures when
+# completion events are missed or tracing starts/stops mid-flight.
+MAX_NVME_PENDING_CMDS = 262_144
+NVME_PENDING_TIMEOUT_SEC = 30.0
 
 # Cap the qd_ts list — only every Nth sample is kept for large traces.
 MAX_QD_SAMPLES  = 200_000
@@ -571,6 +582,8 @@ class FtraceIOCollector:
         r'(?:.*?\bstatus=(?P<status>[^,\s]+))?',
         re.IGNORECASE
     )
+    _RE_NVME_SLBA = re.compile(r'\bslba=(?P<slba>\d+)')
+    _RE_NVME_LEN  = re.compile(r'\b(?:len|nlb)=(?P<nlb>\d+)')
 
     @staticmethod
     def _normalize_nvme_device_name(device: str) -> str:
@@ -585,7 +598,10 @@ class FtraceIOCollector:
 
     def __init__(self, device: str, duration: int,
                  trace_nvme_cmds: bool = False,
-                 raw_trace_output: str = None):
+                 raw_trace_output: str = None,
+                 max_nvme_samples: int = MAX_NVME_PLOT_SAMPLES,
+                 max_nvme_pending: int = MAX_NVME_PENDING_CMDS,
+                 pending_timeout_sec: float = NVME_PENDING_TIMEOUT_SEC):
         self.requested_device = device
         self.device   = self._normalize_nvme_device_name(device)
         m_ctrl = re.match(r'^nvme(\d+)n\d+(?:p\d+)?$', self.device)
@@ -593,6 +609,10 @@ class FtraceIOCollector:
         self.duration = duration
         self.trace_nvme_cmds = trace_nvme_cmds
         self.raw_trace_output = Path(raw_trace_output) if raw_trace_output else None
+        self.max_nvme_samples = max(0, int(max_nvme_samples or 0))
+        self.max_nvme_pending = max(1, int(max_nvme_pending or 1))
+        self.pending_timeout_sec = max(0.0, float(pending_timeout_sec or 0.0))
+        self.logical_block_size = self._logical_block_size()
 
         dev_path = Path(f'/dev/{self.device}')
         if not dev_path.exists():
@@ -624,6 +644,10 @@ class FtraceIOCollector:
         print(f"  Duration: {duration}s")
         if self.trace_nvme_cmds:
             print("  NVMe TP : enabled (nvme_setup_cmd + nvme_complete_rq)")
+            print(f"  NVMe LBS: {self.logical_block_size} bytes")
+            print(f"  NVMe cap: samples≤{self.max_nvme_samples:,}, "
+                  f"pending≤{self.max_nvme_pending:,}, "
+                  f"pending-timeout={self.pending_timeout_sec:g}s")
         if self.raw_trace_output:
             print(f"  Raw log : {self.raw_trace_output}")
 
@@ -659,6 +683,45 @@ class FtraceIOCollector:
                 except Exception:
                     pass
         return allowed
+
+    def _base_nvme_disk_name(self) -> str:
+        """Return nvmeXnY for nvmeXnY or nvmeXnYpZ."""
+        m = re.match(r'^(nvme\d+n\d+)', self.device)
+        return m.group(1) if m else self.device
+
+    def _logical_block_size(self) -> int:
+        """Best-effort logical block size for translating NVMe SLBA/NLB.
+
+        NVMe tracepoints report slba and len in namespace logical blocks,
+        while the existing plots use 512-byte sector units.  Read the block
+        namespace queue setting and fall back to 512 bytes if unavailable.
+        """
+        base = self._base_nvme_disk_name()
+        p = Path('/sys/block') / base / 'queue' / 'logical_block_size'
+        try:
+            v = int(p.read_text().strip())
+            return v if v > 0 else SECTOR_BYTES
+        except Exception:
+            return SECTOR_BYTES
+
+    def _nvme_cmd_lba_size(self, cmd: str):
+        """Return (sector512, bytes, slba, nlb) parsed from an NVMe cmd string.
+
+        The kernel tracepoint prints read/write commands like:
+          cmd=(nvme_cmd_read slba=256121, len=0, ...)
+        NVMe len is zero-based: len=0 means one logical block.
+        """
+        cmd = cmd or ''
+        m_slba = self._RE_NVME_SLBA.search(cmd)
+        if not m_slba:
+            return None, None, None, None
+        slba = int(m_slba.group('slba'))
+        m_len = self._RE_NVME_LEN.search(cmd)
+        nlb = int(m_len.group('nlb')) + 1 if m_len else 1
+        nlb = max(1, nlb)
+        bytes_ = nlb * self.logical_block_size
+        sector512 = int((slba * self.logical_block_size) // SECTOR_BYTES)
+        return sector512, bytes_, slba, nlb
 
     @staticmethod
     def _classify_rwbs(rwbs: str) -> str:
@@ -823,13 +886,29 @@ class FtraceIOCollector:
         lat_hist_w   = np.zeros(32, dtype=np.uint64)
         lba_hist_r   = np.zeros(self.N_LBA, dtype=np.uint64)
         lba_hist_w   = np.zeros(self.N_LBA, dtype=np.uint64)
+
+        # NVMe tracepoint-derived plot histograms.  These are used in
+        # preference to block R/W histograms when --trace-nvme-cmds is enabled
+        # and matched nvme_setup_cmd/nvme_complete_rq pairs contain LBA data.
+        nvme_size_hist_r = np.zeros(32, dtype=np.uint64)
+        nvme_size_hist_w = np.zeros(32, dtype=np.uint64)
+        nvme_lat_hist_r  = np.zeros(32, dtype=np.uint64)
+        nvme_lat_hist_w  = np.zeros(32, dtype=np.uint64)
+        nvme_lba_hist_r  = np.zeros(self.N_LBA, dtype=np.uint64)
+        nvme_lba_hist_w  = np.zeros(self.N_LBA, dtype=np.uint64)
+
         block_other  = collections.Counter()
+        block_other_rwbs = collections.Counter()
         inflight     = {}     # (sector, nr_sector) → (issue_ts, op)
         qd_timeline  = []
         t_start      = time.monotonic()
         interrupted  = False
 
-        nvme_inflight = {}    # (ctrl, qid, cmdid) → (setup_ts, op, nsid, disk, cmd)
+        # (ctrl, qid, cmdid) → (setup_ts, op, nsid, disk, cmd, sector512, bytes)
+        nvme_inflight = {}
+        nvme_events_sample = []
+        nvme_sample_rng = random.Random(0)
+        nvme_trace_t0 = [None]
         nvme_summary = dict(
             enabled       = bool(self.trace_nvme_cmds),
             setup         = 0,
@@ -837,8 +916,42 @@ class FtraceIOCollector:
             matched       = 0,
             cmd_counts    = collections.Counter(),
             status_counts = collections.Counter(),
-            latency_ns    = [],
+            latency_samples_ns = [],
+            latency_seen = 0,
+            plot_sample_seen = 0,
+            pending_expired = 0,
+            pending_evicted = 0,
         )
+
+        def _reservoir_add(sample, seen: int, item, cap: int):
+            """Bounded uniform reservoir sample; counters/histograms stay exact."""
+            if cap <= 0:
+                return
+            if len(sample) < cap:
+                sample.append(item)
+                return
+            j = nvme_sample_rng.randrange(seen)
+            if j < cap:
+                sample[j] = item
+
+        def _prune_nvme_pending(now_ts: float):
+            if not nvme_inflight:
+                return
+            if self.pending_timeout_sec > 0 and now_ts > 0:
+                cutoff = now_ts - self.pending_timeout_sec
+                while nvme_inflight:
+                    first_key = next(iter(nvme_inflight))
+                    first_ts = nvme_inflight[first_key][0]
+                    if first_ts <= 0 or first_ts >= cutoff:
+                        break
+                    nvme_inflight.pop(first_key, None)
+                    nvme_summary['pending_expired'] += 1
+            while len(nvme_inflight) > self.max_nvme_pending:
+                try:
+                    nvme_inflight.pop(next(iter(nvme_inflight)))
+                    nvme_summary['pending_evicted'] += 1
+                except StopIteration:
+                    break
 
         raw_fh = None
         if self.raw_trace_output:
@@ -883,6 +996,7 @@ class FtraceIOCollector:
                                 lba_hist_w[zone] += 1
                             else:
                                 block_other[op] += 1
+                                block_other_rwbs[rwbs] += 1
                             inflight[(sector, nr)] = (ts, op)
                             continue
 
@@ -919,9 +1033,14 @@ class FtraceIOCollector:
                                 key = (int(g['ctrl']), int(g['qid']), int(g['cmdid']))
                                 cmd = g.get('cmd') or ''
                                 op  = self._classify_nvme_cmd(cmd)
+                                sector512, bytes_, _slba, _nlb = self._nvme_cmd_lba_size(cmd)
                                 nvme_summary['setup'] += 1
                                 nvme_summary['cmd_counts'][op] += 1
-                                nvme_inflight[key] = (ts, op, g.get('nsid'), g.get('disk'), cmd)
+                                nvme_inflight[key] = (ts, op, g.get('nsid'), g.get('disk'),
+                                                       cmd, sector512, bytes_)
+                                # Prune occasionally; normal cost stays O(1) per event.
+                                if (nvme_summary['setup'] & 0x3fff) == 0:
+                                    _prune_nvme_pending(ts)
                                 continue
 
                             m = self._RE_NVME_COMPLETE.search(line)
@@ -940,7 +1059,45 @@ class FtraceIOCollector:
                                     lat_ns = int((ts - entry[0]) * 1e9)
                                     if lat_ns > 0:
                                         nvme_summary['matched'] += 1
-                                        nvme_summary['latency_ns'].append(lat_ns)
+                                        op = entry[1]
+                                        sector = entry[5]
+                                        bytes_ = entry[6]
+                                        nvme_summary['latency_seen'] += 1
+                                        _reservoir_add(
+                                            nvme_summary['latency_samples_ns'],
+                                            nvme_summary['latency_seen'],
+                                            lat_ns,
+                                            self.max_nvme_samples
+                                        )
+
+                                        if op in ('read', 'write') and sector is not None and bytes_:
+                                            bkt  = self._log2b(int(bytes_))
+                                            lbkt = self._log2b(lat_ns)
+                                            zone = min(max(int(sector), 0) // self.ZONE_SECS,
+                                                       self.N_LBA - 1)
+                                            if op == 'read':
+                                                nvme_size_hist_r[bkt] += 1
+                                                nvme_lba_hist_r[zone] += 1
+                                                nvme_lat_hist_r[lbkt] += 1
+                                                rw_char = 'R'
+                                            else:
+                                                nvme_size_hist_w[bkt] += 1
+                                                nvme_lba_hist_w[zone] += 1
+                                                nvme_lat_hist_w[lbkt] += 1
+                                                rw_char = 'W'
+
+                                            if nvme_trace_t0[0] is None:
+                                                nvme_trace_t0[0] = entry[0]
+                                            ts_rel = max(0.0, ts - nvme_trace_t0[0])
+                                            lat_ms = lat_ns / 1e6
+                                            nvme_summary['plot_sample_seen'] += 1
+                                            _reservoir_add(
+                                                nvme_events_sample,
+                                                nvme_summary['plot_sample_seen'],
+                                                (ts_rel, int(sector), int(bytes_), rw_char,
+                                                 lat_ms, status, op),
+                                                self.max_nvme_samples
+                                            )
                                 continue
 
             except Exception:
@@ -955,12 +1112,16 @@ class FtraceIOCollector:
             end = t_start + self.duration
             while time.monotonic() < end:
                 time.sleep(0.5)
-                qd = max(0, len(inflight))
+                qd = max(0, len(nvme_inflight) if self.trace_nvme_cmds else len(inflight))
                 qd_timeline.append((round(time.monotonic() - t_start, 2), qd))
                 elapsed = time.monotonic() - t_start
                 if int(elapsed) % 10 < 1:
-                    nr_r = int(size_hist_r.sum())
-                    nr_w = int(size_hist_w.sum())
+                    if self.trace_nvme_cmds:
+                        nr_r = int(nvme_summary['cmd_counts'].get('read', 0))
+                        nr_w = int(nvme_summary['cmd_counts'].get('write', 0))
+                    else:
+                        nr_r = int(size_hist_r.sum())
+                        nr_w = int(size_hist_w.sum())
                     rem  = max(0, self.duration - elapsed)
                     print(f"  [{elapsed:6.0f}s]  R={nr_r:>10,}  W={nr_w:>10,}"
                           f"  QD={qd:>4}  remaining={rem:.0f}s   ",
@@ -991,10 +1152,20 @@ class FtraceIOCollector:
 
         nr_r = int(size_hist_r.sum())
         nr_w = int(size_hist_w.sum())
-        print(f"  I/Os captured  : R={nr_r:,}  W={nr_w:,}")
-        if block_other:
-            print(f"  Other block ops: {dict(block_other)}")
         if self.trace_nvme_cmds:
+            print(f"  Block normal I/O: R={nr_r:,}  W={nr_w:,}")
+        else:
+            print(f"  I/Os captured  : R={nr_r:,}  W={nr_w:,}")
+        if block_other:
+            if block_other_rwbs:
+                print(f"  Other block rwbs: {dict(block_other_rwbs)}")
+            print(f"  Other block ops : {dict(block_other)}")
+        if self.trace_nvme_cmds:
+            nvme_r = int(nvme_summary['cmd_counts'].get('read', 0))
+            nvme_w = int(nvme_summary['cmd_counts'].get('write', 0))
+            nvme_other = int(sum(v for k, v in nvme_summary['cmd_counts'].items()
+                                 if k not in ('read', 'write')))
+            print(f"  NVMe I/O captured: R={nvme_r:,}  W={nvme_w:,}  OtherCmds={nvme_other:,}")
             print("  NVMe commands  : "
                   f"setup={nvme_summary['setup']:,}  "
                   f"complete={nvme_summary['complete']:,}  "
@@ -1003,26 +1174,59 @@ class FtraceIOCollector:
                 print(f"  NVMe op mix    : {dict(nvme_summary['cmd_counts'])}")
             if nvme_summary['status_counts']:
                 print(f"  NVMe statuses  : {dict(nvme_summary['status_counts'])}")
-            if nvme_summary['latency_ns']:
-                lats = np.array(nvme_summary['latency_ns'], dtype=np.uint64)
+            if nvme_summary['latency_samples_ns']:
+                lats = np.array(nvme_summary['latency_samples_ns'], dtype=np.uint64)
+                samp_note = (f"  sample={len(lats):,}/{nvme_summary['latency_seen']:,}"
+                             if nvme_summary['latency_seen'] > len(lats)
+                             else f"  sample={len(lats):,}")
                 print("  NVMe latency   : "
                       f"p50={np.percentile(lats, 50)/1e3:.1f}µs  "
-                      f"p99={np.percentile(lats, 99)/1e3:.1f}µs")
+                      f"p99={np.percentile(lats, 99)/1e3:.1f}µs"
+                      f"{samp_note}")
+            if nvme_summary['plot_sample_seen']:
+                print("  NVMe plot data : "
+                      f"tracepoint records={len(nvme_events_sample):,}/"
+                      f"{nvme_summary['plot_sample_seen']:,} "
+                      f"(bounded sample, source=nvme tracepoints)")
+            if nvme_summary['pending_expired'] or nvme_summary['pending_evicted']:
+                print("  NVMe pending   : "
+                      f"expired={nvme_summary['pending_expired']:,}  "
+                      f"evicted={nvme_summary['pending_evicted']:,}  "
+                      f"remaining={len(nvme_inflight):,}")
         if self.raw_trace_output:
             print(f"  Raw trace      : {self.raw_trace_output}")
         print(f"  Actual duration: {actual_dur:.1f}s")
         if parse_errors[0]:
             print(f"  ⚠  Parse errors: {parse_errors[0]}")
 
+        nvme_events_df = pd.DataFrame(
+            nvme_events_sample,
+            columns=['ts_s', 'sector', 'bytes', 'rw', 'lat_ms', 'status', 'op']
+        ) if nvme_events_sample else pd.DataFrame()
+        if not nvme_events_df.empty:
+            nvme_events_df.attrs['source'] = 'nvme_tracepoints'
+            nvme_events_df.attrs['sample_seen'] = nvme_summary['plot_sample_seen']
+            nvme_events_df.attrs['sample_kept'] = len(nvme_events_df)
+
         return dict(
+            # Existing block-layer outputs remain intact.
             size_hist_r = size_hist_r,
             size_hist_w = size_hist_w,
             lba_hist_r  = lba_hist_r,
             lba_hist_w  = lba_hist_w,
             lat_hist_r  = lat_hist_r,
             lat_hist_w  = lat_hist_w,
-            events_df   = pd.DataFrame(),
-            qd_timeline = qd_timeline,
+
+            # New NVMe-tracepoint plot source.  The plotter uses these when
+            # present, otherwise it falls back to the block-layer histograms.
+            nvme_size_hist_r = nvme_size_hist_r,
+            nvme_size_hist_w = nvme_size_hist_w,
+            nvme_lba_hist_r  = nvme_lba_hist_r,
+            nvme_lba_hist_w  = nvme_lba_hist_w,
+            nvme_lat_hist_r  = nvme_lat_hist_r,
+            nvme_lat_hist_w  = nvme_lat_hist_w,
+            events_df        = nvme_events_df,
+            qd_timeline      = qd_timeline,
             nvme_trace  = dict(
                 enabled       = nvme_summary['enabled'],
                 setup         = nvme_summary['setup'],
@@ -1030,8 +1234,21 @@ class FtraceIOCollector:
                 matched       = nvme_summary['matched'],
                 cmd_counts    = dict(nvme_summary['cmd_counts']),
                 status_counts = dict(nvme_summary['status_counts']),
+                latency_seen  = nvme_summary['latency_seen'],
+                latency_sample_kept = len(nvme_summary['latency_samples_ns']),
+                plot_sample_seen    = nvme_summary['plot_sample_seen'],
+                plot_sample_kept    = len(nvme_events_sample),
+                plot_source         = ('nvme_tracepoints' if nvme_summary['plot_sample_seen'] else 'block_tracepoints'),
+                logical_block_size  = self.logical_block_size,
+                max_plot_samples    = self.max_nvme_samples,
+                max_pending_cmds    = self.max_nvme_pending,
+                pending_timeout_sec = self.pending_timeout_sec,
+                pending_expired     = nvme_summary['pending_expired'],
+                pending_evicted     = nvme_summary['pending_evicted'],
+                pending_remaining   = len(nvme_inflight),
             ),
             block_other = dict(block_other),
+            block_other_rwbs = dict(block_other_rwbs),
             actual_dur  = actual_dur,
             interrupted = interrupted,
             device      = self.device,
@@ -1083,7 +1300,13 @@ class FtraceIOCollector:
                        np.random.choice(size_w, n))
         lba = np.random.choice([50,200,800,2000],n,p=[.4,.3,.2,.1])*1_048_576 \
               + np.random.exponential(1_048_576//4, n).astype(int)
-        events_df = pd.DataFrame(dict(ts_s=ts, sector=lba, bytes=sz, rw=rw))
+        # Synthetic NVMe tracepoint-style sample.
+        lat_ms = np.where(rw=='R',
+                          np.random.lognormal(np.log(0.05), 0.7, n),
+                          np.random.lognormal(np.log(0.10), 0.6, n))
+        events_df = pd.DataFrame(dict(ts_s=ts, sector=lba, bytes=sz, rw=rw,
+                                      lat_ms=lat_ms, status='0x0',
+                                      op=np.where(rw=='R', 'read', 'write')))
 
         qd_tl = [(t, int(np.random.choice([16,32,64,128,256],
                   p=[.1,.2,.3,.25,.15])))
@@ -1096,8 +1319,34 @@ class FtraceIOCollector:
             lba_hist_w  = lba_w,
             lat_hist_r  = _lhist(lat_r),
             lat_hist_w  = _lhist(lat_w),
+            nvme_size_hist_r = _hist(size_r),
+            nvme_size_hist_w = _hist(size_w),
+            nvme_lba_hist_r  = lba_r.copy(),
+            nvme_lba_hist_w  = lba_w.copy(),
+            nvme_lat_hist_r  = _lhist(lat_r),
+            nvme_lat_hist_w  = _lhist(lat_w),
             events_df   = events_df,
             qd_timeline = qd_tl,
+            nvme_trace  = dict(
+                enabled=True,
+                setup=n,
+                complete=n,
+                matched=n,
+                cmd_counts={'read': int((rw=='R').sum()), 'write': int((rw=='W').sum())},
+                status_counts={'0x0': n},
+                latency_seen=n,
+                latency_sample_kept=min(n, MAX_NVME_PLOT_SAMPLES),
+                plot_sample_seen=n,
+                plot_sample_kept=len(events_df),
+                plot_source='nvme_tracepoints',
+                logical_block_size=4096,
+                max_plot_samples=MAX_NVME_PLOT_SAMPLES,
+                max_pending_cmds=MAX_NVME_PENDING_CMDS,
+                pending_timeout_sec=NVME_PENDING_TIMEOUT_SEC,
+                pending_expired=0,
+                pending_evicted=0,
+                pending_remaining=0,
+            ),
             actual_dur  = duration,
             interrupted = False,
             device      = device,
@@ -2550,6 +2799,25 @@ class IOAnalyzerPlotter:
 
         SIZE_EDGES  = FtraceIOCollector.SIZE_EDGES
         LAT_LABELS  = FtraceIOCollector.LAT_LABELS
+        nvme_meta   = data.get('nvme_trace', {}) or {}
+
+        def _sum_arr(name: str) -> int:
+            arr = data.get(name)
+            return int(arr.sum()) if arr is not None else 0
+
+        use_nvme_plots = bool(
+            nvme_meta.get('enabled') and
+            (_sum_arr('nvme_size_hist_r') + _sum_arr('nvme_size_hist_w') +
+             _sum_arr('nvme_lba_hist_r')  + _sum_arr('nvme_lba_hist_w')  +
+             _sum_arr('nvme_lat_hist_r')  + _sum_arr('nvme_lat_hist_w')) > 0
+        )
+        source_label = 'NVMe tracepoints' if use_nvme_plots else 'block tracepoints'
+        source_note  = f'  ·  source={source_label}'
+
+        def _src_arr(nvme_key: str, block_key: str):
+            if use_nvme_plots and data.get(nvme_key) is not None:
+                return data[nvme_key]
+            return data[block_key]
 
         def _size_label(b: int) -> str:
             v = SIZE_EDGES[b]
@@ -2559,11 +2827,11 @@ class IOAnalyzerPlotter:
 
         # ── Page 1: Size distribution ─────────────────────────────────────────
         fig, axes = plt.subplots(2, 2, figsize=(18, 12))
-        fig.suptitle(f'NVMe Driver Layer — I/O Size Distribution  ·  /dev/{device}{partial_tag}',
+        fig.suptitle(f'NVMe Driver Layer — I/O Size Distribution  ·  /dev/{device}{partial_tag}{source_note}',
                      fontsize=13, color=PALETTE['accent'], fontweight='bold')
 
-        sh_r = data['size_hist_r']
-        sh_w = data['size_hist_w']
+        sh_r = _src_arr('nvme_size_hist_r', 'size_hist_r')
+        sh_w = _src_arr('nvme_size_hist_w', 'size_hist_w')
         # Trim trailing zeros
         last  = max(np.flatnonzero(sh_r) [-1] if sh_r.any() else 0,
                     np.flatnonzero(sh_w) [-1] if sh_w.any() else 0) + 2
@@ -2580,7 +2848,7 @@ class IOAnalyzerPlotter:
         ax.bar(x + w/2, sh_w[:last], w, color=PALETTE['write'],
                alpha=0.85, label='Write', edgecolor=PALETTE['bg'])
         ax.set_xticks(x); ax.set_xticklabels(xlabs, rotation=45, ha='right')
-        ax.set_title('I/O Count by Size  (NVMe driver layer)')
+        ax.set_title(f'I/O Count by Size  ({source_label})')
         ax.set_ylabel('I/O Count'); ax.legend(); ax.grid(True, axis='y')
         ax.set_yscale('symlog', linthresh=1)
 
@@ -2638,7 +2906,7 @@ class IOAnalyzerPlotter:
 
         # ── Page 2: LBA + Latency + QD ───────────────────────────────────────
         fig2, axes2 = plt.subplots(2, 2, figsize=(18, 12))
-        fig2.suptitle(f'NVMe Driver Layer — LBA Hotspots & Latency  ·  /dev/{device}{partial_tag}',
+        fig2.suptitle(f'NVMe Driver Layer — LBA Hotspots & Latency  ·  /dev/{device}{partial_tag}{source_note}',
                       fontsize=13, color=PALETTE['accent'], fontweight='bold')
 
         cmap = matplotlib.colors.LinearSegmentedColormap.from_list(
@@ -2647,8 +2915,8 @@ class IOAnalyzerPlotter:
 
         # LBA heatmap (top N zones)
         ax = axes2[0, 0]
-        lba_r = data['lba_hist_r']
-        lba_w = data['lba_hist_w']
+        lba_r = _src_arr('nvme_lba_hist_r', 'lba_hist_r')
+        lba_w = _src_arr('nvme_lba_hist_w', 'lba_hist_w')
         lba_tot = lba_r + lba_w
         n_zones = (lba_tot > 0).sum()
         top_n   = min(64, max(8, n_zones))
@@ -2662,7 +2930,7 @@ class IOAnalyzerPlotter:
         ax.set_xticks(xz[::max(1, top_n//8)])
         ax.set_xticklabels([zone_mb[i] for i in range(0, top_n, max(1, top_n//8))],
                             rotation=45, ha='right', fontsize=7)
-        ax.set_title('Top LBA Zones (512MB buckets)  [NVMe driver layer]')
+        ax.set_title(f'Top LBA Zones (512MB buckets)  [{source_label}]')
         ax.set_ylabel('I/O Count'); ax.legend(); ax.grid(True, axis='y')
 
         # LBA zone sparkline (full range)
@@ -2684,8 +2952,8 @@ class IOAnalyzerPlotter:
 
         # Latency histogram
         ax = axes2[1, 0]
-        lh_r = data['lat_hist_r']
-        lh_w = data['lat_hist_w']
+        lh_r = _src_arr('nvme_lat_hist_r', 'lat_hist_r')
+        lh_w = _src_arr('nvme_lat_hist_w', 'lat_hist_w')
         last_l = max(np.flatnonzero(lh_r)[-1] if lh_r.any() else 10,
                      np.flatnonzero(lh_w)[-1] if lh_w.any() else 10) + 2
         last_l = min(last_l, 31)
@@ -2697,7 +2965,7 @@ class IOAnalyzerPlotter:
         ax.bar(xll + w/2, lh_w[:last_l], w, color=PALETTE['write'],
                alpha=0.85, label='Write', edgecolor=PALETTE['bg'])
         ax.set_xticks(xll); ax.set_xticklabels(xlat, rotation=45, ha='right', fontsize=7)
-        ax.set_title('Latency Histogram  (log2 ns buckets)  [NVMe driver layer]')
+        ax.set_title(f'Latency Histogram  (log2 ns buckets)  [{source_label}]')
         ax.set_ylabel('I/O Count'); ax.legend(); ax.grid(True, axis='y')
         ax.set_yscale('symlog', linthresh=1)
 
@@ -2712,40 +2980,97 @@ class IOAnalyzerPlotter:
                 v = np.percentile(qd_, p)
                 ax.axhline(v, color=c, ls='--', lw=0.9, label=f'P{p}={v:.0f}')
             ax.legend(fontsize=8)
-        ax.set_title('Queue Depth Timeline  [NVMe driver layer]')
+        ax.set_title(f'Queue Depth Timeline  [{source_label}]')
         ax.set_xlabel('Time (s)'); ax.set_ylabel('In-Flight Commands')
         ax.grid(True)
 
         fig2.tight_layout()
         self._save(fig2, '08_nvme_ebpf_lba_lat')
 
-        # ── Page 3: Per-event timeline (if events were captured) ─────────────
+        # ── Page 3: NVMe tracepoint per-event sample / heatmap ───────────────
         ev = data.get('events_df')
         if ev is not None and not ev.empty:
-            fig3, axes3 = plt.subplots(2, 1, figsize=(18, 10))
-            fig3.suptitle(f'NVMe Driver Layer — Per-Event Timeline  ·  /dev/{device}{partial_tag}',
+            ev = ev.copy()
+            if 'lat_ms' not in ev.columns:
+                ev['lat_ms'] = np.nan
+            if 'op' not in ev.columns:
+                ev['op'] = ev['rw'].map({'R': 'read', 'W': 'write'}).fillna('other')
+
+            sample_seen = int(nvme_meta.get('plot_sample_seen', len(ev)))
+            sample_tag = (f'  ·  sampled {len(ev):,}/{sample_seen:,}'
+                          if sample_seen > len(ev) else f'  ·  records {len(ev):,}')
+            fig3, axes3 = plt.subplots(2, 2, figsize=(18, 12))
+            fig3.suptitle(f'NVMe Driver Layer — Tracepoint LBA/Latency Timeline  ·  '
+                          f'/dev/{device}{partial_tag}{source_note}{sample_tag}',
                           fontsize=13, color=PALETTE['accent'], fontweight='bold')
 
+            # Size over time
+            ax = axes3[0, 0]
             for rw, col, lab in [('R', PALETTE['read'],  'Read'),
                                   ('W', PALETTE['write'], 'Write')]:
                 d = ev[ev['rw'] == rw]
                 if d.empty: continue
-                axes3[0].scatter(d['ts_s'], d['bytes']/1024, s=0.8,
-                                 alpha=0.2, color=col, label=lab, rasterized=True)
-                axes3[1].scatter(d['ts_s'], d['sector']/1e6, s=0.8,
-                                 alpha=0.2, color=col, label=lab, rasterized=True)
+                ax.scatter(d['ts_s'], d['bytes']/1024, s=1.0, alpha=0.22,
+                           color=col, label=lab, rasterized=True)
+            ax.set_yscale('log')
+            ax.set_title('I/O Size Over Time  (matched NVMe commands)')
+            ax.set_ylabel('Size (KiB)'); ax.set_xlabel('Time (s)')
+            ax.legend(fontsize=8, markerscale=8); ax.grid(True)
 
-            axes3[0].set_yscale('log')
-            axes3[0].set_title('I/O Size Over Time')
-            axes3[0].set_ylabel('Size (KiB)'); axes3[0].set_xlabel('Time (s)')
-            axes3[0].legend(fontsize=8, markerscale=8); axes3[0].grid(True)
+            # True time × LBA heatmap from the bounded NVMe tracepoint sample
+            ax = axes3[0, 1]
+            ev_h = ev[(ev['rw'].isin(['R', 'W'])) & ev['sector'].notna() & ev['ts_s'].notna()]
+            if not ev_h.empty:
+                n_lba = min(128, max(8, int(np.sqrt(len(ev_h)) // 2)))
+                n_t   = min(160, max(20, int(np.sqrt(len(ev_h)))))
+                try:
+                    heat, lba_edges, t_edges = np.histogram2d(
+                        ev_h['sector'].astype(float).values,
+                        ev_h['ts_s'].astype(float).values,
+                        bins=[n_lba, n_t]
+                    )
+                    heat_s = gaussian_filter(heat + 0.05, sigma=1.0)
+                    if heat_s.max() > 0:
+                        im = ax.imshow(heat_s, aspect='auto', origin='lower',
+                                       extent=[t_edges[0], t_edges[-1],
+                                               lba_edges[0]/1e6, lba_edges[-1]/1e6],
+                                       cmap=cmap,
+                                       norm=LogNorm(vmin=0.05, vmax=heat_s.max()))
+                        fig3.colorbar(im, ax=ax, fraction=0.046, pad=0.04,
+                                      label='I/O count')
+                except Exception:
+                    pass
+            ax.set_title('Time × LBA Heatmap  (NVMe tracepoint sample)')
+            ax.set_xlabel('Time (s)'); ax.set_ylabel('LBA (512B sectors, millions)')
+            ax.grid(False)
 
-            axes3[1].set_title('LBA Access Over Time  (per I/O)')
-            axes3[1].set_ylabel('LBA (millions)'); axes3[1].set_xlabel('Time (s)')
-            axes3[1].legend(fontsize=8, markerscale=8); axes3[1].grid(True)
+            # Latency over time
+            ax = axes3[1, 0]
+            for rw, col, lab in [('R', PALETTE['read'],  'Read'),
+                                  ('W', PALETTE['write'], 'Write')]:
+                d = ev[(ev['rw'] == rw) & ev['lat_ms'].notna()]
+                if d.empty: continue
+                ax.scatter(d['ts_s'], d['lat_ms'], s=1.0, alpha=0.22,
+                           color=col, label=lab, rasterized=True)
+            ax.set_yscale('log')
+            ax.set_title('Latency Over Time  (setup → completion)')
+            ax.set_ylabel('Latency (ms)'); ax.set_xlabel('Time (s)')
+            ax.legend(fontsize=8, markerscale=8); ax.grid(True)
+
+            # LBA scatter over time
+            ax = axes3[1, 1]
+            for rw, col, lab in [('R', PALETTE['read'],  'Read'),
+                                  ('W', PALETTE['write'], 'Write')]:
+                d = ev[ev['rw'] == rw]
+                if d.empty: continue
+                ax.scatter(d['ts_s'], d['sector']/1e6, s=1.0, alpha=0.22,
+                           color=col, label=lab, rasterized=True)
+            ax.set_title('LBA Access Over Time  (per matched NVMe command)')
+            ax.set_ylabel('LBA (512B sectors, millions)'); ax.set_xlabel('Time (s)')
+            ax.legend(fontsize=8, markerscale=8); ax.grid(True)
 
             fig3.tight_layout()
-            self._save(fig3, '09_nvme_ebpf_timeline')
+            self._save(fig3, '09_nvme_ebpf_trace_heatmap')
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2852,7 +3177,7 @@ def main():
 
     # ── nvme-ebpf ──
     p = sub.add_parser('nvme-ebpf',
-                       help='eBPF probe on block_rq_issue — NVMe driver layer I/O size distribution')
+                       help='ftrace block/NVMe tracepoint collection — NVMe driver layer analysis')
     p.add_argument('--device',   required=True,
                    help='NVMe device, e.g. nvme4n1 or nvme4n1p1')
     p.add_argument('--duration', type=int,   default=60,
@@ -2862,6 +3187,16 @@ def main():
                    help='Also enable nvme:nvme_setup_cmd and nvme:nvme_complete_rq')
     p.add_argument('--raw-trace-output', default=None,
                    help='Optional file to save matching raw ftrace lines')
+    p.add_argument('--max-nvme-samples', type=int, default=MAX_NVME_PLOT_SAMPLES,
+                   help=f'Max matched NVMe tracepoint records kept for per-event plots '
+                        f'and percentile sampling (default {MAX_NVME_PLOT_SAMPLES:,}). '
+                        'Counters and histograms still use the full capture.')
+    p.add_argument('--max-nvme-pending', type=int, default=MAX_NVME_PENDING_CMDS,
+                   help=f'Max unmatched nvme_setup_cmd entries kept in memory '
+                        f'(default {MAX_NVME_PENDING_CMDS:,})')
+    p.add_argument('--pending-timeout-sec', type=float, default=NVME_PENDING_TIMEOUT_SEC,
+                   help=f'Drop unmatched NVMe setup entries older than this many seconds '
+                        f'(default {NVME_PENDING_TIMEOUT_SEC:g})')
     p.add_argument('--demo',     action='store_true',
                    help='Use synthetic data — no root required')
 
@@ -2964,7 +3299,10 @@ def main():
             collector = FtraceIOCollector(
                 args.device, args.duration,
                 trace_nvme_cmds=args.trace_nvme_cmds,
-                raw_trace_output=args.raw_trace_output
+                raw_trace_output=args.raw_trace_output,
+                max_nvme_samples=args.max_nvme_samples,
+                max_nvme_pending=args.max_nvme_pending,
+                pending_timeout_sec=args.pending_timeout_sec
             )
             data      = collector.collect()
         pl.plot_nvme_ebpf_analysis(data)
