@@ -134,6 +134,35 @@ struct {
 volatile const bool detailed_logging = true;
 volatile const unsigned int sampling_rate = 1;  // Sample 1 out of every N events (1 = capture all)
 
+// enter/exit join: stash read/write-family enter args by TID so sys_exit can attach the bytes the
+// syscall RETURNED. Without this, enter events carry (fd,count,offset) but ret=-1, and the generic
+// sys_exit carries ret but fd=-1/count=1/offset=0 -- the two are never correlated, so neither
+// requested-vs-returned nor per-fd byte accounting is recoverable. This restores a single joined
+// record {fd, offset, requested count, returned bytes} emitted at completion.
+struct io_ctx {
+    u32 syscall_nr;
+    u32 fd;
+    u64 count;   // requested bytes (or iovcnt for readv/writev)
+    u64 offset;  // absolute offset for pread/pwrite, 0 otherwise
+};
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, MAX_ENTRIES);
+    __type(key, u64);            // bpf_get_current_pid_tgid()
+    __type(value, struct io_ctx);
+} io_inflight SEC(".maps");
+
+static __always_inline void stash_io_enter(u32 syscall_nr, u32 fd, u64 count, u64 offset)
+{
+    u64 tid = bpf_get_current_pid_tgid();
+    struct io_ctx c = {};
+    c.syscall_nr = syscall_nr;
+    c.fd = fd;
+    c.count = count;
+    c.offset = offset;
+    bpf_map_update_elem(&io_inflight, &tid, &c, BPF_ANY);
+}
+
 static __always_inline void update_stats(u32 syscall_nr, u64 size)
 {
     u64 *val;
@@ -211,8 +240,7 @@ int trace_read_entry(struct trace_event_raw_sys_enter *ctx)
     int fd = (int)ctx->args[0];
     size_t count = (size_t)ctx->args[2];
 
-    update_stats(syscall_nr, count);
-    log_event(syscall_nr, fd, count, 0, "", 0, "", -1, -1);
+    stash_io_enter(syscall_nr, fd, count, 0);  // joined + accounted at sys_exit
 
     return 0;
 }
@@ -224,8 +252,7 @@ int trace_write_entry(struct trace_event_raw_sys_enter *ctx)
     int fd = (int)ctx->args[0];
     size_t count = (size_t)ctx->args[2];
 
-    update_stats(syscall_nr, count);
-    log_event(syscall_nr, fd, count, 0, "", 0, "", -1, -1);
+    stash_io_enter(syscall_nr, fd, count, 0);  // joined + accounted at sys_exit
 
     return 0;
 }
@@ -356,8 +383,7 @@ int trace_pread_entry(struct trace_event_raw_sys_enter *ctx)
     size_t count = (size_t)ctx->args[2];
     loff_t pos = (loff_t)ctx->args[3];
 
-    update_stats(syscall_nr, count);
-    log_event(syscall_nr, fd, count, pos, "", 0, "", -1, -1);
+    stash_io_enter(syscall_nr, fd, count, pos);  // joined + accounted at sys_exit
 
     return 0;
 }
@@ -370,8 +396,7 @@ int trace_pwrite_entry(struct trace_event_raw_sys_enter *ctx)
     size_t count = (size_t)ctx->args[2];
     loff_t pos = (loff_t)ctx->args[3];
 
-    update_stats(syscall_nr, count);
-    log_event(syscall_nr, fd, count, pos, "", 0, "", -1, -1);
+    stash_io_enter(syscall_nr, fd, count, pos);  // joined + accounted at sys_exit
 
     return 0;
 }
@@ -412,8 +437,7 @@ int trace_readv_entry(struct trace_event_raw_sys_enter *ctx)
     unsigned int fd = (unsigned int)ctx->args[0];
     size_t iovcnt = (size_t)ctx->args[2];
 
-    update_stats(syscall_nr, iovcnt);
-    log_event(syscall_nr, fd, iovcnt, 0, "", 0, "", -1, -1);
+    stash_io_enter(syscall_nr, fd, iovcnt, 0);  // joined + accounted at sys_exit
 
     return 0;
 }
@@ -425,8 +449,7 @@ int trace_writev_entry(struct trace_event_raw_sys_enter *ctx)
     unsigned int fd = (unsigned int)ctx->args[0];
     size_t iovcnt = (size_t)ctx->args[2];
 
-    update_stats(syscall_nr, iovcnt);
-    log_event(syscall_nr, fd, iovcnt, 0, "", 0, "", -1, -1);
+    stash_io_enter(syscall_nr, fd, iovcnt, 0);  // joined + accounted at sys_exit
 
     return 0;
 }
@@ -448,16 +471,28 @@ SEC("tracepoint/raw_syscalls/sys_exit")
 int trace_sys_exit(struct trace_event_raw_sys_exit *ctx)
 {
     u32 syscall_nr  = ctx->id;   // syscall number
-    long ret = ctx->ret; // return value
+    long ret = ctx->ret; // return value (bytes transferred, or -errno)
     long error_code = 0;
     if (ret < 0 ) {
 	error_code  = -ret;
     }
 
-    if (syscall_nr == 0 || syscall_nr == 1 || syscall_nr == 2 ||
-    syscall_nr == 257 || syscall_nr == 3 || syscall_nr == 8
-    || syscall_nr == 17 || syscall_nr == 18 || syscall_nr == 9 ||
-    syscall_nr == 11 || syscall_nr == 19 || syscall_nr == 20 || syscall_nr == 74) {
+    // read/write family: join with the stashed enter args and emit ONE complete record carrying the
+    // requested count, the absolute offset, AND the RETURNED bytes (the true transfer). Accounting
+    // uses returned bytes, not the requested count -- that is the layer the analytical model needs.
+    u64 tid = bpf_get_current_pid_tgid();
+    struct io_ctx *c = bpf_map_lookup_elem(&io_inflight, &tid);
+    if (c && c->syscall_nr == syscall_nr) {
+        u64 transferred = (ret > 0) ? (u64)ret : 0;
+        update_stats(syscall_nr, transferred);
+        log_event(syscall_nr, c->fd, c->count, c->offset, "", 0, "", ret, error_code);
+        bpf_map_delete_elem(&io_inflight, &tid);
+        return 0;
+    }
+
+    // other syscalls (open/openat/close/lseek/mmap/munmap/fsync): completion-only record
+    if (syscall_nr == 2 || syscall_nr == 257 || syscall_nr == 3 || syscall_nr == 8 ||
+    syscall_nr == 9 || syscall_nr == 11 || syscall_nr == 74) {
         update_stats(syscall_nr, 1);
         log_event(syscall_nr, -1, 1, 0,"", 0, "", ret, error_code);
     }
