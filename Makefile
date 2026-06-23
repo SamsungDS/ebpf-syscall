@@ -29,9 +29,13 @@ TARGET  = syscall_monitor
 BPF_OBJ = syscall_monitor.bpf.o
 SKEL    = syscall_monitor.skel.h
 
+MMAP_TARGET  = mmap_readamp
+MMAP_BPF_OBJ = mmap_readamp.bpf.o
+MMAP_SKEL    = mmap_readamp.skel.h
+
 .PHONY: all clean setup
 
-all: setup $(TARGET)
+all: setup $(TARGET) $(MMAP_TARGET)
 
 setup:
 ifeq ($(LIBBPF_SYSTEM),yes)
@@ -56,6 +60,15 @@ $(SKEL): $(BPF_OBJ)
 
 $(TARGET): syscall_monitor.c $(SKEL)
 	$(CC) $(CFLAGS) $(INCLUDES) syscall_monitor.c $(LIBS_DIR) $(LIBS) -o $@
+
+$(MMAP_BPF_OBJ): mmap_readamp.bpf.c vmlinux.h
+	$(CLANG) $(BPF_CFLAGS) $(INCLUDES) -c mmap_readamp.bpf.c -o $@
+
+$(MMAP_SKEL): $(MMAP_BPF_OBJ)
+	$(BPFTOOL) gen skeleton $< > $@
+
+$(MMAP_TARGET): mmap_readamp.c $(MMAP_SKEL)
+	$(CC) $(CFLAGS) $(INCLUDES) mmap_readamp.c $(LIBS_DIR) $(LIBS) -o $@
 
 vmlinux.h:
 	@echo "Generating vmlinux.h from running kernel..."
@@ -85,6 +98,7 @@ install-deps:
 
 clean:
 	rm -f $(TARGET) $(BPF_OBJ) $(SKEL) vmlinux.h
+	rm -f $(MMAP_TARGET) $(MMAP_BPF_OBJ) $(MMAP_SKEL)
 	rm -rf $(LIBBPF_DIR)
 
 help:
