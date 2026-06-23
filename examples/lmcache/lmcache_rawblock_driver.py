@@ -114,7 +114,9 @@ def main():
                 grp = list(range(s, min(s + args.batch, args.count)))
                 bid = dev.batched_write([offs[i] for i in grp],
                                         [bufs[i] for i in grp],
-                                        [args.size for _ in grp])
+                                        [args.size for _ in grp],
+                                        [(args.trace_id_base + i) if args.trace_id_base else 0
+                                         for i in grp])
                 dev.wait_iouring(bid)
                 for i in grp:
                     record(i, "write", offs[i])
@@ -141,7 +143,9 @@ def main():
                 grp = list(range(s, min(s + args.batch, args.count)))
                 bid = dev.batched_read([offs[i] for i in grp],
                                        [outs[i] for i in grp],
-                                       [args.size for _ in grp])
+                                       [args.size for _ in grp],
+                                       [(args.trace_id_base + i) if args.trace_id_base else 0
+                                        for i in grp])
                 dev.wait_iouring(bid)
                 for i in grp:
                     record(i, "read", offs[i])
