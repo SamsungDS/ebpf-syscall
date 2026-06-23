@@ -37,9 +37,13 @@ IOU_TARGET  = iouring_monitor
 IOU_BPF_OBJ = iouring_monitor.bpf.o
 IOU_SKEL    = iouring_monitor.skel.h
 
+NVME_TARGET  = nvme_uring_cmd_monitor
+NVME_BPF_OBJ = nvme_uring_cmd_monitor.bpf.o
+NVME_SKEL    = nvme_uring_cmd_monitor.skel.h
+
 .PHONY: all clean setup
 
-all: setup $(TARGET) $(MMAP_TARGET) $(IOU_TARGET)
+all: setup $(TARGET) $(MMAP_TARGET) $(IOU_TARGET) $(NVME_TARGET)
 
 setup:
 ifeq ($(LIBBPF_SYSTEM),yes)
@@ -83,6 +87,15 @@ $(IOU_SKEL): $(IOU_BPF_OBJ)
 $(IOU_TARGET): iouring_monitor.c $(IOU_SKEL)
 	$(CC) $(CFLAGS) $(INCLUDES) iouring_monitor.c $(LIBS_DIR) $(LIBS) -o $@
 
+$(NVME_BPF_OBJ): nvme_uring_cmd_monitor.bpf.c vmlinux.h
+	$(CLANG) $(BPF_CFLAGS) $(INCLUDES) -c nvme_uring_cmd_monitor.bpf.c -o $@
+
+$(NVME_SKEL): $(NVME_BPF_OBJ)
+	$(BPFTOOL) gen skeleton $< > $@
+
+$(NVME_TARGET): nvme_uring_cmd_monitor.c $(NVME_SKEL)
+	$(CC) $(CFLAGS) $(INCLUDES) nvme_uring_cmd_monitor.c $(LIBS_DIR) $(LIBS) -o $@
+
 vmlinux.h:
 	@echo "Generating vmlinux.h from running kernel..."
 	@if [ -n "$(BPFTOOL)" ] && [ -x "$(BPFTOOL)" ]; then \
@@ -113,6 +126,7 @@ clean:
 	rm -f $(TARGET) $(BPF_OBJ) $(SKEL) vmlinux.h
 	rm -f $(MMAP_TARGET) $(MMAP_BPF_OBJ) $(MMAP_SKEL)
 	rm -f $(IOU_TARGET) $(IOU_BPF_OBJ) $(IOU_SKEL)
+	rm -f $(NVME_TARGET) $(NVME_BPF_OBJ) $(NVME_SKEL)
 	rm -rf $(LIBBPF_DIR)
 
 help:

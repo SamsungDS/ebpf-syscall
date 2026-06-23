@@ -10,4 +10,6 @@ libbpf/
 /syscall_monitor
 /mmap_readamp
 /iouring_monitor
+/nvme_uring_cmd_monitor
 /examples/io_uring/io_uring_demo
+/examples/io_uring/nvme_uring_cmd_rw

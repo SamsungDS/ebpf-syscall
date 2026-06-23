@@ -6,9 +6,10 @@ LIBURING_CFLAGS := $(shell pkg-config --cflags liburing 2>/dev/null)
 LIBURING_LIBS   := $(shell pkg-config --libs liburing 2>/dev/null || echo -luring)
 
 TARGET = io_uring_demo
+NVME_TARGET = nvme_uring_cmd_rw
 
 .PHONY: all clean check-liburing
-all: check-liburing $(TARGET)
+all: check-liburing $(TARGET) $(NVME_TARGET)
 
 check-liburing:
 	@pkg-config --exists liburing 2>/dev/null && \
@@ -18,5 +19,8 @@ check-liburing:
 $(TARGET): io_uring_demo.c
 	$(CC) $(CFLAGS) $(LIBURING_CFLAGS) $< $(LIBURING_LIBS) -o $@
 
+$(NVME_TARGET): nvme_uring_cmd_rw.c
+	$(CC) $(CFLAGS) $(LIBURING_CFLAGS) $< $(LIBURING_LIBS) -o $@
+
 clean:
-	rm -f $(TARGET) /tmp/io_uring_demo.dat
+	rm -f $(TARGET) $(NVME_TARGET) /tmp/io_uring_demo.dat
