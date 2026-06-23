@@ -56,6 +56,10 @@ def main():
     ap.add_argument("--max-xfer", type=int, default=0,
                     help="split each logical op into <=N-byte device ops (mimics LMCache "
                          "max_data_transfer_size; one NVMe command per device op)")
+    ap.add_argument("--trace-id-base", type=int, default=0,
+                    help="if set, tag op i with trace_id=base+i (encoded into io_uring "
+                         "user_data high 32 bits) so an eBPF tracer can attribute every "
+                         "NVMe command to KV object i; needs the kvio LMCache engine")
     ap.add_argument("--manifest", default=None, help="JSONL op manifest out")
     ap.add_argument("--header", type=int, default=1 << 20, help="reserved prefix bytes")
     args = ap.parse_args()
@@ -99,10 +103,11 @@ def main():
         if args.batch <= 1:
             mx = args.max_xfer or args.size
             for i, o in enumerate(offs):
+                tid = (args.trace_id_base + i) if args.trace_id_base else 0
                 mv = memoryview(bufs[i])
                 for off in range(0, args.size, mx):
                     n = min(mx, args.size - off)
-                    dev.write_uring(o + off, mv[off:off + n], n, n)
+                    dev.write_uring(o + off, mv[off:off + n], n, n, tid)
                 record(i, "write", o)
         else:
             for s in range(0, args.count, args.batch):
@@ -125,10 +130,11 @@ def main():
         if args.batch <= 1:
             mx = args.max_xfer or args.size
             for i, o in enumerate(offs):
+                tid = (args.trace_id_base + i) if args.trace_id_base else 0
                 mv = memoryview(outs[i])
                 for off in range(0, args.size, mx):
                     n = min(mx, args.size - off)
-                    dev.read_uring(o + off, mv[off:off + n], n, n)
+                    dev.read_uring(o + off, mv[off:off + n], n, n, tid)
                 record(i, "read", o)
         else:
             for s in range(0, args.count, args.batch):
