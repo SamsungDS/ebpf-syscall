@@ -21,6 +21,13 @@ struct file_stats {
     unsigned long long completed_faults, minor_faults, major_faults, write_faults;
     unsigned long long fault_bytes, major_bytes, retries;
 };
+struct devino_key {
+    unsigned int dev;
+    unsigned long long ino;
+};
+struct pgcache_stats {
+    unsigned long long fill_pages, fill_bytes;
+};
 
 static volatile int stop;
 static void on_sig(int s) { (void)s; stop = 1; }
@@ -76,6 +83,29 @@ int main(int argc, char **argv)
         k = nk;
     }
     if (!any) printf("(no file-backed demand faults captured)\n");
+
+    // ACTUAL storage reads per file (demand + readahead) from mm_filemap_add_to_page_cache.
+    // fill_MB is what the block layer was forced to read; fault_MB (above) is the demand (intent).
+    // readahead over-fetch = fill_MB - fault_MB (large for plain mmap, ~0 for MADV_RANDOM).
+    // O_DIRECT reads do NOT appear here (they bypass the page cache).
+    int pfd = bpf_map__fd(skel->maps.pgcache);
+    struct devino_key pk, pnk;
+    struct pgcache_stats pv;
+    int pfirst = 1, pany = 0;
+    printf("\n%-16s %14s %14s\n", "dev:inode", "fill_pages", "actual_fill_MB");
+    memset(&pk, 0xff, sizeof(pk));
+    while (bpf_map_get_next_key(pfd, pfirst ? NULL : &pk, &pnk) == 0) {
+        pfirst = 0;
+        if (bpf_map_lookup_elem(pfd, &pnk, &pv) == 0) {
+            char di[40];
+            snprintf(di, sizeof(di), "%u:%llu", pnk.dev, pnk.ino);
+            printf("%-16s %14llu %14.2f\n", di, pv.fill_pages, pv.fill_bytes / 1e6);
+            pany = 1;
+        }
+        pk = pnk;
+    }
+    if (!pany) printf("(no page-cache fills captured)\n");
+
     mmap_readamp_bpf__destroy(skel);
     return 0;
 }

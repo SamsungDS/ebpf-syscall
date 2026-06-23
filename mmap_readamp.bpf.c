@@ -79,6 +79,25 @@ struct {
     __type(value, struct file_stats);
 } file_stats SEC(".maps");
 
+// Page-cache fills = the ACTUAL storage reads (demand fault AND readahead), per file, from the
+// mm_filemap_add_to_page_cache tracepoint. filemap_fault counts the DEMAND (what the app's fault
+// asked for, ~= intent at page granularity); fill_bytes - fault_bytes = the readahead over-fetch.
+// Keyed by file only (dev,ino): readahead is not reliably issued by the faulting task.
+struct devino_key {
+    __u32 dev;
+    __u64 ino;
+};
+struct pgcache_stats {
+    __u64 fill_pages;
+    __u64 fill_bytes;
+};
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 8192);
+    __type(key, struct devino_key);
+    __type(value, struct pgcache_stats);
+} pgcache SEC(".maps");
+
 // optional pid filter (0 = trace all). Set via skeleton rodata before load.
 const volatile __u32 target_tgid = 0;
 
@@ -184,6 +203,31 @@ int BPF_PROG(on_fault_exit, struct vm_fault *vmf, int ret)
         }
     }
     bpf_map_delete_elem(&pending_faults, &k);
+    return 0;
+}
+
+// Every folio inserted into the page cache = an actual storage read (the demand-faulted page OR a
+// readahead page). This is the BLOCK-forced read (4 KiB << order), vs filemap_fault's demand. The
+// gap between this and fault_bytes is the readahead over-fetch (large for plain mmap, ~0 for
+// MADV_RANDOM). O_DIRECT bypasses the page cache, so it does NOT appear here (by design).
+SEC("tracepoint/filemap/mm_filemap_add_to_page_cache")
+int on_pgcache_add(struct trace_event_raw_mm_filemap_op_page_cache *ctx)
+{
+    struct devino_key k = {
+        .dev = BPF_CORE_READ(ctx, s_dev),
+        .ino = BPF_CORE_READ(ctx, i_ino),
+    };
+    __u8 order = BPF_CORE_READ(ctx, order);
+    struct pgcache_stats *s = bpf_map_lookup_elem(&pgcache, &k);
+    if (!s) {
+        struct pgcache_stats zero = {};
+        bpf_map_update_elem(&pgcache, &k, &zero, BPF_NOEXIST);
+        s = bpf_map_lookup_elem(&pgcache, &k);
+    }
+    if (s) {
+        __sync_fetch_and_add(&s->fill_pages, (__u64)1 << order);
+        __sync_fetch_and_add(&s->fill_bytes, (__u64)PAGE_SIZE << order);
+    }
     return 0;
 }
 
