@@ -180,10 +180,11 @@ int main(int argc, char **argv)
     }
     if (!bany) printf("(no block reads captured)\n");
 
-    // MINIMUM I/O: unique 4 KiB pages per file (the floor with a perfect cache: each touched page
-    // read exactly once). min_io_MB = unique_pages * 4 KiB. actual/min_io = avoidable waste (cache
-    // thrash + readahead); min_io/useful_bytes (useful is app-supplied) = the irreducible 4 KiB
-    // granularity + layout tax. Tally per (dev,ino) into a small open-addressed table.
+    // PAGE FOOTPRINT: unique 4 KiB pages per file. NOT the application's intent and NOT the absolute
+    // minimum -- it is the floor AT THE CURRENT ON-DISK LAYOUT (perfect cache, each touched page read
+    // once). footprint_MB = unique_pages * 4 KiB. The app's useful bytes (rows x row_size, supplied by
+    // you) are smaller; the gap footprint/useful is the scatter tax that a row REPACK removes, and
+    // actual/footprint is the cache thrash that more cache removes. Tally per (dev,ino) open-addressed.
     int gfd = bpf_map__fd(skel->maps.pages_seen);
     struct page_key gk, gnk;
     unsigned char gv;
@@ -205,8 +206,9 @@ int main(int argc, char **argv)
         }
         gk = gnk;
     }
-    printf("\n%-16s %14s %14s   (the I/O floor: read each touched page once)\n",
-           "dev:inode", "unique_pages", "min_io_MB");
+    printf("\n%-16s %14s %16s   (distinct pages x 4KiB = floor AT THE CURRENT LAYOUT,"
+           " not the app's useful bytes; a repack shrinks it toward useful)\n",
+           "dev:inode", "unique_pages", "footprint_MB");
     if (!npg) printf("(no pages tracked)\n");
     for (int b = 0; b < NT; b++)
         if (tal[b].pages) {
