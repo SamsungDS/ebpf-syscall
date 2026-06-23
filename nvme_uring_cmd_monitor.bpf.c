@@ -45,6 +45,7 @@ struct nvme_cmd_event {
 	__u64 ts;
 	__u32 pid;
 	__u32 tid;
+	__u64 user_data;    /* SQE user_data — the KV-object join key (if LMCache tags it) */
 	__u64 cmd_op;       /* ioucmd->cmd_op (NVME_URING_CMD_IO/_VEC) */
 	__u8  nvme_opcode;  /* 0x02 read, 0x01 write, ... */
 	__u8  multipath;    /* 1 if via *_head_chr handler */
@@ -88,6 +89,10 @@ static __always_inline int handle(struct io_uring_cmd *ioucmd, __u8 multipath)
 	e->pid = id >> 32;
 	e->tid = (__u32)id;
 	bpf_get_current_comm(&e->comm, sizeof(e->comm));
+	/* SQE user_data: the join key tying this NVMe command to a KV object, IF the
+	 * application (LMCache) encodes a trace_id there. user_data is at a fixed
+	 * offset in the SQE; the kernel carries it through untouched. */
+	e->user_data = BPF_CORE_READ(sqe, user_data);
 	e->cmd_op = BPF_CORE_READ(ioucmd, cmd_op);
 	e->nvme_opcode = c.opcode;
 	e->multipath = multipath;

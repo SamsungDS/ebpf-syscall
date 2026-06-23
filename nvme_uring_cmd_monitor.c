@@ -16,6 +16,7 @@ struct nvme_cmd_event {
 	unsigned long long ts;
 	unsigned int pid;
 	unsigned int tid;
+	unsigned long long user_data;
 	unsigned long long cmd_op;
 	unsigned char nvme_opcode;
 	unsigned char multipath;
@@ -52,12 +53,13 @@ static int handle_event(void *ctx, void *data, size_t sz)
 	unsigned long long nlb = (unsigned long long)e->nlb_zero + 1;
 	unsigned long long bytes = nlb * lba_size;
 	fprintf(out,
-		"{\"event_type\":\"nvme_cmd\",\"pid\":%u,\"tid\":%u,\"nvme_opcode\":%u,"
-		"\"op_name\":\"%s\",\"nsid\":%u,\"slba\":%llu,\"nlb\":%llu,"
+		"{\"event_type\":\"nvme_cmd\",\"pid\":%u,\"tid\":%u,\"user_data\":%llu,"
+		"\"nvme_opcode\":%u,\"op_name\":\"%s\",\"nsid\":%u,\"slba\":%llu,\"nlb\":%llu,"
 		"\"bytes\":%llu,\"data_len\":%u,\"multipath\":%u,\"cmd_op\":\"0x%llx\","
 		"\"comm\":\"%s\",\"ts\":%llu}\n",
-		e->pid, e->tid, e->nvme_opcode, nvme_op(e->nvme_opcode), e->nsid,
-		e->slba, nlb, bytes, e->data_len, e->multipath, e->cmd_op, e->comm, e->ts);
+		e->pid, e->tid, e->user_data, e->nvme_opcode, nvme_op(e->nvme_opcode),
+		e->nsid, e->slba, nlb, bytes, e->data_len, e->multipath, e->cmd_op,
+		e->comm, e->ts);
 	return 0;
 }
 
