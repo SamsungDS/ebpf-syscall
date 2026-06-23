@@ -20,9 +20,24 @@ import argparse, json, os, sys, time
 import lmcache_rust_raw_block_io as rb
 
 
+import functools
+
+
+@functools.lru_cache(maxsize=1)
+def _base():
+    # 64 KiB deterministic base pattern, computed once (pure-python per-byte
+    # generation of multi-MiB buffers is too slow and would push the real I/O
+    # outside a tracer's capture window).
+    return bytes((i * 2654435761 >> 8) & 0xFF for i in range(1 << 16))
+
+
 def pattern(n, off):
-    # deterministic, offset-keyed
-    return bytes(((off + i) * 1103515245 >> 16) & 0xFF for i in range(n))
+    # deterministic per-op buffer at C speed: tile the base, then tag the first
+    # 8 bytes with the offset so a misaddressed read is caught on verify.
+    base = _base()
+    b = bytearray(base * (n // len(base) + 1))[:n]
+    b[0:8] = (off & 0xFFFFFFFFFFFFFFFF).to_bytes(8, "little")
+    return bytes(b)
 
 
 def main():
