@@ -16,7 +16,7 @@ else
   INCLUDES       = -I$(LIBBPF_HDR_DIR) -I$(LIBBPF_DIR)/src -I.
   LIBS_DIR       = -L$(LIBBPF_DIR)/src
   LIBS           = -lbpf -lelf -lz
-  BPFTOOL        = bpftool
+  BPFTOOL        = $(shell command -v bpftool || command -v /usr/sbin/bpftool)
 endif
 
 # Compiler flags
@@ -33,9 +33,13 @@ MMAP_TARGET  = mmap_readamp
 MMAP_BPF_OBJ = mmap_readamp.bpf.o
 MMAP_SKEL    = mmap_readamp.skel.h
 
+IOU_TARGET  = iouring_monitor
+IOU_BPF_OBJ = iouring_monitor.bpf.o
+IOU_SKEL    = iouring_monitor.skel.h
+
 .PHONY: all clean setup
 
-all: setup $(TARGET) $(MMAP_TARGET)
+all: setup $(TARGET) $(MMAP_TARGET) $(IOU_TARGET)
 
 setup:
 ifeq ($(LIBBPF_SYSTEM),yes)
@@ -70,6 +74,15 @@ $(MMAP_SKEL): $(MMAP_BPF_OBJ)
 $(MMAP_TARGET): mmap_readamp.c $(MMAP_SKEL)
 	$(CC) $(CFLAGS) $(INCLUDES) mmap_readamp.c $(LIBS_DIR) $(LIBS) -o $@
 
+$(IOU_BPF_OBJ): iouring_monitor.bpf.c vmlinux.h
+	$(CLANG) $(BPF_CFLAGS) $(INCLUDES) -c iouring_monitor.bpf.c -o $@
+
+$(IOU_SKEL): $(IOU_BPF_OBJ)
+	$(BPFTOOL) gen skeleton $< > $@
+
+$(IOU_TARGET): iouring_monitor.c $(IOU_SKEL)
+	$(CC) $(CFLAGS) $(INCLUDES) iouring_monitor.c $(LIBS_DIR) $(LIBS) -o $@
+
 vmlinux.h:
 	@echo "Generating vmlinux.h from running kernel..."
 	@if [ -n "$(BPFTOOL)" ] && [ -x "$(BPFTOOL)" ]; then \
@@ -99,6 +112,7 @@ install-deps:
 clean:
 	rm -f $(TARGET) $(BPF_OBJ) $(SKEL) vmlinux.h
 	rm -f $(MMAP_TARGET) $(MMAP_BPF_OBJ) $(MMAP_SKEL)
+	rm -f $(IOU_TARGET) $(IOU_BPF_OBJ) $(IOU_SKEL)
 	rm -rf $(LIBBPF_DIR)
 
 help:
