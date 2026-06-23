@@ -98,6 +98,59 @@ struct {
     __type(value, struct pgcache_stats);
 } pgcache SEC(".maps");
 
+// read()/pread() syscall reads attributed per file (fd -> inode). This is the INTENT the app issued
+// to the kernel: the requested byte count. For mmap there are NO such syscalls (data access is a
+// memory load), so this is empty for mmap -- it is exactly what makes a pread-based SSD offload
+// introspectable where mmap is opaque. For an O_DIRECT page cache the requests are 4 KiB-aligned;
+// for a hypothetical pread(row_bytes) fetch it is the true logical intent (e.g. 768 B/row).
+struct sysread_stats {
+    __u64 read_calls;
+    __u64 read_bytes;
+};
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 8192);
+    __type(key, struct devino_key);
+    __type(value, struct sysread_stats);
+} syscall_reads SEC(".maps");
+
+static __always_inline int read_fd_inode(__u32 fd_num, __u32 *dev, __u64 *ino)
+{
+    struct task_struct *task = (struct task_struct *)bpf_get_current_task();
+    struct file **fdarr = BPF_CORE_READ(task, files, fdt, fd);
+    if (!fdarr)
+        return -1;
+    struct file *file = NULL;
+    bpf_probe_read_kernel(&file, sizeof(file), &fdarr[fd_num]);
+    if (!file)
+        return -1;
+    struct inode *inode = BPF_CORE_READ(file, f_inode);
+    if (!inode)
+        return -1;
+    *ino = BPF_CORE_READ(inode, i_ino);
+    *dev = BPF_CORE_READ(inode, i_sb, s_dev);
+    return 0;
+}
+static __always_inline int account_read(__u32 fd_num, __u64 count)
+{
+    __u32 dev;
+    __u64 ino;
+    if (read_fd_inode(fd_num, &dev, &ino))
+        return 0;
+    struct devino_key k = {.dev = dev, .ino = ino};
+    struct sysread_stats *s = bpf_map_lookup_elem(&syscall_reads, &k);
+    if (!s) {
+        struct sysread_stats zero = {};
+        bpf_map_update_elem(&syscall_reads, &k, &zero, BPF_NOEXIST);
+        s = bpf_map_lookup_elem(&syscall_reads, &k);
+    }
+    if (s) {
+        __sync_fetch_and_add(&s->read_calls, 1);
+        __sync_fetch_and_add(&s->read_bytes, count);
+    }
+    return 0;
+}
+
 // optional pid filter (0 = trace all). Set via skeleton rodata before load.
 const volatile __u32 target_tgid = 0;
 
@@ -229,6 +282,19 @@ int on_pgcache_add(struct trace_event_raw_mm_filemap_op_page_cache *ctx)
         __sync_fetch_and_add(&s->fill_bytes, (__u64)PAGE_SIZE << order);
     }
     return 0;
+}
+
+// pread(fd, buf, count, pos) -- the offload's row/page fetches if it uses pread (e.g. O_DIRECT).
+SEC("tracepoint/syscalls/sys_enter_pread64")
+int on_pread(struct trace_event_raw_sys_enter *ctx)
+{
+    return account_read((__u32)ctx->args[0], (__u64)ctx->args[2]);
+}
+// read(fd, buf, count) -- buffered sequential fetches.
+SEC("tracepoint/syscalls/sys_enter_read")
+int on_read(struct trace_event_raw_sys_enter *ctx)
+{
+    return account_read((__u32)ctx->args[0], (__u64)ctx->args[2]);
 }
 
 // reap stale pending entries on thread exit (a RETRY that never completed)

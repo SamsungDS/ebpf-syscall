@@ -28,6 +28,9 @@ struct devino_key {
 struct pgcache_stats {
     unsigned long long fill_pages, fill_bytes;
 };
+struct sysread_stats {
+    unsigned long long read_calls, read_bytes;
+};
 
 static volatile int stop;
 static void on_sig(int s) { (void)s; stop = 1; }
@@ -105,6 +108,27 @@ int main(int argc, char **argv)
         pk = pnk;
     }
     if (!pany) printf("(no page-cache fills captured)\n");
+
+    // INTENT via read()/pread() syscalls, per file (fd -> inode). Empty for pure mmap (no syscalls);
+    // populated for a pread/O_DIRECT offload -- this is what the app asked the kernel to read.
+    int sfd = bpf_map__fd(skel->maps.syscall_reads);
+    struct devino_key sk, snk;
+    struct sysread_stats sv;
+    int sfirst = 1, sany = 0;
+    printf("\n%-16s %14s %16s %14s\n", "dev:inode", "read_calls", "read_bytes(MB)", "avg_req(B)");
+    memset(&sk, 0xff, sizeof(sk));
+    while (bpf_map_get_next_key(sfd, sfirst ? NULL : &sk, &snk) == 0) {
+        sfirst = 0;
+        if (bpf_map_lookup_elem(sfd, &snk, &sv) == 0) {
+            char di[40];
+            snprintf(di, sizeof(di), "%u:%llu", snk.dev, snk.ino);
+            printf("%-16s %14llu %16.2f %14.0f\n", di, sv.read_calls, sv.read_bytes / 1e6,
+                   sv.read_calls ? (double)sv.read_bytes / sv.read_calls : 0.0);
+            sany = 1;
+        }
+        sk = snk;
+    }
+    if (!sany) printf("(no read/pread syscalls -- expected for pure mmap)\n");
 
     mmap_readamp_bpf__destroy(skel);
     return 0;
