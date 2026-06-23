@@ -51,18 +51,28 @@ def main():
                     help="io_uring: ops per batched_write/read call (1 = single write_uring)")
     ap.add_argument("--align", type=int, default=4096)
     ap.add_argument("--odirect", action="store_true")
+    ap.add_argument("--uring-cmd", action="store_true",
+                    help="NVMe passthrough via io_uring_cmd (needs --engine io_uring + /dev/ngXnY)")
+    ap.add_argument("--max-xfer", type=int, default=0,
+                    help="split each logical op into <=N-byte device ops (mimics LMCache "
+                         "max_data_transfer_size; one NVMe command per device op)")
     ap.add_argument("--manifest", default=None, help="JSONL op manifest out")
     ap.add_argument("--header", type=int, default=1 << 20, help="reserved prefix bytes")
     args = ap.parse_args()
 
-    cap = args.header + args.count * max(args.size, args.align) + (1 << 20)
-    with open(args.file, "wb") as f:
-        f.truncate(cap)
+    if args.uring_cmd:
+        assert args.engine == "io_uring", "--uring-cmd requires --engine io_uring"
+        assert args.file.startswith("/dev/ng"), "--uring-cmd requires a /dev/ngXnY device"
+        # raw NVMe namespace char device: fixed size, do NOT truncate
+    else:
+        cap = args.header + args.count * max(args.size, args.align) + (1 << 20)
+        with open(args.file, "wb") as f:
+            f.truncate(cap)
 
     dev = rb.RawBlockDevice(
         args.file, writable=True, use_odirect=args.odirect,
         alignment=args.align, io_engine=args.engine,
-        iouring_queue_depth=args.qd,
+        iouring_queue_depth=args.qd, use_uring_cmd=args.uring_cmd,
     )
 
     man = open(args.manifest, "w") if args.manifest else None
@@ -87,8 +97,12 @@ def main():
             record(i, "write", o)
     else:
         if args.batch <= 1:
+            mx = args.max_xfer or args.size
             for i, o in enumerate(offs):
-                dev.write_uring(o, bufs[i], args.size, args.size)
+                mv = memoryview(bufs[i])
+                for off in range(0, args.size, mx):
+                    n = min(mx, args.size - off)
+                    dev.write_uring(o + off, mv[off:off + n], n, n)
                 record(i, "write", o)
         else:
             for s in range(0, args.count, args.batch):
@@ -109,8 +123,12 @@ def main():
             record(i, "read", o)
     else:
         if args.batch <= 1:
+            mx = args.max_xfer or args.size
             for i, o in enumerate(offs):
-                dev.read_uring(o, outs[i], args.size, args.size)
+                mv = memoryview(outs[i])
+                for off in range(0, args.size, mx):
+                    n = min(mx, args.size - off)
+                    dev.read_uring(o + off, mv[off:off + n], n, n)
                 record(i, "read", o)
         else:
             for s in range(0, args.count, args.batch):
