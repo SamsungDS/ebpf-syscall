@@ -145,6 +145,31 @@ struct {
     __type(value, struct block_stats);
 } block_reads SEC(".maps");
 
+// Unique 4 KiB pages touched per file = the MINIMUM I/O floor: the bytes you must read from storage
+// even with a perfect (infinite) cache, each page fetched exactly once. min_io = unique_pages * 4096.
+// actual/min = the avoidable waste (cache thrash + readahead above the footprint); min/useful_bytes =
+// the irreducible 4 KiB-granularity + layout tax. Marked from mmap faults (pgoff) and O_DIRECT begins
+// (pos..pos+count). NO_PREALLOC so memory tracks the real footprint, not the 8M cap.
+struct page_key {
+    __u32 dev;
+    __u64 ino;
+    __u64 pgoff;
+};
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 8388608);
+    __uint(map_flags, BPF_F_NO_PREALLOC);
+    __type(key, struct page_key);
+    __type(value, __u8);
+} pages_seen SEC(".maps");
+
+static __always_inline void mark_page(__u32 dev, __u64 ino, __u64 pgoff)
+{
+    struct page_key pk = {.dev = dev, .ino = ino, .pgoff = pgoff};
+    __u8 one = 1;
+    bpf_map_update_elem(&pages_seen, &pk, &one, BPF_NOEXIST);
+}
+
 static __always_inline int read_fd_inode(__u32 fd_num, __u32 *dev, __u64 *ino)
 {
     struct task_struct *task = (struct task_struct *)bpf_get_current_task();
@@ -285,6 +310,7 @@ int BPF_PROG(on_fault_exit, struct vm_fault *vmf, int ret)
             if (p->write)
                 __sync_fetch_and_add(&st->write_faults, 1);
         }
+        mark_page(p->dev, p->ino, p->pgoff); // unique demanded page (the footprint, not readahead)
     }
     bpf_map_delete_elem(&pending_faults, &k);
     return 0;
@@ -326,6 +352,24 @@ SEC("tracepoint/syscalls/sys_enter_read")
 int on_read(struct trace_event_raw_sys_enter *ctx)
 {
     return account_read((__u32)ctx->args[0], (__u64)ctx->args[2]);
+}
+
+// O_DIRECT begin -- carries pos+count, so mark the page footprint (unique pages = the minimum I/O).
+SEC("tracepoint/iomap/iomap_dio_rw_begin")
+int on_dio_begin(struct trace_event_raw_iomap_dio_rw_begin *ctx)
+{
+    __u32 dev = BPF_CORE_READ(ctx, dev);
+    __u64 ino = BPF_CORE_READ(ctx, ino);
+    __u64 pos = BPF_CORE_READ(ctx, pos);
+    __u64 count = BPF_CORE_READ(ctx, count);
+    __u64 start = pos >> PAGE_SHIFT;
+    __u64 end = (pos + count + PAGE_SIZE - 1) >> PAGE_SHIFT;
+    for (int i = 0; i < 256; i++) { // bounded: 4 KiB reads = 1 page; caps a single DIO at 1 MiB footprint
+        if (start + i >= end)
+            break;
+        mark_page(dev, ino, start + i);
+    }
+    return 0;
 }
 
 // O_DIRECT completion -- the one hook where O_DIRECT is attributable to a regular file (the

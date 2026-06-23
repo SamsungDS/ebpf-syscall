@@ -37,6 +37,11 @@ struct odirect_stats {
 struct block_stats {
     unsigned long long read_bytes, read_ios;
 };
+struct page_key {
+    unsigned int dev;
+    unsigned long long ino;
+    unsigned long long pgoff;
+};
 
 static volatile int stop;
 static void on_sig(int s) { (void)s; stop = 1; }
@@ -141,14 +146,15 @@ int main(int argc, char **argv)
     struct devino_key ok, onk;
     struct odirect_stats ov;
     int ofirst = 1, oany = 0;
-    printf("\n%-16s %14s %16s\n", "dev:inode", "dio_calls", "odirect_MB");
+    printf("\n%-16s %14s %16s %12s\n", "dev:inode", "dio_calls", "odirect_MB", "avg_io_B");
     memset(&ok, 0xff, sizeof(ok));
     while (bpf_map_get_next_key(ofd, ofirst ? NULL : &ok, &onk) == 0) {
         ofirst = 0;
         if (bpf_map_lookup_elem(ofd, &onk, &ov) == 0) {
             char di[40];
             snprintf(di, sizeof(di), "%u:%llu", onk.dev, onk.ino);
-            printf("%-16s %14llu %16.2f\n", di, ov.dio_calls, ov.dio_bytes / 1e6);
+            printf("%-16s %14llu %16.2f %12.0f\n", di, ov.dio_calls, ov.dio_bytes / 1e6,
+                   ov.dio_calls ? (double)ov.dio_bytes / ov.dio_calls : 0.0);
             oany = 1;
         }
         ok = onk;
@@ -161,17 +167,53 @@ int main(int argc, char **argv)
     unsigned int bk, bnk;
     struct block_stats bv;
     int bfirst = 1, bany = 0;
-    printf("\n%-10s %14s %16s\n", "device", "read_ios", "physical_MB");
+    printf("\n%-10s %14s %16s %12s\n", "device", "read_ios", "physical_MB", "avg_io_B");
     memset(&bk, 0xff, sizeof(bk));
     while (bpf_map_get_next_key(bfd, bfirst ? NULL : &bk, &bnk) == 0) {
         bfirst = 0;
         if (bpf_map_lookup_elem(bfd, &bnk, &bv) == 0) {
-            printf("%-10u %14llu %16.2f\n", bnk, bv.read_ios, bv.read_bytes / 1e6);
+            printf("%-10u %14llu %16.2f %12.0f\n", bnk, bv.read_ios, bv.read_bytes / 1e6,
+                   bv.read_ios ? (double)bv.read_bytes / bv.read_ios : 0.0);
             bany = 1;
         }
         bk = bnk;
     }
     if (!bany) printf("(no block reads captured)\n");
+
+    // MINIMUM I/O: unique 4 KiB pages per file (the floor with a perfect cache: each touched page
+    // read exactly once). min_io_MB = unique_pages * 4 KiB. actual/min_io = avoidable waste (cache
+    // thrash + readahead); min_io/useful_bytes (useful is app-supplied) = the irreducible 4 KiB
+    // granularity + layout tax. Tally per (dev,ino) into a small open-addressed table.
+    int gfd = bpf_map__fd(skel->maps.pages_seen);
+    struct page_key gk, gnk;
+    unsigned char gv;
+    enum { NT = 1 << 18 };
+    static struct { unsigned int dev; unsigned long long ino, pages; } tal[NT];
+    int gfirst = 1;
+    unsigned long long npg = 0;
+    memset(&gk, 0xff, sizeof(gk));
+    while (bpf_map_get_next_key(gfd, gfirst ? NULL : &gk, &gnk) == 0) {
+        gfirst = 0;
+        if (bpf_map_lookup_elem(gfd, &gnk, &gv) == 0) {
+            npg++;
+            unsigned long long h = (gnk.ino * 1099511628211ULL) ^ gnk.dev;
+            for (int probe = 0; probe < NT; probe++) {
+                unsigned int b = (h + probe) & (NT - 1);
+                if (tal[b].pages == 0) { tal[b].dev = gnk.dev; tal[b].ino = gnk.ino; tal[b].pages = 1; break; }
+                if (tal[b].dev == gnk.dev && tal[b].ino == gnk.ino) { tal[b].pages++; break; }
+            }
+        }
+        gk = gnk;
+    }
+    printf("\n%-16s %14s %14s   (the I/O floor: read each touched page once)\n",
+           "dev:inode", "unique_pages", "min_io_MB");
+    if (!npg) printf("(no pages tracked)\n");
+    for (int b = 0; b < NT; b++)
+        if (tal[b].pages) {
+            char di[40];
+            snprintf(di, sizeof(di), "%u:%llu", tal[b].dev, tal[b].ino);
+            printf("%-16s %14llu %14.2f\n", di, tal[b].pages, tal[b].pages * 4096.0 / 1e6);
+        }
 
     mmap_readamp_bpf__destroy(skel);
     return 0;
