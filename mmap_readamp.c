@@ -31,6 +31,12 @@ struct pgcache_stats {
 struct sysread_stats {
     unsigned long long read_calls, read_bytes;
 };
+struct odirect_stats {
+    unsigned long long dio_bytes, dio_calls;
+};
+struct block_stats {
+    unsigned long long read_bytes, read_ios;
+};
 
 static volatile int stop;
 static void on_sig(int s) { (void)s; stop = 1; }
@@ -129,6 +135,43 @@ int main(int argc, char **argv)
         sk = snk;
     }
     if (!sany) printf("(no read/pread syscalls -- expected for pure mmap)\n");
+
+    // O_DIRECT bytes per file (iomap DIO) -- the offload's actual reads, which bypass the page cache.
+    int ofd = bpf_map__fd(skel->maps.odirect);
+    struct devino_key ok, onk;
+    struct odirect_stats ov;
+    int ofirst = 1, oany = 0;
+    printf("\n%-16s %14s %16s\n", "dev:inode", "dio_calls", "odirect_MB");
+    memset(&ok, 0xff, sizeof(ok));
+    while (bpf_map_get_next_key(ofd, ofirst ? NULL : &ok, &onk) == 0) {
+        ofirst = 0;
+        if (bpf_map_lookup_elem(ofd, &onk, &ov) == 0) {
+            char di[40];
+            snprintf(di, sizeof(di), "%u:%llu", onk.dev, onk.ino);
+            printf("%-16s %14llu %16.2f\n", di, ov.dio_calls, ov.dio_bytes / 1e6);
+            oany = 1;
+        }
+        ok = onk;
+    }
+    if (!oany) printf("(no O_DIRECT reads captured)\n");
+
+    // PHYSICAL block-device reads, per device (block_rq_issue) -- the true storage bytes (vs the
+    // page-cache materialization footprint above). Not per-file: the block layer loses the inode.
+    int bfd = bpf_map__fd(skel->maps.block_reads);
+    unsigned int bk, bnk;
+    struct block_stats bv;
+    int bfirst = 1, bany = 0;
+    printf("\n%-10s %14s %16s\n", "device", "read_ios", "physical_MB");
+    memset(&bk, 0xff, sizeof(bk));
+    while (bpf_map_get_next_key(bfd, bfirst ? NULL : &bk, &bnk) == 0) {
+        bfirst = 0;
+        if (bpf_map_lookup_elem(bfd, &bnk, &bv) == 0) {
+            printf("%-10u %14llu %16.2f\n", bnk, bv.read_ios, bv.read_bytes / 1e6);
+            bany = 1;
+        }
+        bk = bnk;
+    }
+    if (!bany) printf("(no block reads captured)\n");
 
     mmap_readamp_bpf__destroy(skel);
     return 0;

@@ -114,6 +114,37 @@ struct {
     __type(value, struct sysread_stats);
 } syscall_reads SEC(".maps");
 
+// O_DIRECT bytes per file from the iomap direct-I/O completion (iomap_dio_complete carries the
+// regular-file dev+inode from iocb->ki_filp -- the one place O_DIRECT is attributable to a file).
+// O_DIRECT bypasses the page cache, so neither filemap_fault nor mm_filemap_add_to_page_cache sees
+// it; this closes that hole. (Transfer bytes; reads for a read-only workload.)
+struct odirect_stats {
+    __u64 dio_bytes;
+    __u64 dio_calls;
+};
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 8192);
+    __type(key, struct devino_key);
+    __type(value, struct odirect_stats);
+} odirect SEC(".maps");
+
+// PHYSICAL block-device read bytes, per DEVICE, from block_rq_issue. This is the true host storage
+// traffic -- distinct from the page-cache-fill materialization footprint. The block layer cannot map
+// a request back to a regular-file inode (request merging across files; O_DIRECT bios point at the
+// anonymous user buffer, not page->mapping->host), so this is per-device, not per-file. For a
+// single-tenant run it equals the workload's physical reads.
+struct block_stats {
+    __u64 read_bytes;
+    __u64 read_ios;
+};
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 256);
+    __type(key, __u32);
+    __type(value, struct block_stats);
+} block_reads SEC(".maps");
+
 static __always_inline int read_fd_inode(__u32 fd_num, __u32 *dev, __u64 *ino)
 {
     struct task_struct *task = (struct task_struct *)bpf_get_current_task();
@@ -295,6 +326,55 @@ SEC("tracepoint/syscalls/sys_enter_read")
 int on_read(struct trace_event_raw_sys_enter *ctx)
 {
     return account_read((__u32)ctx->args[0], (__u64)ctx->args[2]);
+}
+
+// O_DIRECT completion -- the one hook where O_DIRECT is attributable to a regular file (the
+// tracepoint reads dev+inode from iocb->ki_filp). Closes the hole the page-cache probe can't see.
+SEC("tracepoint/iomap/iomap_dio_complete")
+int on_dio_complete(struct trace_event_raw_iomap_dio_complete *ctx)
+{
+    long ret = BPF_CORE_READ(ctx, ret);
+    if (ret <= 0)
+        return 0;
+    struct devino_key k = {
+        .dev = BPF_CORE_READ(ctx, dev),
+        .ino = BPF_CORE_READ(ctx, ino),
+    };
+    struct odirect_stats *s = bpf_map_lookup_elem(&odirect, &k);
+    if (!s) {
+        struct odirect_stats zero = {};
+        bpf_map_update_elem(&odirect, &k, &zero, BPF_NOEXIST);
+        s = bpf_map_lookup_elem(&odirect, &k);
+    }
+    if (s) {
+        __sync_fetch_and_add(&s->dio_bytes, (__u64)ret);
+        __sync_fetch_and_add(&s->dio_calls, 1);
+    }
+    return 0;
+}
+
+// PHYSICAL block-device reads (block_rq_issue). rwbs[0]=='R' is a read (covers 'R' and 'RA'
+// readahead). Per device, not per file -- this is the true storage bytes, the bottom of the stack.
+SEC("tracepoint/block/block_rq_issue")
+int on_block_rq(struct trace_event_raw_block_rq *ctx)
+{
+    char op = 0;
+    bpf_probe_read_kernel(&op, 1, &ctx->rwbs[0]);
+    if (op != 'R')
+        return 0;
+    __u32 dev = BPF_CORE_READ(ctx, dev);
+    __u32 bytes = BPF_CORE_READ(ctx, bytes);
+    struct block_stats *s = bpf_map_lookup_elem(&block_reads, &dev);
+    if (!s) {
+        struct block_stats zero = {};
+        bpf_map_update_elem(&block_reads, &dev, &zero, BPF_NOEXIST);
+        s = bpf_map_lookup_elem(&block_reads, &dev);
+    }
+    if (s) {
+        __sync_fetch_and_add(&s->read_bytes, bytes);
+        __sync_fetch_and_add(&s->read_ios, 1);
+    }
+    return 0;
 }
 
 // reap stale pending entries on thread exit (a RETRY that never completed)
