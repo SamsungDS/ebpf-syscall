@@ -239,11 +239,11 @@ int main(int argc, char **argv)
     int ggfd = bpf_map__fd(skel->maps.dev_geoms);
     unsigned int bk, bnk;
     struct block_stats bv;
-    int bfirst = 1, bany = 0, floored_any = 0;
+    int bfirst = 1, bany = 0, floored_any = 0, opt_unrep = 0;
     const char *hl[12] = {"512", "1K",  "2K",   "4K",   "8K",   "16K",
                           "32K", "64K", "128K", "256K", "512K", ">=1M"};
     printf("\n%-9s %10s %10s %9s %9s %9s %9s %9s %9s %8s %7s\n", "device", "read_ios", "phys",
-           "min", "avg", "max", "IU", "NOWS", "MDTS", "IU_rdamp", "sub-IU%");
+           "min", "avg", "max", "IU", "opt_io", "MDTS", "IU_rdamp", "sub-IU%");
     printf("  (IU_rdamp = IU-granular bytes / actual reads; sub-IU%% = reads below the IU)\n");
     memset(&bk, 0xff, sizeof(bk));
     while (bpf_map_get_next_key(bfd, bfirst ? NULL : &bk, &bnk) == 0) {
@@ -258,9 +258,10 @@ int main(int argc, char **argv)
             hsize(g.iu, biu, sizeof(biu));
             snprintf(iustr, sizeof(iustr), "%s%s", biu, g.floored ? "*" : "");
             if (g.floored) floored_any = 1;
-            // NOWS = optimal_io_size verbatim; show n/a when the device does not report one (never fake it).
+            // opt_io = optimal_io_size verbatim. >0 -> the device's preferred sustained-I/O unit;
+            // 0 -> the device reports no optimal I/O size (kernel ABI). Show it raw, never fake it.
             if (g.nows) hsize(g.nows, bno, sizeof(bno));
-            else snprintf(bno, sizeof(bno), "n/a");
+            else { snprintf(bno, sizeof(bno), "0"); opt_unrep = 1; }
             printf("%-9u %10llu %10s %9s %9s %9s %9s %9s %9s %6.2fx %6.1f%%\n", bnk, bv.read_ios,
                    hsize(bv.read_bytes, bp, sizeof(bp)), hsize(bv.min_io, bmin, sizeof(bmin)),
                    hsize(avg, bavg, sizeof(bavg)), hsize(bv.max_io, bmax, sizeof(bmax)), iustr,
@@ -274,7 +275,7 @@ int main(int argc, char **argv)
                 else if (g.mdts && bsz == g.mdts) m = 'M';
                 printf("%s%c=%llu ", hl[i], m, bv.hist[i]);
             }
-            printf("  [I=IU O=NOWS M=MDTS]\n");
+            printf("  [I=IU O=opt_io M=MDTS]\n");
             bany = 1;
         }
         bk = bnk;
@@ -282,6 +283,9 @@ int main(int argc, char **argv)
     if (!bany) printf("(no block reads captured)\n");
     if (floored_any)
         printf("  * IU assumed 4 KiB (NVMe 512-LBA; device did not report a larger one)\n");
+    if (opt_unrep)
+        printf("  opt_io (optimal_io_size) = 0: device reports no optimal I/O size (kernel ABI) -- the\n"
+               "         preferred unit for SUSTAINED throughput; rare on SSDs, usually a RAID stripe width\n");
 
     // FS-layer demand vs readahead (XFS/iomap), per file: readahead-PREPARED pages (the speculative
     // window) vs DEMAND folio reads. This is the split block_rq_issue cannot give (it is post-merge).
