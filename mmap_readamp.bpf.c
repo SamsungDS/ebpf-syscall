@@ -372,6 +372,42 @@ int on_read(struct trace_event_raw_sys_enter *ctx)
     return account_read((__u32)ctx->args[0], (__u64)ctx->args[2]);
 }
 
+// preadv(fd, iov, iovcnt, pos) -- scatter/gather reads (GNN store, many DBs). The requested bytes are
+// the SUM of the iovec lengths (in user memory), so walk up to 16 iovecs. This is INTENT: it fires
+// whether the data comes from the device or the page cache, so for a RAM-resident file it shows the
+// full logical read volume even when block_rq_issue shows ~0.
+static __always_inline int account_preadv(__u32 fd, const struct iovec *iov, __u64 iovcnt)
+{
+    __u64 total = 0;
+    for (int i = 0; i < 16; i++) {
+        if ((__u64)i >= iovcnt)
+            break;
+        struct iovec v = {};
+        if (bpf_probe_read_user(&v, sizeof(v), &iov[i]))
+            break;
+        total += (__u64)v.iov_len;
+    }
+    return account_read(fd, total);
+}
+SEC("tracepoint/syscalls/sys_enter_preadv")
+int on_preadv(struct trace_event_raw_sys_enter *ctx)
+{
+    return account_preadv((__u32)ctx->args[0], (const struct iovec *)ctx->args[1],
+                          (__u64)ctx->args[2]);
+}
+SEC("tracepoint/syscalls/sys_enter_preadv2")
+int on_preadv2(struct trace_event_raw_sys_enter *ctx)
+{
+    return account_preadv((__u32)ctx->args[0], (const struct iovec *)ctx->args[1],
+                          (__u64)ctx->args[2]);
+}
+SEC("tracepoint/syscalls/sys_enter_readv")
+int on_readv(struct trace_event_raw_sys_enter *ctx)
+{
+    return account_preadv((__u32)ctx->args[0], (const struct iovec *)ctx->args[1],
+                          (__u64)ctx->args[2]);
+}
+
 // O_DIRECT begin -- carries pos+count, so mark the page footprint (unique pages = the minimum I/O).
 SEC("tracepoint/iomap/iomap_dio_rw_begin")
 int on_dio_begin(struct trace_event_raw_iomap_dio_rw_begin *ctx)
