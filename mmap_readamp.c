@@ -35,7 +35,10 @@ struct odirect_stats {
     unsigned long long dio_bytes, dio_calls;
 };
 struct block_stats {
-    unsigned long long read_bytes, read_ios;
+    unsigned long long read_bytes, read_ios, hist[9];
+};
+struct iomap_stats {
+    unsigned long long ra_prepared_pages, ra_calls;
 };
 struct page_key {
     unsigned int dev;
@@ -106,7 +109,8 @@ int main(int argc, char **argv)
     struct devino_key pk, pnk;
     struct pgcache_stats pv;
     int pfirst = 1, pany = 0;
-    printf("\n%-16s %14s %14s\n", "dev:inode", "fill_pages", "actual_fill_MB");
+    printf("\n%-16s %14s %16s   (page-cache INSERTION, pre-FS-submission, not device completion)\n",
+           "dev:inode", "fill_pages", "insertion_MB");
     memset(&pk, 0xff, sizeof(pk));
     while (bpf_map_get_next_key(pfd, pfirst ? NULL : &pk, &pnk) == 0) {
         pfirst = 0;
@@ -162,23 +166,50 @@ int main(int argc, char **argv)
     if (!oany) printf("(no O_DIRECT reads captured)\n");
 
     // PHYSICAL block-device reads, per device (block_rq_issue) -- the true storage bytes (vs the
-    // page-cache materialization footprint above). Not per-file: the block layer loses the inode.
+    // page-cache insertion above). Not per-file: the block layer loses the inode. The SIZE HISTOGRAM
+    // is the point: an average hides whether 23 KB means "mostly 4K + rare 128K" or "uniformly 23K".
     int bfd = bpf_map__fd(skel->maps.block_reads);
     unsigned int bk, bnk;
     struct block_stats bv;
     int bfirst = 1, bany = 0;
-    printf("\n%-10s %14s %16s %12s\n", "device", "read_ios", "physical_MB", "avg_io_B");
+    const char *hl[9] = {"4K", "8K", "16K", "32K", "64K", "128K", "256K", "512K", ">=1M"};
+    printf("\n%-10s %14s %14s %10s   size histogram (ops): %s\n", "device", "read_ios", "physical_MB",
+           "avg_io_B", "4K 8K 16K 32K 64K 128K 256K 512K >=1M");
     memset(&bk, 0xff, sizeof(bk));
     while (bpf_map_get_next_key(bfd, bfirst ? NULL : &bk, &bnk) == 0) {
         bfirst = 0;
         if (bpf_map_lookup_elem(bfd, &bnk, &bv) == 0) {
-            printf("%-10u %14llu %16.2f %12.0f\n", bnk, bv.read_ios, bv.read_bytes / 1e6,
+            printf("%-10u %14llu %14.2f %10.0f   ", bnk, bv.read_ios, bv.read_bytes / 1e6,
                    bv.read_ios ? (double)bv.read_bytes / bv.read_ios : 0.0);
+            for (int i = 0; i < 9; i++)
+                printf("%s=%llu ", hl[i], bv.hist[i]);
+            printf("\n");
             bany = 1;
         }
         bk = bnk;
     }
     if (!bany) printf("(no block reads captured)\n");
+
+    // FS-layer demand vs readahead (XFS/iomap), per file: readahead-PREPARED pages (the speculative
+    // window) vs DEMAND folio reads. This is the split block_rq_issue cannot give (it is post-merge).
+    int ifd = bpf_map__fd(skel->maps.iomap_reads);
+    struct devino_key ik, ink;
+    struct iomap_stats iv;
+    int ifirst = 1, iany = 0;
+    printf("\n%-16s %16s %12s   (XFS readahead PREPARED; vs fault_MB demand above = over-fetch)\n",
+           "dev:inode", "ra_prepared_MB", "ra_calls");
+    memset(&ik, 0xff, sizeof(ik));
+    while (bpf_map_get_next_key(ifd, ifirst ? NULL : &ik, &ink) == 0) {
+        ifirst = 0;
+        if (bpf_map_lookup_elem(ifd, &ink, &iv) == 0) {
+            char di[40];
+            snprintf(di, sizeof(di), "%u:%llu", ink.dev, ink.ino);
+            printf("%-16s %16.2f %12llu\n", di, iv.ra_prepared_pages * 4096.0 / 1e6, iv.ra_calls);
+            iany = 1;
+        }
+        ik = ink;
+    }
+    if (!iany) printf("(no iomap readahead -- O_DIRECT, MADV_RANDOM, or non-iomap fs)\n");
 
     // PAGE FOOTPRINT: unique 4 KiB pages per file. NOT the application's intent and NOT the absolute
     // minimum -- it is the floor AT THE CURRENT ON-DISK LAYOUT (perfect cache, each touched page read

@@ -137,6 +137,7 @@ struct {
 struct block_stats {
     __u64 read_bytes;
     __u64 read_ios;
+    __u64 hist[9]; // request-size buckets: 4K,8K,16K,32K,64K,128K,256K,512K,>=1M
 };
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
@@ -144,6 +145,22 @@ struct {
     __type(key, __u32);
     __type(value, struct block_stats);
 } block_reads SEC(".maps");
+
+// Filesystem-layer readahead, per file (XFS/iomap), from the iomap:iomap_readahead tracepoint:
+// nr_pages = readahead_count(rac), the base pages XFS PREPARED for readahead on this inode (the
+// predicted window; the demand page is inside it). Compare against filemap_fault DEMAND: the excess
+// is the readahead over-fetch -- the split block_rq_issue (post-merge) cannot give. NOT device
+// completion; holes/failures/partial submission can still intervene below.
+struct iomap_stats {
+    __u64 ra_prepared_pages;
+    __u64 ra_calls;
+};
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 8192);
+    __type(key, struct devino_key);
+    __type(value, struct iomap_stats);
+} iomap_reads SEC(".maps");
 
 // Unique 4 KiB pages touched per file = the MINIMUM I/O floor: the bytes you must read from storage
 // even with a perfect (infinite) cache, each page fetched exactly once. min_io = unique_pages * 4096.
@@ -316,10 +333,11 @@ int BPF_PROG(on_fault_exit, struct vm_fault *vmf, int ret)
     return 0;
 }
 
-// Every folio inserted into the page cache = an actual storage read (the demand-faulted page OR a
-// readahead page). This is the BLOCK-forced read (4 KiB << order), vs filemap_fault's demand. The
-// gap between this and fault_bytes is the readahead over-fetch (large for plain mmap, ~0 for
-// MADV_RANDOM). O_DIRECT bypasses the page cache, so it does NOT appear here (by design).
+// Folio INSERTED into the page cache (demand fault OR readahead). This is page-cache INSERTION, which
+// fires BEFORE read_pages() submits to the filesystem -- a near-proxy for a cold read, NOT a device
+// completion (the FS may leave prepared folios unread). For the true device bytes use block_rq_issue.
+// The gap insertion - fault is the readahead over-fetch (large for plain mmap, ~0 for MADV_RANDOM).
+// O_DIRECT bypasses the page cache, so it does NOT appear here (by design).
 SEC("tracepoint/filemap/mm_filemap_add_to_page_cache")
 int on_pgcache_add(struct trace_event_raw_mm_filemap_op_page_cache *ctx)
 {
@@ -417,6 +435,46 @@ int on_block_rq(struct trace_event_raw_block_rq *ctx)
     if (s) {
         __sync_fetch_and_add(&s->read_bytes, bytes);
         __sync_fetch_and_add(&s->read_ios, 1);
+        // size histogram: bucket = floor(log2(bytes/4KiB)); an AVERAGE alone hides the distribution.
+        __u32 pages = bytes >> PAGE_SHIFT;
+        int b = 0;
+        for (int i = 0; i < 8; i++) {
+            if (pages <= 1)
+                break;
+            pages >>= 1;
+            b++;
+        }
+        __sync_fetch_and_add(&s->hist[b], 1);
+    }
+    return 0;
+}
+
+// XFS/iomap readahead via the tracepoint (iomap_readahead is exposed as a TRACE_EVENT, not a plain
+// fentry target -- its BTF FUNC is the tp trampoline, so fentry read garbage). The tracepoint hands
+// us dev+ino+nr_pages directly, no CO-RE pointer walk. nr_pages = the readahead_count prepared.
+struct iomap_ra_tp {
+    char common[8]; // common_type/flags/preempt_count/pid
+    __u32 dev;      // offset 8
+    __u32 _pad;     // ino is 8-aligned at offset 16
+    __u64 ino;      // offset 16
+    __s32 nr_pages; // offset 24
+};
+SEC("tracepoint/iomap/iomap_readahead")
+int on_iomap_readahead(struct iomap_ra_tp *ctx)
+{
+    struct devino_key k = {.dev = ctx->dev, .ino = ctx->ino};
+    __s32 nr = ctx->nr_pages;
+    if (nr < 0)
+        nr = 0;
+    struct iomap_stats *s = bpf_map_lookup_elem(&iomap_reads, &k);
+    if (!s) {
+        struct iomap_stats zero = {};
+        bpf_map_update_elem(&iomap_reads, &k, &zero, BPF_NOEXIST);
+        s = bpf_map_lookup_elem(&iomap_reads, &k);
+    }
+    if (s) {
+        __sync_fetch_and_add(&s->ra_prepared_pages, (__u64)nr);
+        __sync_fetch_and_add(&s->ra_calls, 1);
     }
     return 0;
 }
