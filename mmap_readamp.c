@@ -29,7 +29,7 @@ struct pgcache_stats {
     unsigned long long fill_pages, fill_bytes;
 };
 struct sysread_stats {
-    unsigned long long read_calls, read_bytes;
+    unsigned long long read_calls, read_bytes, min_bytes, max_bytes;
 };
 struct odirect_stats {
     unsigned long long dio_bytes, dio_calls;
@@ -130,15 +130,17 @@ int main(int argc, char **argv)
     struct devino_key sk, snk;
     struct sysread_stats sv;
     int sfirst = 1, sany = 0;
-    printf("\n%-16s %14s %16s %14s\n", "dev:inode", "read_calls", "read_bytes(MB)", "avg_req(B)");
+    printf("\n%-16s %12s %14s %11s %11s %11s   (per-read INTENT size: what the app asks the kernel)\n",
+           "dev:inode", "read_calls", "read_bytes(MB)", "min_req(B)", "avg_req(B)", "max_req(B)");
     memset(&sk, 0xff, sizeof(sk));
     while (bpf_map_get_next_key(sfd, sfirst ? NULL : &sk, &snk) == 0) {
         sfirst = 0;
         if (bpf_map_lookup_elem(sfd, &snk, &sv) == 0) {
             char di[40];
             snprintf(di, sizeof(di), "%u:%llu", snk.dev, snk.ino);
-            printf("%-16s %14llu %16.2f %14.0f\n", di, sv.read_calls, sv.read_bytes / 1e6,
-                   sv.read_calls ? (double)sv.read_bytes / sv.read_calls : 0.0);
+            printf("%-16s %12llu %14.2f %11llu %11.0f %11llu\n", di, sv.read_calls, sv.read_bytes / 1e6,
+                   sv.min_bytes, sv.read_calls ? (double)sv.read_bytes / sv.read_calls : 0.0,
+                   sv.max_bytes);
             sany = 1;
         }
         sk = snk;

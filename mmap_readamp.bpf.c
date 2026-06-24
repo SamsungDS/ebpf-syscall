@@ -106,6 +106,8 @@ struct {
 struct sysread_stats {
     __u64 read_calls;
     __u64 read_bytes;
+    __u64 min_bytes; // smallest single read request to this file (0 = unset)
+    __u64 max_bytes; // largest single read request
 };
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
@@ -220,6 +222,12 @@ static __always_inline int account_read(__u32 fd_num, __u64 count)
     if (s) {
         __sync_fetch_and_add(&s->read_calls, 1);
         __sync_fetch_and_add(&s->read_bytes, count);
+        // min/max are non-atomic read-modify-write: a lost update under cross-CPU contention just
+        // defers the extreme to its next occurrence, which over millions of reads is exact.
+        if (s->min_bytes == 0 || count < s->min_bytes)
+            s->min_bytes = count;
+        if (count > s->max_bytes)
+            s->max_bytes = count;
     }
     return 0;
 }
