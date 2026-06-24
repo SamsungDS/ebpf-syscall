@@ -253,22 +253,24 @@ int main(int argc, char **argv)
             bpf_map_lookup_elem(ggfd, &bnk, &g);
             double amp = bv.read_bytes ? (double)bv.iu_bytes / bv.read_bytes : 0.0;
             double subp = bv.read_ios ? 100.0 * bv.sub_iu_ios / bv.read_ios : 0.0;
-            unsigned int nows = g.nows ? g.nows : g.iu; // io_opt==0 -> optimal is the minimum (IU)
             unsigned long long avg = bv.read_ios ? bv.read_bytes / bv.read_ios : 0;
             char bp[24], bmin[24], bavg[24], bmax[24], biu[24], bno[24], bmd[24], iustr[28];
             hsize(g.iu, biu, sizeof(biu));
             snprintf(iustr, sizeof(iustr), "%s%s", biu, g.floored ? "*" : "");
             if (g.floored) floored_any = 1;
+            // NOWS = optimal_io_size verbatim; show n/a when the device does not report one (never fake it).
+            if (g.nows) hsize(g.nows, bno, sizeof(bno));
+            else snprintf(bno, sizeof(bno), "n/a");
             printf("%-9u %10llu %10s %9s %9s %9s %9s %9s %9s %6.2fx %6.1f%%\n", bnk, bv.read_ios,
                    hsize(bv.read_bytes, bp, sizeof(bp)), hsize(bv.min_io, bmin, sizeof(bmin)),
                    hsize(avg, bavg, sizeof(bavg)), hsize(bv.max_io, bmax, sizeof(bmax)), iustr,
-                   hsize(nows, bno, sizeof(bno)), hsize(g.mdts, bmd, sizeof(bmd)), amp, subp);
+                   bno, hsize(g.mdts, bmd, sizeof(bmd)), amp, subp);
             printf("  size hist(ops): ");
             for (int i = 0; i < 12; i++) {
                 unsigned int bsz = 512u << i;
                 char m = ' ';
                 if (g.iu && bsz == g.iu) m = 'I';
-                else if (bsz == nows && nows != g.iu) m = 'O';
+                else if (g.nows && bsz == g.nows) m = 'O';
                 else if (g.mdts && bsz == g.mdts) m = 'M';
                 printf("%s%c=%llu ", hl[i], m, bv.hist[i]);
             }
