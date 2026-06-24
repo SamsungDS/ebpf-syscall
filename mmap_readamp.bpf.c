@@ -106,13 +106,19 @@ struct {
 struct sysread_stats {
     __u64 read_calls;
     __u64 read_bytes;
-    __u64 min_bytes; // smallest single read request to this file (0 = unset)
-    __u64 max_bytes; // largest single read request
+    __u64 min_bytes; // smallest single request to this file (0 = unset)
+    __u64 max_bytes; // largest single request
+};
+// keyed by (dev, ino, is_write): read AND write intent per file (write/pwrite/pwritev too -- LMCache).
+struct sysio_key {
+    __u32 dev;
+    __u64 ino;
+    __u32 is_write;
 };
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
-    __uint(max_entries, 8192);
-    __type(key, struct devino_key);
+    __uint(max_entries, 16384);
+    __type(key, struct sysio_key);
     __type(value, struct sysread_stats);
 } syscall_reads SEC(".maps");
 
@@ -137,18 +143,24 @@ struct {
 // anonymous user buffer, not page->mapping->host), so this is per-device, not per-file. For a
 // single-tenant run it equals the workload's physical reads.
 struct block_stats {
-    __u64 read_bytes;
+    __u64 read_bytes; // "read_" prefix is historical; with the is_write key this holds R or W bytes
     __u64 read_ios;
     __u64 hist[12]; // size buckets, 512-byte base: 512,1K,2K,4K,8K,16K,32K,64K,128K,256K,512K,>=1M
-    __u64 iu_bytes; // sum over reads of (IUs the read spans) * IU_size -- the IU-granular footprint
-    __u64 sub_iu_ios; // reads smaller than one IU
-    __u64 min_io;   // smallest block read request (0 = unset)
-    __u64 max_io;   // largest block read request
+    __u64 iu_bytes; // sum over ops of (IUs the op spans) * IU_size -- the IU-granular footprint
+    __u64 sub_iu_ios; // ops smaller than one IU (sub-IU READS over-fetch; sub-IU WRITES = RMW risk)
+    __u64 min_io;   // smallest block request (0 = unset)
+    __u64 max_io;   // largest block request
+};
+// keyed by (dev, is_write) so reads and writes are tracked separately -- writes matter for LMCache
+// (KV offload) and sub-IU writes are the read-modify-write case the IU is really about.
+struct bdev_key {
+    __u32 dev;
+    __u32 is_write;
 };
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
-    __uint(max_entries, 256);
-    __type(key, __u32);
+    __uint(max_entries, 512);
+    __type(key, struct bdev_key);
     __type(value, struct block_stats);
 } block_reads SEC(".maps");
 
@@ -225,13 +237,13 @@ static __always_inline int read_fd_inode(__u32 fd_num, __u32 *dev, __u64 *ino)
     *dev = BPF_CORE_READ(inode, i_sb, s_dev);
     return 0;
 }
-static __always_inline int account_read(__u32 fd_num, __u64 count)
+static __always_inline int account_io(__u32 fd_num, __u64 count, __u32 is_write)
 {
     __u32 dev;
     __u64 ino;
     if (read_fd_inode(fd_num, &dev, &ino))
         return 0;
-    struct devino_key k = {.dev = dev, .ino = ino};
+    struct sysio_key k = {.dev = dev, .ino = ino, .is_write = is_write};
     struct sysread_stats *s = bpf_map_lookup_elem(&syscall_reads, &k);
     if (!s) {
         struct sysread_stats zero = {};
@@ -386,24 +398,23 @@ int on_pgcache_add(struct trace_event_raw_mm_filemap_op_page_cache *ctx)
     return 0;
 }
 
-// pread(fd, buf, count, pos) -- the offload's row/page fetches if it uses pread (e.g. O_DIRECT).
+// read/pread/write/pwrite intent (fd,buf,count[,pos]) -- count is args[2] for all four.
 SEC("tracepoint/syscalls/sys_enter_pread64")
 int on_pread(struct trace_event_raw_sys_enter *ctx)
-{
-    return account_read((__u32)ctx->args[0], (__u64)ctx->args[2]);
-}
-// read(fd, buf, count) -- buffered sequential fetches.
+{ return account_io((__u32)ctx->args[0], (__u64)ctx->args[2], 0); }
 SEC("tracepoint/syscalls/sys_enter_read")
 int on_read(struct trace_event_raw_sys_enter *ctx)
-{
-    return account_read((__u32)ctx->args[0], (__u64)ctx->args[2]);
-}
+{ return account_io((__u32)ctx->args[0], (__u64)ctx->args[2], 0); }
+SEC("tracepoint/syscalls/sys_enter_pwrite64")
+int on_pwrite(struct trace_event_raw_sys_enter *ctx)
+{ return account_io((__u32)ctx->args[0], (__u64)ctx->args[2], 1); }
+SEC("tracepoint/syscalls/sys_enter_write")
+int on_write(struct trace_event_raw_sys_enter *ctx)
+{ return account_io((__u32)ctx->args[0], (__u64)ctx->args[2], 1); }
 
-// preadv(fd, iov, iovcnt, pos) -- scatter/gather reads (GNN store, many DBs). The requested bytes are
-// the SUM of the iovec lengths (in user memory), so walk up to 16 iovecs. This is INTENT: it fires
-// whether the data comes from the device or the page cache, so for a RAM-resident file it shows the
-// full logical read volume even when block_rq_issue shows ~0.
-static __always_inline int account_preadv(__u32 fd, const struct iovec *iov, __u64 iovcnt)
+// vectored I/O (fd, iov, iovcnt): sum the iovec lengths from user memory. INTENT (fires for cache or
+// device). Covers preadv/readv (reads) and pwritev/writev (writes -- LMCache's KV offload).
+static __always_inline int account_iov(__u32 fd, const struct iovec *iov, __u64 iovcnt, __u32 is_write)
 {
     __u64 total = 0;
     for (int i = 0; i < 16; i++) {
@@ -414,26 +425,26 @@ static __always_inline int account_preadv(__u32 fd, const struct iovec *iov, __u
             break;
         total += (__u64)v.iov_len;
     }
-    return account_read(fd, total);
+    return account_io(fd, total, is_write);
 }
 SEC("tracepoint/syscalls/sys_enter_preadv")
 int on_preadv(struct trace_event_raw_sys_enter *ctx)
-{
-    return account_preadv((__u32)ctx->args[0], (const struct iovec *)ctx->args[1],
-                          (__u64)ctx->args[2]);
-}
+{ return account_iov((__u32)ctx->args[0], (const struct iovec *)ctx->args[1], (__u64)ctx->args[2], 0); }
 SEC("tracepoint/syscalls/sys_enter_preadv2")
 int on_preadv2(struct trace_event_raw_sys_enter *ctx)
-{
-    return account_preadv((__u32)ctx->args[0], (const struct iovec *)ctx->args[1],
-                          (__u64)ctx->args[2]);
-}
+{ return account_iov((__u32)ctx->args[0], (const struct iovec *)ctx->args[1], (__u64)ctx->args[2], 0); }
 SEC("tracepoint/syscalls/sys_enter_readv")
 int on_readv(struct trace_event_raw_sys_enter *ctx)
-{
-    return account_preadv((__u32)ctx->args[0], (const struct iovec *)ctx->args[1],
-                          (__u64)ctx->args[2]);
-}
+{ return account_iov((__u32)ctx->args[0], (const struct iovec *)ctx->args[1], (__u64)ctx->args[2], 0); }
+SEC("tracepoint/syscalls/sys_enter_pwritev")
+int on_pwritev(struct trace_event_raw_sys_enter *ctx)
+{ return account_iov((__u32)ctx->args[0], (const struct iovec *)ctx->args[1], (__u64)ctx->args[2], 1); }
+SEC("tracepoint/syscalls/sys_enter_pwritev2")
+int on_pwritev2(struct trace_event_raw_sys_enter *ctx)
+{ return account_iov((__u32)ctx->args[0], (const struct iovec *)ctx->args[1], (__u64)ctx->args[2], 1); }
+SEC("tracepoint/syscalls/sys_enter_writev")
+int on_writev(struct trace_event_raw_sys_enter *ctx)
+{ return account_iov((__u32)ctx->args[0], (const struct iovec *)ctx->args[1], (__u64)ctx->args[2], 1); }
 
 // O_DIRECT begin -- carries pos+count, so mark the page footprint (unique pages = the minimum I/O).
 SEC("tracepoint/iomap/iomap_dio_rw_begin")
@@ -478,22 +489,28 @@ int on_dio_complete(struct trace_event_raw_iomap_dio_complete *ctx)
     return 0;
 }
 
-// PHYSICAL block-device reads (block_rq_issue). rwbs[0]=='R' is a read (covers 'R' and 'RA'
-// readahead). Per device, not per file -- this is the true storage bytes, the bottom of the stack.
+// PHYSICAL block-device I/O (block_rq_issue), split by direction. rwbs[0]: 'R' read (incl 'RA'
+// readahead), 'W' write. Per (dev, direction) -- the true storage bytes, the bottom of the stack.
 SEC("tracepoint/block/block_rq_issue")
 int on_block_rq(struct trace_event_raw_block_rq *ctx)
 {
     char op = 0;
     bpf_probe_read_kernel(&op, 1, &ctx->rwbs[0]);
-    if (op != 'R')
-        return 0;
+    __u32 is_write;
+    if (op == 'R')
+        is_write = 0;
+    else if (op == 'W')
+        is_write = 1;
+    else
+        return 0; // skip discards/flushes
     __u32 dev = BPF_CORE_READ(ctx, dev);
     __u32 bytes = BPF_CORE_READ(ctx, bytes);
-    struct block_stats *s = bpf_map_lookup_elem(&block_reads, &dev);
+    struct bdev_key bkey = {.dev = dev, .is_write = is_write};
+    struct block_stats *s = bpf_map_lookup_elem(&block_reads, &bkey);
     if (!s) {
         struct block_stats zero = {};
-        bpf_map_update_elem(&block_reads, &dev, &zero, BPF_NOEXIST);
-        s = bpf_map_lookup_elem(&block_reads, &dev);
+        bpf_map_update_elem(&block_reads, &bkey, &zero, BPF_NOEXIST);
+        s = bpf_map_lookup_elem(&block_reads, &bkey);
     }
     if (s) {
         __sync_fetch_and_add(&s->read_bytes, bytes);

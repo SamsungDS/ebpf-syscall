@@ -32,6 +32,14 @@ struct pgcache_stats {
 struct sysread_stats {
     unsigned long long read_calls, read_bytes, min_bytes, max_bytes;
 };
+struct sysio_key {
+    unsigned int dev;
+    unsigned long long ino;
+    unsigned int is_write;
+};
+struct bdev_key {
+    unsigned int dev, is_write;
+};
 struct odirect_stats {
     unsigned long long dio_bytes, dio_calls;
 };
@@ -189,28 +197,29 @@ int main(int argc, char **argv)
     }
     if (!pany) printf("(no page-cache fills captured)\n");
 
-    // INTENT via read()/pread() syscalls, per file (fd -> inode). Empty for pure mmap (no syscalls);
-    // populated for a pread/O_DIRECT offload -- this is what the app asked the kernel to read.
+    // INTENT via read/pread/preadv AND write/pwrite/pwritev syscalls, per file+direction (fd->inode).
+    // Empty for pure mmap (no syscalls); populated for a pread/pwrite/O_DIRECT path -- LMCache writes here.
     int sfd = bpf_map__fd(skel->maps.syscall_reads);
-    struct devino_key sk, snk;
+    struct sysio_key sk, snk;
     struct sysread_stats sv;
     int sfirst = 1, sany = 0;
-    printf("\n%-16s %12s %14s %11s %11s %11s   (per-read INTENT size: what the app asks the kernel)\n",
-           "dev:inode", "read_calls", "read_bytes(MB)", "min_req(B)", "avg_req(B)", "max_req(B)");
+    printf("\n%-16s %3s %12s %12s %9s %9s %9s   (per-op INTENT size: what the app asks the kernel)\n",
+           "dev:inode", "rw", "calls", "bytes", "min", "avg", "max");
     memset(&sk, 0xff, sizeof(sk));
     while (bpf_map_get_next_key(sfd, sfirst ? NULL : &sk, &snk) == 0) {
         sfirst = 0;
         if (bpf_map_lookup_elem(sfd, &snk, &sv) == 0) {
-            char di[40];
+            char di[40], bb[24], bmn[24], bav[24], bmx[24];
+            unsigned long long avg = sv.read_calls ? sv.read_bytes / sv.read_calls : 0;
             snprintf(di, sizeof(di), "%u:%llu", snk.dev, snk.ino);
-            printf("%-16s %12llu %14.2f %11llu %11.0f %11llu\n", di, sv.read_calls, sv.read_bytes / 1e6,
-                   sv.min_bytes, sv.read_calls ? (double)sv.read_bytes / sv.read_calls : 0.0,
-                   sv.max_bytes);
+            printf("%-16s %3s %12llu %12s %9s %9s %9s\n", di, snk.is_write ? "W" : "R", sv.read_calls,
+                   hsize(sv.read_bytes, bb, sizeof(bb)), hsize(sv.min_bytes, bmn, sizeof(bmn)),
+                   hsize(avg, bav, sizeof(bav)), hsize(sv.max_bytes, bmx, sizeof(bmx)));
             sany = 1;
         }
         sk = snk;
     }
-    if (!sany) printf("(no read/pread syscalls -- expected for pure mmap)\n");
+    if (!sany) printf("(no read/write syscalls -- expected for pure mmap)\n");
 
     // O_DIRECT bytes per file (iomap DIO) -- the offload's actual reads, which bypass the page cache.
     int ofd = bpf_map__fd(skel->maps.odirect);
@@ -237,20 +246,20 @@ int main(int argc, char **argv)
     // is the point: an average hides whether 23 KB means "mostly 4K + rare 128K" or "uniformly 23K".
     int bfd = bpf_map__fd(skel->maps.block_reads);
     int ggfd = bpf_map__fd(skel->maps.dev_geoms);
-    unsigned int bk, bnk;
+    struct bdev_key bk, bnk;
     struct block_stats bv;
     int bfirst = 1, bany = 0, floored_any = 0, opt_unrep = 0;
     const char *hl[12] = {"512", "1K",  "2K",   "4K",   "8K",   "16K",
                           "32K", "64K", "128K", "256K", "512K", ">=1M"};
-    printf("\n%-9s %10s %10s %9s %9s %9s %9s %9s %9s %8s %7s\n", "device", "read_ios", "phys",
-           "min", "avg", "max", "IU", "opt_io", "MDTS", "IU_rdamp", "sub-IU%");
-    printf("  (IU_rdamp = IU-granular bytes / actual reads; sub-IU%% = reads below the IU)\n");
+    printf("\n%-9s %3s %9s %9s %9s %9s %9s %9s %9s %9s %8s %7s\n", "device", "rw", "ios", "bytes",
+           "min", "avg", "max", "IU", "opt_io", "MDTS", "IU_amp", "sub-IU%");
+    printf("  (IU_amp = IU-granular bytes / actual; sub-IU%% = ops below the IU; W sub-IU = RMW risk)\n");
     memset(&bk, 0xff, sizeof(bk));
     while (bpf_map_get_next_key(bfd, bfirst ? NULL : &bk, &bnk) == 0) {
         bfirst = 0;
         if (bpf_map_lookup_elem(bfd, &bnk, &bv) == 0) {
             struct dev_geom g = {0, 0, 0, 0};
-            bpf_map_lookup_elem(ggfd, &bnk, &g);
+            bpf_map_lookup_elem(ggfd, &bnk.dev, &g);
             double amp = bv.read_bytes ? (double)bv.iu_bytes / bv.read_bytes : 0.0;
             double subp = bv.read_ios ? 100.0 * bv.sub_iu_ios / bv.read_ios : 0.0;
             unsigned long long avg = bv.read_ios ? bv.read_bytes / bv.read_ios : 0;
@@ -262,10 +271,11 @@ int main(int argc, char **argv)
             // 0 -> the device reports no optimal I/O size (kernel ABI). Show it raw, never fake it.
             if (g.nows) hsize(g.nows, bno, sizeof(bno));
             else { snprintf(bno, sizeof(bno), "0"); opt_unrep = 1; }
-            printf("%-9u %10llu %10s %9s %9s %9s %9s %9s %9s %6.2fx %6.1f%%\n", bnk, bv.read_ios,
-                   hsize(bv.read_bytes, bp, sizeof(bp)), hsize(bv.min_io, bmin, sizeof(bmin)),
-                   hsize(avg, bavg, sizeof(bavg)), hsize(bv.max_io, bmax, sizeof(bmax)), iustr,
-                   bno, hsize(g.mdts, bmd, sizeof(bmd)), amp, subp);
+            printf("%-9u %3s %9llu %9s %9s %9s %9s %9s %9s %9s %6.2fx %6.1f%%\n", bnk.dev,
+                   bnk.is_write ? "W" : "R", bv.read_ios, hsize(bv.read_bytes, bp, sizeof(bp)),
+                   hsize(bv.min_io, bmin, sizeof(bmin)), hsize(avg, bavg, sizeof(bavg)),
+                   hsize(bv.max_io, bmax, sizeof(bmax)), iustr, bno, hsize(g.mdts, bmd, sizeof(bmd)),
+                   amp, subp);
             printf("  size hist(ops): ");
             for (int i = 0; i < 12; i++) {
                 unsigned int bsz = 512u << i;
