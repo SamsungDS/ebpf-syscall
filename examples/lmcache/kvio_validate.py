@@ -32,6 +32,8 @@ def main():
     ap.add_argument("--header-bytes", type=int, default=4096)
     ap.add_argument("--max-xfer", type=int, default=0)
     ap.add_argument("--mdts-bytes", type=int, default=128 * 1024)
+    ap.add_argument("--lba-bytes", type=int, default=512,
+                    help="device LBA size; commands round up to this (match --lba-size)")
     args = ap.parse_args()
 
     sem = {o["trace_id"]: o for o in load_jsonl(args.semantic)}
@@ -59,7 +61,7 @@ def main():
     for tid, s in sorted(sem.items()):
         m = measured.get(tid, {"cmds": 0, "bytes": 0, "sizes": []})
         p = kvio_plan.project(s["bytes"], s["op"], args.header_bytes,
-                              args.max_xfer, args.mdts_bytes)
+                              args.max_xfer, args.mdts_bytes, args.lba_bytes)
         cmd_ok = m["cmds"] == p["nvme_commands"]
         byte_ok = m["bytes"] == p["total_device_bytes"]
         ok = cmd_ok and byte_ok

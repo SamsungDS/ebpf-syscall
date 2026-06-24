@@ -30,21 +30,34 @@ def per_token_kv(layers, kv_heads, head_dim, dtype_bytes):
     return 2 * layers * kv_heads * head_dim * dtype_bytes
 
 
-def split_commands(nbytes, xfer):
-    """A logical transfer of nbytes -> ceil(nbytes/xfer) NVMe commands."""
+def split_commands(nbytes, xfer, lba_bytes=512):
+    """A logical transfer of nbytes -> ceil(nbytes/xfer) NVMe commands.
+
+    The device transfers in whole logical blocks (LBAs), so each command's byte
+    count is rounded UP to a multiple of ``lba_bytes``. For MDTS- and header-sized
+    transfers (both already LBA multiples) this is a no-op; it only affects a
+    non-LBA-aligned payload tail. Validated by the kvio sweep: a 700000 B payload's
+    44640 B tail rounds to 45056 B (+416 B vs the naive byte count). Real
+    model-derived KV chunks are LBA-aligned, so this matters only for arbitrary
+    payload sizes -- but it makes the projection exact for any size.
+    """
     if nbytes <= 0:
         return []
     n = math.ceil(nbytes / xfer)
-    return [xfer] * (n - 1) + [nbytes - xfer * (n - 1)]
+    cmds = [xfer] * (n - 1) + [nbytes - xfer * (n - 1)]
+    if lba_bytes > 1:
+        cmds = [((c + lba_bytes - 1) // lba_bytes) * lba_bytes for c in cmds]
+    return cmds
 
 
-def project(payload_bytes, op, header_bytes=4096, max_xfer=0, mdts_bytes=128 * 1024):
+def project(payload_bytes, op, header_bytes=4096, max_xfer=0, mdts_bytes=128 * 1024,
+            lba_bytes=512):
     """Project the device I/O geometry of one KV store/load."""
     xfer = min(max_xfer, mdts_bytes) if max_xfer else mdts_bytes
     cmds = []
     if op == "store":
-        cmds += split_commands(header_bytes, xfer)   # header op
-    cmds += split_commands(payload_bytes, xfer)       # payload op
+        cmds += split_commands(header_bytes, xfer, lba_bytes)   # header op
+    cmds += split_commands(payload_bytes, xfer, lba_bytes)       # payload op
     return {
         "op": op,
         "payload_bytes": payload_bytes,
@@ -76,16 +89,19 @@ def main():
     ap.add_argument("--max-xfer", type=int, default=0,
                     help="LMCache max_data_transfer_size (0 = use MDTS)")
     ap.add_argument("--mdts-bytes", type=int, default=128 * 1024)
+    ap.add_argument("--lba-bytes", type=int, default=512,
+                    help="device logical block size (commands round up to this)")
     ap.add_argument("--all-models", action="store_true")
     args = ap.parse_args()
 
     if args.all_models:
         print(f"# chunk={args.chunk_tokens} tok, MDTS={args.mdts_bytes // 1024} KiB, "
-              f"max_xfer={args.max_xfer or 'MDTS'}")
+              f"max_xfer={args.max_xfer or 'MDTS'}, LBA={args.lba_bytes} B")
         for name in MODELS:
             for op in ("store", "load"):
                 p = project(payload_for_model(name, args.chunk_tokens), op,
-                            args.header_bytes, args.max_xfer, args.mdts_bytes)
+                            args.header_bytes, args.max_xfer, args.mdts_bytes,
+                            args.lba_bytes)
                 print(f"  {name:14s} {op:5s}: payload={p['payload_bytes'] // 1024:>6} KiB "
                       f"-> {p['nvme_commands']:>4} NVMe cmds, "
                       f"{p['total_device_bytes']} B (frag {p['fragmentation']}x)")
@@ -99,7 +115,8 @@ def main():
         payload = per_token_kv(args.layers, args.kv_heads, args.head_dim,
                                args.dtype_bytes) * args.chunk_tokens
     print(json.dumps(
-        project(payload, args.op, args.header_bytes, args.max_xfer, args.mdts_bytes),
+        project(payload, args.op, args.header_bytes, args.max_xfer, args.mdts_bytes,
+                args.lba_bytes),
         indent=2))
 
 
