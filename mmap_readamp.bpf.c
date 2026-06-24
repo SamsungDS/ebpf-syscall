@@ -142,6 +142,8 @@ struct block_stats {
     __u64 hist[12]; // size buckets, 512-byte base: 512,1K,2K,4K,8K,16K,32K,64K,128K,256K,512K,>=1M
     __u64 iu_bytes; // sum over reads of (IUs the read spans) * IU_size -- the IU-granular footprint
     __u64 sub_iu_ios; // reads smaller than one IU
+    __u64 min_io;   // smallest block read request (0 = unset)
+    __u64 max_io;   // largest block read request
 };
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
@@ -496,6 +498,10 @@ int on_block_rq(struct trace_event_raw_block_rq *ctx)
     if (s) {
         __sync_fetch_and_add(&s->read_bytes, bytes);
         __sync_fetch_and_add(&s->read_ios, 1);
+        if (s->min_io == 0 || bytes < s->min_io)
+            s->min_io = bytes;
+        if (bytes > s->max_io)
+            s->max_io = bytes;
         // size histogram, 512-byte base (so sub-4K reads are visible): bucket=floor(log2(bytes/512)).
         __u32 units = bytes >> 9;
         int b = 0;

@@ -36,7 +36,7 @@ struct odirect_stats {
     unsigned long long dio_bytes, dio_calls;
 };
 struct block_stats {
-    unsigned long long read_bytes, read_ios, hist[12], iu_bytes, sub_iu_ios;
+    unsigned long long read_bytes, read_ios, hist[12], iu_bytes, sub_iu_ios, min_io, max_io;
 };
 struct dev_geom {
     unsigned int iu, nows, mdts, floored;
@@ -61,6 +61,19 @@ static unsigned int read_u32_file(const char *path)
     if (fscanf(f, "%lu", &v) != 1) v = 0;
     fclose(f);
     return (unsigned int)v;
+}
+
+// Human-friendly byte size into a caller buffer (B / KiB / MiB / GiB / TiB).
+static const char *hsize(unsigned long long b, char *buf, size_t n)
+{
+    static const char *u[] = {"B", "KiB", "MiB", "GiB", "TiB"};
+    double v = (double)b;
+    int i = 0;
+    while (v >= 1024.0 && i < 4) { v /= 1024.0; i++; }
+    if (i == 0) snprintf(buf, n, "%llu %s", b, u[0]);
+    else if (v == (double)(long long)v) snprintf(buf, n, "%.0f %s", v, u[i]);
+    else snprintf(buf, n, "%.1f %s", v, u[i]);
+    return buf;
 }
 
 // Scrape per-device geometry from sysfs into dev_geoms so the BPF can charge each read to its IU.
@@ -229,8 +242,9 @@ int main(int argc, char **argv)
     int bfirst = 1, bany = 0, floored_any = 0;
     const char *hl[12] = {"512", "1K",  "2K",   "4K",   "8K",   "16K",
                           "32K", "64K", "128K", "256K", "512K", ">=1M"};
-    printf("\n%-9s %11s %10s %8s %8s %8s %8s %9s %7s   (IU_rd_amp = IU-granular bytes / actual reads)\n",
-           "device", "read_ios", "phys_MB", "avg_B", "IU", "NOWS", "MDTS", "IU_rd_amp", "sub-IU%");
+    printf("\n%-9s %10s %10s %9s %9s %9s %9s %9s %9s %8s %7s\n", "device", "read_ios", "phys",
+           "min", "avg", "max", "IU", "NOWS", "MDTS", "IU_rdamp", "sub-IU%");
+    printf("  (IU_rdamp = IU-granular bytes / actual reads; sub-IU%% = reads below the IU)\n");
     memset(&bk, 0xff, sizeof(bk));
     while (bpf_map_get_next_key(bfd, bfirst ? NULL : &bk, &bnk) == 0) {
         bfirst = 0;
@@ -239,22 +253,26 @@ int main(int argc, char **argv)
             bpf_map_lookup_elem(ggfd, &bnk, &g);
             double amp = bv.read_bytes ? (double)bv.iu_bytes / bv.read_bytes : 0.0;
             double subp = bv.read_ios ? 100.0 * bv.sub_iu_ios / bv.read_ios : 0.0;
-            char iustr[16];
-            snprintf(iustr, sizeof(iustr), "%u%s", g.iu, g.floored ? "*" : "");
+            unsigned int nows = g.nows ? g.nows : g.iu; // io_opt==0 -> optimal is the minimum (IU)
+            unsigned long long avg = bv.read_ios ? bv.read_bytes / bv.read_ios : 0;
+            char bp[24], bmin[24], bavg[24], bmax[24], biu[24], bno[24], bmd[24], iustr[28];
+            hsize(g.iu, biu, sizeof(biu));
+            snprintf(iustr, sizeof(iustr), "%s%s", biu, g.floored ? "*" : "");
             if (g.floored) floored_any = 1;
-            printf("%-9u %11llu %10.2f %8.0f %8s %8u %8u %8.2fx %6.1f%%\n", bnk, bv.read_ios,
-                   bv.read_bytes / 1e6, bv.read_ios ? (double)bv.read_bytes / bv.read_ios : 0.0,
-                   iustr, g.nows, g.mdts, amp, subp);
+            printf("%-9u %10llu %10s %9s %9s %9s %9s %9s %9s %6.2fx %6.1f%%\n", bnk, bv.read_ios,
+                   hsize(bv.read_bytes, bp, sizeof(bp)), hsize(bv.min_io, bmin, sizeof(bmin)),
+                   hsize(avg, bavg, sizeof(bavg)), hsize(bv.max_io, bmax, sizeof(bmax)), iustr,
+                   hsize(nows, bno, sizeof(bno)), hsize(g.mdts, bmd, sizeof(bmd)), amp, subp);
             printf("  size hist(ops): ");
             for (int i = 0; i < 12; i++) {
                 unsigned int bsz = 512u << i;
                 char m = ' ';
                 if (g.iu && bsz == g.iu) m = 'I';
-                else if (g.nows && bsz == g.nows) m = 'O';
+                else if (bsz == nows && nows != g.iu) m = 'O';
                 else if (g.mdts && bsz == g.mdts) m = 'M';
                 printf("%s%c=%llu ", hl[i], m, bv.hist[i]);
             }
-            printf("  [I=IU O=NOWS(optimal) M=MDTS]\n");
+            printf("  [I=IU O=NOWS M=MDTS]\n");
             bany = 1;
         }
         bk = bnk;
