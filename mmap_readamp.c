@@ -10,6 +10,7 @@
 #include <string.h>
 #include <bpf/libbpf.h>
 #include <bpf/bpf.h>
+#include <dirent.h>
 #include "mmap_readamp.skel.h"
 
 struct file_key {
@@ -35,7 +36,10 @@ struct odirect_stats {
     unsigned long long dio_bytes, dio_calls;
 };
 struct block_stats {
-    unsigned long long read_bytes, read_ios, hist[9];
+    unsigned long long read_bytes, read_ios, hist[12], iu_bytes, sub_iu_ios;
+};
+struct dev_geom {
+    unsigned int iu, nows, mdts, floored;
 };
 struct iomap_stats {
     unsigned long long ra_prepared_pages, ra_calls;
@@ -48,6 +52,53 @@ struct page_key {
 
 static volatile int stop;
 static void on_sig(int s) { (void)s; stop = 1; }
+
+static unsigned int read_u32_file(const char *path)
+{
+    FILE *f = fopen(path, "r");
+    if (!f) return 0;
+    unsigned long v = 0;
+    if (fscanf(f, "%lu", &v) != 1) v = 0;
+    fclose(f);
+    return (unsigned int)v;
+}
+
+// Scrape per-device geometry from sysfs into dev_geoms so the BPF can charge each read to its IU.
+// IU = minimum_io_size, but for an NVMe namespace reporting physical_block_size==512 we bake in the
+// 4 KiB floor (512 LBA is compatibility-only; every real NVMe drive has an IU of >= 4 KiB).
+static void scrape_geometry(int gfd)
+{
+    DIR *d = opendir("/sys/block");
+    if (!d) return;
+    struct dirent *e;
+    char p[600];
+    while ((e = readdir(d))) {
+        if (e->d_name[0] == '.') continue;
+        snprintf(p, sizeof(p), "/sys/block/%s/dev", e->d_name);
+        FILE *f = fopen(p, "r");
+        if (!f) continue;
+        unsigned int maj = 0, mi = 0;
+        int ok = fscanf(f, "%u:%u", &maj, &mi) == 2;
+        fclose(f);
+        if (!ok) continue;
+        unsigned int dev = (maj << 20) | mi;
+        snprintf(p, sizeof(p), "/sys/block/%s/queue/minimum_io_size", e->d_name);
+        unsigned int min_io = read_u32_file(p);
+        snprintf(p, sizeof(p), "/sys/block/%s/queue/physical_block_size", e->d_name);
+        unsigned int phys = read_u32_file(p);
+        snprintf(p, sizeof(p), "/sys/block/%s/queue/optimal_io_size", e->d_name);
+        unsigned int nows = read_u32_file(p);
+        snprintf(p, sizeof(p), "/sys/block/%s/queue/max_hw_sectors_kb", e->d_name);
+        unsigned int mdts = read_u32_file(p) * 1024;
+        int is_nvme = strncmp(e->d_name, "nvme", 4) == 0;
+        unsigned int iu = min_io, floored = 0;
+        if (is_nvme && phys == 512 && iu < 4096) { iu = 4096; floored = 1; } // baked-in NVMe IU floor
+        if (iu == 0) iu = phys ? phys : 512;
+        struct dev_geom g = {.iu = iu, .nows = nows, .mdts = mdts, .floored = floored};
+        bpf_map_update_elem(gfd, &dev, &g, BPF_ANY);
+    }
+    closedir(d);
+}
 
 int main(int argc, char **argv)
 {
@@ -62,6 +113,7 @@ int main(int argc, char **argv)
     if (!skel) { fprintf(stderr, "open failed\n"); return 1; }
     skel->rodata->target_tgid = pid;
     if (mmap_readamp_bpf__load(skel)) { fprintf(stderr, "load failed (verifier?)\n"); return 1; }
+    scrape_geometry(bpf_map__fd(skel->maps.dev_geoms)); // populate per-device IU/NOWS/MDTS before tracing
     if (mmap_readamp_bpf__attach(skel)) { fprintf(stderr, "attach failed (filemap_fault fentry?)\n"); return 1; }
 
     signal(SIGINT, on_sig); signal(SIGTERM, on_sig); signal(SIGALRM, on_sig);
@@ -171,26 +223,45 @@ int main(int argc, char **argv)
     // page-cache insertion above). Not per-file: the block layer loses the inode. The SIZE HISTOGRAM
     // is the point: an average hides whether 23 KB means "mostly 4K + rare 128K" or "uniformly 23K".
     int bfd = bpf_map__fd(skel->maps.block_reads);
+    int ggfd = bpf_map__fd(skel->maps.dev_geoms);
     unsigned int bk, bnk;
     struct block_stats bv;
-    int bfirst = 1, bany = 0;
-    const char *hl[9] = {"4K", "8K", "16K", "32K", "64K", "128K", "256K", "512K", ">=1M"};
-    printf("\n%-10s %14s %14s %10s   size histogram (ops): %s\n", "device", "read_ios", "physical_MB",
-           "avg_io_B", "4K 8K 16K 32K 64K 128K 256K 512K >=1M");
+    int bfirst = 1, bany = 0, floored_any = 0;
+    const char *hl[12] = {"512", "1K",  "2K",   "4K",   "8K",   "16K",
+                          "32K", "64K", "128K", "256K", "512K", ">=1M"};
+    printf("\n%-9s %11s %10s %8s %8s %8s %8s %9s %7s   (IU_rd_amp = IU-granular bytes / actual reads)\n",
+           "device", "read_ios", "phys_MB", "avg_B", "IU", "NOWS", "MDTS", "IU_rd_amp", "sub-IU%");
     memset(&bk, 0xff, sizeof(bk));
     while (bpf_map_get_next_key(bfd, bfirst ? NULL : &bk, &bnk) == 0) {
         bfirst = 0;
         if (bpf_map_lookup_elem(bfd, &bnk, &bv) == 0) {
-            printf("%-10u %14llu %14.2f %10.0f   ", bnk, bv.read_ios, bv.read_bytes / 1e6,
-                   bv.read_ios ? (double)bv.read_bytes / bv.read_ios : 0.0);
-            for (int i = 0; i < 9; i++)
-                printf("%s=%llu ", hl[i], bv.hist[i]);
-            printf("\n");
+            struct dev_geom g = {0, 0, 0, 0};
+            bpf_map_lookup_elem(ggfd, &bnk, &g);
+            double amp = bv.read_bytes ? (double)bv.iu_bytes / bv.read_bytes : 0.0;
+            double subp = bv.read_ios ? 100.0 * bv.sub_iu_ios / bv.read_ios : 0.0;
+            char iustr[16];
+            snprintf(iustr, sizeof(iustr), "%u%s", g.iu, g.floored ? "*" : "");
+            if (g.floored) floored_any = 1;
+            printf("%-9u %11llu %10.2f %8.0f %8s %8u %8u %8.2fx %6.1f%%\n", bnk, bv.read_ios,
+                   bv.read_bytes / 1e6, bv.read_ios ? (double)bv.read_bytes / bv.read_ios : 0.0,
+                   iustr, g.nows, g.mdts, amp, subp);
+            printf("  size hist(ops): ");
+            for (int i = 0; i < 12; i++) {
+                unsigned int bsz = 512u << i;
+                char m = ' ';
+                if (g.iu && bsz == g.iu) m = 'I';
+                else if (g.nows && bsz == g.nows) m = 'O';
+                else if (g.mdts && bsz == g.mdts) m = 'M';
+                printf("%s%c=%llu ", hl[i], m, bv.hist[i]);
+            }
+            printf("  [I=IU O=NOWS(optimal) M=MDTS]\n");
             bany = 1;
         }
         bk = bnk;
     }
     if (!bany) printf("(no block reads captured)\n");
+    if (floored_any)
+        printf("  * IU assumed 4 KiB (NVMe 512-LBA; device did not report a larger one)\n");
 
     // FS-layer demand vs readahead (XFS/iomap), per file: readahead-PREPARED pages (the speculative
     // window) vs DEMAND folio reads. This is the split block_rq_issue cannot give (it is post-merge).

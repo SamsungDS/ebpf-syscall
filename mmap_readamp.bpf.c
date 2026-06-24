@@ -139,7 +139,9 @@ struct {
 struct block_stats {
     __u64 read_bytes;
     __u64 read_ios;
-    __u64 hist[9]; // request-size buckets: 4K,8K,16K,32K,64K,128K,256K,512K,>=1M
+    __u64 hist[12]; // size buckets, 512-byte base: 512,1K,2K,4K,8K,16K,32K,64K,128K,256K,512K,>=1M
+    __u64 iu_bytes; // sum over reads of (IUs the read spans) * IU_size -- the IU-granular footprint
+    __u64 sub_iu_ios; // reads smaller than one IU
 };
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
@@ -147,6 +149,21 @@ struct {
     __type(key, __u32);
     __type(value, struct block_stats);
 } block_reads SEC(".maps");
+
+// Per-device geometry (IU/NOWS/MDTS), populated by userspace from sysfs at startup (with the NVMe
+// 512-phys -> 4K IU floor baked in). Keyed by dev_t so on_block_rq can charge each read to its IU.
+struct dev_geom {
+    __u32 iu;      // Indirection Unit (minimum_io_size, floored to 4096 for 512-phys NVMe)
+    __u32 nows;    // optimal_io_size (NOWS)
+    __u32 mdts;    // max_hw_sectors_kb * 1024
+    __u32 floored; // 1 = IU was the assumed 4K NVMe floor, not a reported value (provenance)
+};
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 256);
+    __type(key, __u32);
+    __type(value, struct dev_geom);
+} dev_geoms SEC(".maps");
 
 // Filesystem-layer readahead, per file (XFS/iomap), from the iomap:iomap_readahead tracepoint:
 // nr_pages = readahead_count(rac), the base pages XFS PREPARED for readahead on this inode (the
@@ -479,16 +496,29 @@ int on_block_rq(struct trace_event_raw_block_rq *ctx)
     if (s) {
         __sync_fetch_and_add(&s->read_bytes, bytes);
         __sync_fetch_and_add(&s->read_ios, 1);
-        // size histogram: bucket = floor(log2(bytes/4KiB)); an AVERAGE alone hides the distribution.
-        __u32 pages = bytes >> PAGE_SHIFT;
+        // size histogram, 512-byte base (so sub-4K reads are visible): bucket=floor(log2(bytes/512)).
+        __u32 units = bytes >> 9;
         int b = 0;
-        for (int i = 0; i < 8; i++) {
-            if (pages <= 1)
+        for (int i = 0; i < 11; i++) {
+            if (units <= 1)
                 break;
-            pages >>= 1;
+            units >>= 1;
             b++;
         }
         __sync_fetch_and_add(&s->hist[b], 1);
+        // IU read amplification: charge this read to the Indirection Units it spans. Using the start
+        // SECTOR (alignment matters: an IU-sized read crossing a boundary spans 2 IUs), iu_bytes =
+        // (last_IU - first_IU + 1) * IU. iu_bytes/read_bytes is the IU-granular over-read factor.
+        struct dev_geom *g = bpf_map_lookup_elem(&dev_geoms, &dev);
+        if (g && g->iu) {
+            __u64 start = (__u64)BPF_CORE_READ(ctx, sector) << 9; // sector is 512-byte units
+            __u64 end = start + bytes;
+            __u64 first = start / g->iu;
+            __u64 last = (end - 1) / g->iu;
+            __sync_fetch_and_add(&s->iu_bytes, (last - first + 1) * (__u64)g->iu);
+            if (bytes < g->iu)
+                __sync_fetch_and_add(&s->sub_iu_ios, 1);
+        }
     }
     return 0;
 }
