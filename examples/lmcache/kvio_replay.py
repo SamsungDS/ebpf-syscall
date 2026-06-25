@@ -13,7 +13,7 @@ the projected-vs-measured geometry line up end to end.
 """
 import argparse, os, sys, importlib.util, time
 
-SRC = "/home/ubuntu/lmcache-src"
+SRC = os.environ.get("KVIO_SRC", "/home/ubuntu/lmcache-src")
 sys.path.insert(0, SRC)
 
 import kvio_plan
@@ -43,6 +43,13 @@ def main():
     ap.add_argument("--warmup", type=int, default=5)
     ap.add_argument("--slots", type=int, default=16, help="rotating keys (bounds capacity)")
     ap.add_argument("--mdts-bytes", type=int, default=131072)
+    ap.add_argument("--engine", choices=["posix", "io_uring", "uring_cmd"],
+                    default="uring_cmd",
+                    help="posix/io_uring run on a regular file or block dev; "
+                         "uring_cmd is NVMe passthrough (needs /dev/ngXnY)")
+    ap.add_argument("--odirect", action="store_true",
+                    help="bypass the page cache (real media latency for stores)")
+    ap.add_argument("--capacity-gb", type=int, default=8)
     args = ap.parse_args()
 
     if args.payload_bytes is not None:
@@ -56,14 +63,16 @@ def main():
     proj_load = kvio_plan.project(payload, "load", 4096, args.mdts_bytes, args.mdts_bytes)
 
     slot = ((payload + 4096 + (1 << 20) - 1) >> 20) << 20  # round up to MiB, room for header
+    io_engine = "posix" if args.engine == "posix" else "io_uring"
+    use_uring_cmd = args.engine == "uring_cmd"
     cfg = RawBlockCoreConfig(
-        device_path=args.device, capacity_bytes=8 * 1024 * 1024 * 1024,
+        device_path=args.device, capacity_bytes=args.capacity_gb * 1024 * 1024 * 1024,
         block_align=4096, header_bytes=4096, slot_bytes=slot,
-        use_odirect=False, enable_zero_copy=False, meta_total_bytes=1 * 1024 * 1024,
+        use_odirect=args.odirect, enable_zero_copy=False, meta_total_bytes=1 * 1024 * 1024,
         meta_magic=b"LMCIDX01", meta_version=1, meta_checkpoint_interval_sec=60,
         meta_idle_quiet_ms=0, meta_enable_periodic=False, meta_verify_on_load=False,
         max_data_transfer_size=args.mdts_bytes, load_checkpoint_on_init=False,
-        io_engine="io_uring", iouring_queue_depth=8, use_uring_cmd=True)
+        io_engine=io_engine, iouring_queue_depth=8, use_uring_cmd=use_uring_cmd)
     core = RawBlockCore(cfg, key_namespace="object")
 
     buf = bytes(bytearray(payload))  # CPU bytes, no GPU
@@ -94,6 +103,7 @@ def main():
               f"{mbps:8.1f} MB/s | {iops:9.0f} NVMe cmd/s")
 
     print(f"=== kvio replay: {label}, MDTS={args.mdts_bytes // 1024} KiB, "
+          f"engine={args.engine}, O_DIRECT={'on' if args.odirect else 'off'}, "
           f"{args.iters} iters x {args.slots} slots, dev={args.device} ===")
     report("store", store_ms, proj_store)
     report("load", load_ms, proj_load)
