@@ -1,0 +1,366 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>kvio — GPU-free KV-cache-offload storage-IO projector &amp; replayer</title>
+<style>
+  :root{
+    --bg:#0b0d12; --bg2:#0e1117; --surface:#12161f; --surface2:#161b26;
+    --border:#1f2733; --border2:#2a3441;
+    --text:#c7d0db; --head:#e8eef5; --muted:#7e8a99; --faint:#5b6675;
+    --cyan:#22d3ee; --sky:#38bdf8; --blue:#3b82f6;
+    --green:#4ade80; --red:#f87171; --amber:#fbbf24; --violet:#a78bfa;
+    --mono:ui-monospace,"SF Mono",SFMono-Regular,Menlo,Consolas,"Liberation Mono",monospace;
+    --sans:-apple-system,BlinkMacSystemFont,"Segoe UI",Inter,Roboto,"Helvetica Neue",Arial,sans-serif;
+  }
+  *{box-sizing:border-box}
+  html{scroll-behavior:smooth}
+  body{margin:0;background:var(--bg);color:var(--text);font-family:var(--sans);
+    font-size:16px;line-height:1.65;-webkit-font-smoothing:antialiased}
+  a{color:var(--sky);text-decoration:none}
+  a:hover{color:var(--cyan);text-decoration:underline}
+  code,kbd,pre{font-family:var(--mono)}
+  .wrap{max-width:1000px;margin:0 auto;padding:0 24px}
+
+  header.hero{
+    border-bottom:1px solid var(--border);
+    background:
+      radial-gradient(900px 380px at 12% -8%, rgba(34,211,238,.10), transparent 60%),
+      radial-gradient(800px 360px at 92% -12%, rgba(59,130,246,.10), transparent 55%),
+      linear-gradient(180deg,var(--bg2),var(--bg));
+  }
+  .hero .wrap{padding-top:52px;padding-bottom:40px}
+  .eyebrow{display:inline-flex;align-items:center;gap:8px;font-family:var(--mono);
+    font-size:12.5px;letter-spacing:.12em;text-transform:uppercase;color:var(--cyan);
+    border:1px solid var(--border2);border-radius:999px;padding:5px 12px;background:rgba(34,211,238,.05)}
+  h1{font-size:2.5rem;line-height:1.12;margin:18px 0 10px;color:var(--head);
+    letter-spacing:-.02em;font-weight:740}
+  h1 .mono{font-family:var(--mono);background:linear-gradient(90deg,var(--cyan),var(--sky));
+    -webkit-background-clip:text;background-clip:text;color:transparent}
+  .sub{font-size:1.18rem;color:var(--muted);max-width:74ch;margin:0 0 22px}
+  .meta{display:flex;flex-wrap:wrap;gap:8px 10px;margin-top:8px}
+  .pill{font-family:var(--mono);font-size:12.5px;color:var(--text);
+    background:var(--surface);border:1px solid var(--border);border-radius:7px;padding:5px 10px}
+  .pill b{color:var(--sky);font-weight:600}
+  .pill a{color:var(--text)} .pill a:hover{color:var(--cyan)}
+
+  nav.toc{position:sticky;top:0;z-index:20;background:rgba(11,13,18,.86);
+    backdrop-filter:blur(10px);border-bottom:1px solid var(--border)}
+  nav.toc .wrap{display:flex;gap:4px;overflow-x:auto;padding:10px 24px}
+  nav.toc a{font-size:13.5px;color:var(--muted);padding:6px 11px;border-radius:7px;white-space:nowrap}
+  nav.toc a:hover{color:var(--head);background:var(--surface);text-decoration:none}
+
+  section{padding:44px 0 6px;border-bottom:1px solid var(--border)}
+  section:last-of-type{border-bottom:none}
+  h2{font-size:1.62rem;color:var(--head);margin:0 0 6px;letter-spacing:-.01em;font-weight:680}
+  h2 .n{font-family:var(--mono);color:var(--faint);font-size:1.05rem;margin-right:12px;font-weight:500}
+  h3{font-size:1.16rem;color:var(--head);margin:30px 0 8px;font-weight:640}
+  p{margin:12px 0}
+  .lead{font-size:1.06rem;color:var(--text)}
+  strong{color:var(--head)}
+  ul,ol{padding-left:22px}
+  li{margin:7px 0}
+  .muted{color:var(--muted)}
+
+  .note{border:1px solid var(--border2);border-left-width:3px;border-radius:8px;
+    padding:14px 16px;margin:18px 0;background:var(--surface);font-size:.97rem}
+  .note.win{border-left-color:var(--green);background:rgba(74,222,128,.05)}
+  .note.warn{border-left-color:var(--amber);background:rgba(251,191,36,.05)}
+  .note.info{border-left-color:var(--sky);background:rgba(56,189,248,.05)}
+  .note.bug{border-left-color:var(--red);background:rgba(248,113,113,.05)}
+  .note b.tag{font-family:var(--mono);font-size:11.5px;letter-spacing:.08em;text-transform:uppercase;
+    display:inline-block;margin-right:8px}
+  .win b.tag{color:var(--green)} .warn b.tag{color:var(--amber)}
+  .info b.tag{color:var(--sky)} .bug b.tag{color:var(--red)}
+
+  pre{background:var(--bg2);border:1px solid var(--border);border-radius:10px;
+    padding:0;margin:16px 0;overflow:hidden}
+  pre .bar{display:flex;align-items:center;gap:8px;padding:8px 14px;border-bottom:1px solid var(--border);
+    background:var(--surface);font-family:var(--mono);font-size:12px;color:var(--muted)}
+  pre .bar .dot{width:11px;height:11px;border-radius:50%;background:var(--border2)}
+  pre code{display:block;padding:14px 16px;overflow-x:auto;font-size:13px;line-height:1.6;color:#cbd5e1}
+  pre code .c{color:var(--faint)}
+  pre code .k{color:var(--cyan)}
+  pre code .s{color:var(--green)}
+  pre code .v{color:var(--amber)}
+  pre code .p{color:var(--sky)}
+  :not(pre)>code{background:var(--surface2);border:1px solid var(--border);border-radius:5px;
+    padding:1.5px 6px;font-size:13px;color:#dbe4ee}
+
+  .tbl{overflow-x:auto;margin:18px 0;border:1px solid var(--border);border-radius:10px}
+  table{border-collapse:collapse;width:100%;font-size:13.5px}
+  th,td{padding:9px 13px;text-align:left;border-bottom:1px solid var(--border);vertical-align:top}
+  thead th{background:var(--surface);color:var(--muted);font-weight:600;
+    font-family:var(--mono);font-size:11.5px;letter-spacing:.04em;text-transform:uppercase;
+    position:sticky;top:0}
+  tbody tr:last-child td{border-bottom:none}
+  tbody tr:hover{background:rgba(56,189,248,.04)}
+  td.num{font-family:var(--mono);text-align:right}
+  .pos{color:var(--green);font-weight:600} .neg{color:var(--red);font-weight:600}
+  .flat{color:var(--muted)}
+  td .star{color:var(--cyan)}
+
+  .grid{display:grid;gap:14px;margin:18px 0}
+  .grid.c2{grid-template-columns:repeat(2,1fr)}
+  .grid.c3{grid-template-columns:repeat(3,1fr)}
+  .card{background:var(--surface);border:1px solid var(--border);border-radius:11px;padding:16px 17px}
+  .card h4{margin:0 0 6px;color:var(--head);font-size:1.02rem;display:flex;align-items:center;gap:9px}
+  .card h4 .ic{font-family:var(--mono);color:var(--cyan);font-size:.92rem}
+  .card h4 .tg{font-family:var(--mono);font-size:11px;color:var(--faint);margin-left:auto}
+  .card p{margin:6px 0 0;font-size:.93rem;color:var(--muted)}
+  .card p.eg{margin-top:9px;color:var(--text);font-size:.9rem}
+  .card p.eg b{color:var(--cyan);font-family:var(--mono);font-weight:600;font-size:.84rem}
+  .stat{font-family:var(--mono);font-size:1.9rem;font-weight:700;color:var(--head);letter-spacing:-.02em}
+  .stat.g{color:var(--green)} .stat .u{font-size:1rem;color:var(--muted);font-weight:500}
+
+  footer{padding:34px 0 60px;color:var(--faint);font-size:13px}
+  footer .wrap{display:flex;flex-wrap:wrap;gap:6px 18px;justify-content:space-between}
+  hr.soft{border:none;border-top:1px solid var(--border);margin:26px 0}
+  .kbd{font-family:var(--mono);background:var(--surface2);border:1px solid var(--border2);
+    border-bottom-width:2px;border-radius:5px;padding:1px 6px;font-size:12px;color:var(--head)}
+  @media(max-width:720px){
+    h1{font-size:1.9rem}.grid.c2,.grid.c3{grid-template-columns:1fr}
+  }
+</style>
+</head>
+<body>
+
+<header class="hero">
+  <div class="wrap">
+    <span class="eyebrow">◆ kvio · storage-IO for LLM KV-cache offload</span>
+    <h1><span class="mono">kvio</span><br>GPU-free KV-cache-offload storage-IO projector &amp; replayer</h1>
+    <p class="sub">Project, issue, and replay the NVMe I/O that LLM KV-cache offload produces —
+      from real model geometry, on real hardware, <em>without a GPU or a model</em>. Every
+      device command is attributed back to the KV object that caused it via a cross-layer
+      <code>trace_id</code> join, and validated byte-for-byte against the projection.</p>
+    <div class="meta">
+      <span class="pill"><b>engine:</b> LMCache <code>raw_block</code> io_uring_cmd passthrough</span>
+      <span class="pill"><b>tracer:</b> eBPF <code>nvme_uring_cmd_monitor</code></span>
+      <span class="pill"><b>needs:</b> an NVMe char device (<code>/dev/ngXnY</code>)</span>
+      <span class="pill"><b>GPU:</b> not required</span>
+      <span class="pill"><b>validated:</b> <span style="color:var(--green)">byte-exact on real NVMe</span></span>
+    </div>
+  </div>
+</header>
+
+<nav class="toc"><div class="wrap">
+  <a href="#what">What it is</a>
+  <a href="#how">How it works</a>
+  <a href="#join">The trace_id join</a>
+  <a href="#parts">Components</a>
+  <a href="#deps">Dependencies</a>
+  <a href="#run">How to run</a>
+  <a href="#fidelity">Fidelity metrics</a>
+  <a href="#results">Validated results</a>
+</div></nav>
+
+<main class="wrap">
+
+<section id="what">
+  <h2><span class="n">01</span>What it is</h2>
+  <p class="lead">Storage and systems engineers need to evaluate the disk I/O of LLM
+    KV-cache offload — command sizes, counts, volume, latency — but that I/O normally
+    only exists behind a GPU running a model through vLLM + LMCache. <strong>kvio removes
+    the GPU from that loop.</strong></p>
+  <p>The key observation: <strong>storage I/O geometry is content-independent.</strong> How
+    many NVMe commands a KV store/load produces, and how big each one is, depends only on
+    the KV block size and the device's transfer limit — not on the actual tensor values.
+    So <em>real model dimensions + fake bytes</em> reproduce the real offload I/O pattern.
+    kvio computes the block size from real model geometry, issues that store/load workload
+    through LMCache's real <code>raw_block</code> NVMe-passthrough engine, and confirms the
+    result against the actual device commands captured by an eBPF tracer.</p>
+  <div class="note info"><b class="tag">scope</b> A GPU is only needed to capture real
+    <em>access patterns and timing</em> — which chunk is stored when, hit vs. miss. The I/O
+    <em>geometry</em> for any given model is fully determined and reproduced here, GPU-free.</div>
+</section>
+
+<section id="how">
+  <h2><span class="n">02</span>How it works</h2>
+  <p>kvio is a two-phase model layered on top of LMCache's real storage engine.</p>
+  <div class="grid c2">
+    <div class="card">
+      <h4><span class="ic">1</span> Project / generate</h4>
+      <p>From a model config (the LMCache <a href="https://github.com/LMCache/LMCache/tree/dev/examples/kv_cache_calculator">KV-cache calculator</a>'s
+        <code>modelconfig.json</code>) and a chunk size, compute the KV block bytes with the
+        calculator's exact geometry — MHA/GQA, GQA-with-<code>head_dim</code>, DeepSeek MLA,
+        Hunyuan CLA.</p>
+      <p class="eg"><b>Llama-3.1-8B, 256-tok chunk → 32 MiB KV block</b></p>
+    </div>
+    <div class="card">
+      <h4><span class="ic">2</span> Issue / replay</h4>
+      <p>Push that store/load workload through LMCache <code>RawBlockCore</code> on a real
+        device — POSIX, io_uring, or io_uring_cmd NVMe passthrough. The payload is zeros; the
+        device splits each block into <code>MDTS</code>-sized commands exactly as it would for
+        real KV.</p>
+      <p class="eg"><b>32 MiB block → 256 × 128 KiB NVMe commands</b></p>
+    </div>
+  </div>
+  <p>A recorded workload is captured as a compact <code>kvio_record.json</code> manifest —
+    per-object payload sizes + device geometry, a few KB — that can be <strong>replayed</strong>
+    later to reissue the identical command stream on any device.</p>
+</section>
+
+<section id="join">
+  <h2><span class="n">03</span>The cross-layer <span class="mono" style="font-family:var(--mono);color:var(--cyan)">trace_id</span> join</h2>
+  <p>The distinguishing feature: follow <strong>one KV object</strong> from the LMCache
+    payload, through the raw-block MDTS split, down to the individual NVMe completions — and
+    back. This is done with a single <code>trace_id</code> threaded across three layers:</p>
+  <div class="tbl"><table>
+    <thead><tr><th>Layer</th><th>What it emits</th><th>Carries trace_id as</th></tr></thead>
+    <tbody>
+      <tr><td>LMCache <code>raw_block</code></td><td>a semantic record per KV object op: <code>op</code>, <code>bytes</code>, <code>part</code>, <code>object_id</code>, <code>components</code></td><td>the record's <code>trace_id</code> field</td></tr>
+      <tr><td>io_uring / rust engine</td><td>the submission for each device command</td><td class="num">user_data = (trace_id&lt;&lt;32) | counter</td></tr>
+      <tr><td>eBPF NVMe tracer</td><td>every <code>nvme_setup_cmd</code>: opcode, slba, nlb, bytes</td><td>reads back <code>user_data</code></td></tr>
+    </tbody>
+  </table></div>
+  <p>The validator recovers the object for any command as <code>trace_id = user_data &gt;&gt; 32</code>,
+    joining one logical intent to its N (≤ MDTS) wire commands. The low 32 bits stay a unique
+    completion counter, so CQE matching is unchanged.</p>
+  <div class="note win"><b class="tag">K/V aware</b> The semantic record carries a
+    <code>part</code> (<code>kv</code>/<code>k</code>/<code>v</code>) and, for packed
+    asymmetric-KV blobs, a <code>components</code> breakdown (K / V / scale bytes) read from
+    the <code>EncodedKV</code> header — so a store's device bytes can be attributed to K vs V
+    once the codec emits an asymmetric split.</p>
+</section>
+
+<section id="parts">
+  <h2><span class="n">04</span>Components</h2>
+  <div class="grid c3">
+    <div class="card">
+      <h4><span class="ic">◆</span> kv_cache_offload_io <span class="tg">LMCache</span></h4>
+      <p>Real-model-geometry workload generator. <code>kv_geometry.py</code> (a Python port
+        of the KV-cache calculator) + <code>run_kv_offload_io.py</code>. Lives in LMCache
+        <code>examples/</code>.</p>
+    </div>
+    <div class="card">
+      <h4><span class="ic">◆</span> raw_block <span class="tg">LMCache</span></h4>
+      <p>The real engine: rust <code>lmcache_rust_raw_block_io</code> + <code>RawBlockCore</code>,
+        io_uring_cmd NVMe passthrough. Emits the semantic <code>trace_id</code> record when
+        <code>LMCACHE_KVIO_TRACE</code> is set.</p>
+    </div>
+    <div class="card">
+      <h4><span class="ic">◆</span> kvio_plan <span class="tg">ebpf-syscall</span></h4>
+      <p>The projector: model/params → device ops, NVMe command count, per-command sizes,
+        total bytes, fragmentation vs. MDTS. No I/O.</p>
+    </div>
+    <div class="card">
+      <h4><span class="ic">◆</span> kvio_replay <span class="tg">ebpf-syscall</span></h4>
+      <p><code>--record kvio_record.json</code> reissues a whole recorded object set
+        (store-all-then-load-all) on a real device and measures latency/throughput.</p>
+    </div>
+    <div class="card">
+      <h4><span class="ic">◆</span> nvme_uring_cmd_monitor <span class="tg">ebpf-syscall</span></h4>
+      <p>The eBPF tracer: one JSONL record per <code>nvme_setup_cmd</code>, carrying
+        <code>user_data</code> so each wire command is attributable.</p>
+    </div>
+    <div class="card">
+      <h4><span class="ic">◆</span> kvio_validate <span class="tg">ebpf-syscall</span></h4>
+      <p>Joins tracer + semantic traces by <code>trace_id</code> and scores fidelity:
+        exact-match, WAPE, and command-size total-variation distance.</p>
+    </div>
+  </div>
+</section>
+
+<section id="deps">
+  <h2><span class="n">05</span>Dependencies</h2>
+  <div class="tbl"><table>
+    <thead><tr><th>Dependency</th><th>Why</th><th>Notes</th></tr></thead>
+    <tbody>
+      <tr><td>LMCache <code>kvio</code> branch</td><td>the <code>raw_block</code> engine + the semantic <code>trace_id</code>/<code>part</code>/<code>components</code> wiring</td><td>run against source on <code>PYTHONPATH</code>, or install</td></tr>
+      <tr><td>rust <code>raw_block</code> ext</td><td><code>lmcache_rust_raw_block_io</code> does the io_uring_cmd passthrough</td><td><code>maturin develop --release</code>; needs <span class="star">rustup ≥ 1.87</span> (24.04 apt rust 1.75 fails)</td></tr>
+      <tr><td>PyTorch (CPU is fine)</td><td>tensor buffers + the asymmetric codec</td><td>FP8 casts work on CPU; no GPU needed</td></tr>
+      <tr><td>an NVMe char device <code>/dev/ngXnY</code></td><td>io_uring_cmd passthrough target</td><td>use an <strong>empty, unmounted</strong> namespace — never the OS disk</td></tr>
+      <tr><td>eBPF toolchain</td><td>build <code>nvme_uring_cmd_monitor</code></td><td><code>clang</code>, <code>libbpf-dev</code>, <code>libelf-dev</code>, and <code>bpftool</code> via <code>apt install linux-tools-generic</code></td></tr>
+      <tr><td>kernel ≥ 5.19</td><td>io_uring_cmd (NVMe passthrough)</td><td><code>CONFIG_IO_URING=y</code>; Ubuntu 24.04 (6.8) works</td></tr>
+    </tbody>
+  </table></div>
+  <div class="note warn"><b class="tag">device safety</b> The passthrough target is written to.
+    Always confirm the namespace is empty and unmounted (<code>lsblk</code>, <code>nvme list</code>) —
+    the OS disk's <code>/dev/ng</code> is off-limits, and which namespace is empty differs per box.</div>
+</section>
+
+<section id="run">
+  <h2><span class="n">06</span>How to run</h2>
+  <h3>1 · Generate real-geometry offload I/O (GPU-free)</h3>
+  <pre><div class="bar"><span class="dot"></span><span class="dot"></span><span class="dot"></span>&nbsp; LMCache examples/kv_cache_offload_io</div><code><span class="c"># real model geometry -> real io_uring_cmd passthrough I/O for fake KV blocks</span>
+<span class="k">python</span> run_kv_offload_io.py <span class="v">--model</span> <span class="s">meta-llama/Llama-3.1-8B-Instruct</span> \
+    <span class="v">--dtype</span> <span class="s">bfloat16</span> <span class="v">--chunk-tokens</span> <span class="s">256</span> <span class="v">--num-chunks</span> <span class="s">8</span> \
+    <span class="v">--device</span> <span class="p">/dev/ng0n1</span> <span class="v">--engine</span> <span class="s">uring_cmd</span> \
+    <span class="v">--record</span> <span class="p">/tmp/kvio_record.json</span> <span class="v">--trace</span> <span class="p">/tmp/sem.jsonl</span></code></pre>
+
+  <h3>2 · Capture the wire trace alongside it</h3>
+  <pre><div class="bar"><span class="dot"></span><span class="dot"></span><span class="dot"></span>&nbsp; ebpf-syscall</div><code><span class="k">sudo</span> ./nvme_uring_cmd_monitor <span class="v">--dur</span> <span class="s">90</span> <span class="v">--lba-size</span> <span class="s">512</span> <span class="v">--jsonl</span> <span class="p">/tmp/nvme.jsonl</span> &amp;
+<span class="c"># ... run step 1 with LMCACHE_KVIO_TRACE=/tmp/sem.jsonl ...</span></code></pre>
+
+  <h3>3 · Validate projection vs. real device commands</h3>
+  <pre><div class="bar"><span class="dot"></span><span class="dot"></span><span class="dot"></span>&nbsp; ebpf-syscall/examples/lmcache</div><code><span class="k">python</span> kvio_validate.py <span class="v">--tracer</span> <span class="p">/tmp/nvme.jsonl</span> <span class="v">--semantic</span> <span class="p">/tmp/sem.jsonl</span> \
+    <span class="v">--lba-bytes</span> <span class="s">4096</span> <span class="v">--mdts-bytes</span> <span class="s">131072</span>
+<span class="c"># exact-match 8/8, WAPE 0.0000%, per-cmd size 8/8, size-dist TV 0.0000</span></code></pre>
+
+  <h3>4 · Replay a recorded workload elsewhere</h3>
+  <pre><div class="bar"><span class="dot"></span><span class="dot"></span><span class="dot"></span>&nbsp; ebpf-syscall/examples/lmcache</div><code><span class="k">python</span> kvio_replay.py <span class="v">--record</span> <span class="p">/tmp/kvio_record.json</span> <span class="v">--device</span> <span class="p">/dev/ng0n1</span> <span class="v">--iters</span> <span class="s">5</span>
+<span class="c"># reissues the exact store-all-then-load-all command stream</span></code></pre>
+  <div class="note info"><b class="tag">alignment</b> Pass <code>--lba-bytes</code> equal to the
+    <code>raw_block</code> <code>block_align</code> (4096), not the device LBA (512) — the
+    projector rounds command tails to that alignment. Mismatched, the geometry looks off by a
+    fraction of a percent; matched, it is exact.</div>
+</section>
+
+<section id="fidelity">
+  <h2><span class="n">07</span>Fidelity metrics</h2>
+  <p>Three complementary scores, joined per object by <code>trace_id</code>. AUC is
+    deliberately <em>not</em> used — there is no class label; the geometry is deterministic.</p>
+  <div class="grid c3">
+    <div class="card">
+      <h4><span class="ic">=</span> Exact-match</h4>
+      <p>Per object, do the measured command count <em>and</em> total device bytes equal the
+        projection? The strictest check.</p>
+    </div>
+    <div class="card">
+      <h4><span class="ic">%</span> WAPE</h4>
+      <p>Weighted Absolute Percentage Error: total mispredicted bytes ÷ total measured bytes.
+        <strong>0% = the I/O volume is exactly right.</strong></p>
+    </div>
+    <div class="card">
+      <h4><span class="ic">△</span> Size-dist TV</h4>
+      <p>Total-variation distance between projected and measured command-size distributions
+        (log2 bins). <strong>0 = identical shape</strong> — every command the right size.</p>
+    </div>
+  </div>
+  <div class="note info"><b class="tag">why both</b> The same total bytes in the same command
+    count can still hide a wrong split (256K+768K vs 512K+512K). WAPE and count both pass; TV
+    catches it. WAPE = right <em>volume</em>, TV = right <em>shape</em>. Both zero = the device
+    I/O is reproduced byte-for-byte and command-for-command.</div>
+</section>
+
+<section id="results">
+  <h2><span class="n">08</span>Validated results</h2>
+  <p class="muted">On Latitude bare-metal (real Micron NVMe, io_uring_cmd passthrough on
+    <code>/dev/ng</code>), CPU-side compute, fake KV content.</p>
+  <div class="grid c3">
+    <div class="card"><h4>Real-geometry offload</h4>
+      <div class="stat g">8/8</div>
+      <p>Llama-3.1-8B, 32 MiB blocks, 2052 NVMe commands — exact cmds+bytes, WAPE 0.0000%, TV 0.0000</p></div>
+    <div class="card"><h4>Record → replay</h4>
+      <div class="stat g">18/18</div>
+      <p>replayed the recorded manifest, wire-validated exact-match, WAPE 0.0000%, TV 0.0000</p></div>
+    <div class="card"><h4>Asymmetric K/V capture</h4>
+      <div class="stat g">K=2×V</div>
+      <p>packed K16/V8 <code>components</code> matched the <code>EncodedKV</code> header exactly, byte-exact round-trip</p></div>
+  </div>
+  <div class="note win"><b class="tag">bottom line</b> The capture wiring, the cross-layer
+    <code>trace_id</code> join, the fidelity metrics, and record/replay are all correct and
+    byte-faithful on real NVMe. A real GPU-driven trace over a full dataset (real access
+    patterns/timing) is the remaining, hardware-gated step.</div>
+</section>
+
+</main>
+
+<footer><div class="wrap">
+  <span>kvio — GPU-free KV-cache-offload storage-IO projector &amp; replayer</span>
+  <span>engine: LMCache <code>raw_block</code> · tracer: eBPF <code>nvme_uring_cmd_monitor</code></span>
+</div></footer>
+
+</body>
+</html>
