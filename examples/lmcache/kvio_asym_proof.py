@@ -188,5 +188,33 @@ if os.environ.get("KVIO_JSON"):
             "pass": ok,
         }, f, indent=2)
 
+# Emit a kvio_record.json replay manifest so `kvio_replay.py --record` can
+# reissue this exact IO workload. Geometry is content-independent, so
+# payload_bytes + the device knobs fully determine the NVMe command stream.
+record_path = os.environ.get("KVIO_RECORD")
+if record_path:
+    stores = [r for r in sem if r["op"] == "store"]
+    with open(record_path, "w") as f:
+        json.dump({
+            "schema_version": 1,
+            "source": f"kvio_asym_proof.py on {DEV} ({DEVICE})",
+            "codec": {"name": "asym_k16_v8", "scale_scope": "PER_TENSOR",
+                      "k_dtype": "bfloat16", "v_dtype": "float8_e4m3fn"},
+            "generator": {"shapes": [list(s) for s in SHAPES]},
+            "device_geometry": {
+                "engine": "io_uring", "use_uring_cmd": True,
+                "mdts_bytes": 131072, "block_align": 4096, "header_bytes": 4096,
+                "lba_bytes": 512, "slot_bytes": slot_bytes,
+                "capacity_bytes": 8 * 1024 * 1024 * 1024,
+            },
+            "access_pattern": "store-all-then-load-all",
+            "objects": [{
+                "index": i, "key": s["key"], "object_id": s["object_id"],
+                "part": s["part"], "payload_bytes": s["bytes"],
+                "components": s["components"], "ops": ["store", "load"],
+            } for i, s in enumerate(stores)],
+        }, f, indent=2)
+    print(f"wrote replay manifest: {record_path}")
+
 print("\nRESULT:", "PASS" if ok else "FAIL")
 sys.exit(0 if ok else 1)
