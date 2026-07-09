@@ -140,6 +140,7 @@
       <span class="pill"><b>needs:</b> an NVMe char device (<code>/dev/ngXnY</code>)</span>
       <span class="pill"><b>GPU:</b> not required</span>
       <span class="pill"><b>validated:</b> <span style="color:var(--green)">byte-exact on real NVMe</span></span>
+      <span class="pill"><b>source:</b> <a href="https://github.com/mcgrof/LMCache/tree/kvio">mcgrof/LMCache @ <code>kvio</code></a></span>
     </div>
   </div>
 </header>
@@ -228,13 +229,13 @@
   <h2><span class="n">04</span>Components</h2>
   <div class="grid c3">
     <div class="card">
-      <h4><span class="ic">◆</span> kv_cache_offload_io <span class="tg">LMCache</span></h4>
+      <h4><span class="ic">◆</span> <a href="https://github.com/mcgrof/LMCache/tree/kvio/examples/kv_cache_offload_io">kv_cache_offload_io</a> <span class="tg">LMCache</span></h4>
       <p>Real-model-geometry workload generator. <code>kv_geometry.py</code> (a Python port
         of the KV-cache calculator) + <code>run_kv_offload_io.py</code>. Lives in LMCache
-        <code>examples/</code>.</p>
+        <a href="https://github.com/mcgrof/LMCache/tree/kvio/examples/kv_cache_offload_io"><code>examples/kv_cache_offload_io</code></a> on the <code>kvio</code> branch.</p>
     </div>
     <div class="card">
-      <h4><span class="ic">◆</span> raw_block <span class="tg">LMCache</span></h4>
+      <h4><span class="ic">◆</span> <a href="https://github.com/mcgrof/LMCache/tree/kvio/lmcache/v1/storage_backend/raw_block">raw_block</a> <span class="tg">LMCache</span></h4>
       <p>The real engine: rust <code>lmcache_rust_raw_block_io</code> + <code>RawBlockCore</code>,
         io_uring_cmd NVMe passthrough. Emits the semantic <code>trace_id</code> record when
         <code>LMCACHE_KVIO_TRACE</code> is set.</p>
@@ -267,7 +268,7 @@
   <div class="tbl"><table>
     <thead><tr><th>Dependency</th><th>Why</th><th>Notes</th></tr></thead>
     <tbody>
-      <tr><td>LMCache <code>kvio</code> branch</td><td>the <code>raw_block</code> engine + the semantic <code>trace_id</code>/<code>part</code>/<code>components</code> wiring</td><td>run against source on <code>PYTHONPATH</code>, or install</td></tr>
+      <tr><td>LMCache <a href="https://github.com/mcgrof/LMCache/tree/kvio"><code>kvio</code> branch</a></td><td>the <code>raw_block</code> engine + the semantic <code>trace_id</code>/<code>part</code>/<code>components</code> wiring</td><td><code>git clone -b kvio https://github.com/mcgrof/LMCache</code>; run against source on <code>PYTHONPATH</code>, or install</td></tr>
       <tr><td>rust <code>raw_block</code> ext</td><td><code>lmcache_rust_raw_block_io</code> does the io_uring_cmd passthrough</td><td><code>maturin develop --release</code>; needs <span class="star">rustup ≥ 1.87</span> (24.04 apt rust 1.75 fails)</td></tr>
       <tr><td>PyTorch (CPU is fine)</td><td>tensor buffers + the asymmetric codec</td><td>FP8 casts work on CPU; no GPU needed</td></tr>
       <tr><td>an NVMe char device <code>/dev/ngXnY</code></td><td>io_uring_cmd passthrough target</td><td>use an <strong>empty, unmounted</strong> namespace — never the OS disk</td></tr>
