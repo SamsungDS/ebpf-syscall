@@ -1,0 +1,359 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>kvio case study — the QD~1 KV-load bottleneck, found with eBPF and fixed with parallel loads</title>
+<style>
+  :root{
+    --bg:#0b0d12; --bg2:#0e1117; --surface:#12161f; --surface2:#161b26;
+    --border:#1f2733; --border2:#2a3441;
+    --text:#c7d0db; --head:#e8eef5; --muted:#7e8a99; --faint:#5b6675;
+    --cyan:#22d3ee; --sky:#38bdf8; --blue:#3b82f6;
+    --green:#4ade80; --red:#f87171; --amber:#fbbf24; --violet:#a78bfa;
+    --mono:ui-monospace,"SF Mono",SFMono-Regular,Menlo,Consolas,"Liberation Mono",monospace;
+    --sans:-apple-system,BlinkMacSystemFont,"Segoe UI",Inter,Roboto,"Helvetica Neue",Arial,sans-serif;
+  }
+  *{box-sizing:border-box}
+  html{scroll-behavior:smooth}
+  body{margin:0;background:var(--bg);color:var(--text);font-family:var(--sans);
+    font-size:16px;line-height:1.65;-webkit-font-smoothing:antialiased}
+  a{color:var(--sky);text-decoration:none}
+  a:hover{color:var(--cyan);text-decoration:underline}
+  code,kbd,pre{font-family:var(--mono)}
+  .wrap{max-width:1000px;margin:0 auto;padding:0 24px}
+  header.hero{
+    border-bottom:1px solid var(--border);
+    background:
+      radial-gradient(900px 380px at 12% -8%, rgba(34,211,238,.10), transparent 60%),
+      radial-gradient(800px 360px at 92% -12%, rgba(248,113,113,.10), transparent 55%),
+      linear-gradient(180deg,var(--bg2),var(--bg));
+  }
+  .hero .wrap{padding-top:52px;padding-bottom:40px}
+  .eyebrow{display:inline-flex;align-items:center;gap:8px;font-family:var(--mono);
+    font-size:12.5px;letter-spacing:.12em;text-transform:uppercase;color:var(--cyan);
+    border:1px solid var(--border2);border-radius:999px;padding:5px 12px;background:rgba(34,211,238,.05)}
+  h1{font-size:2.4rem;line-height:1.12;margin:18px 0 10px;color:var(--head);
+    letter-spacing:-.02em;font-weight:740}
+  h1 .mono{font-family:var(--mono);background:linear-gradient(90deg,var(--cyan),var(--sky));
+    -webkit-background-clip:text;background-clip:text;color:transparent}
+  .sub{font-size:1.18rem;color:var(--muted);max-width:76ch;margin:0 0 22px}
+  .meta{display:flex;flex-wrap:wrap;gap:8px 10px;margin-top:8px}
+  .pill{font-family:var(--mono);font-size:12.5px;color:var(--text);
+    background:var(--surface);border:1px solid var(--border);border-radius:7px;padding:5px 10px}
+  .pill b{color:var(--sky);font-weight:600}
+  .pill a{color:var(--text)} .pill a:hover{color:var(--cyan)}
+  nav.toc{position:sticky;top:0;z-index:20;background:rgba(11,13,18,.86);
+    backdrop-filter:blur(10px);border-bottom:1px solid var(--border)}
+  nav.toc .wrap{display:flex;gap:4px;overflow-x:auto;padding:10px 24px}
+  nav.toc a{font-size:13.5px;color:var(--muted);padding:6px 11px;border-radius:7px;white-space:nowrap}
+  nav.toc a:hover{color:var(--head);background:var(--surface);text-decoration:none}
+  section{padding:44px 0 6px;border-bottom:1px solid var(--border)}
+  section:last-of-type{border-bottom:none}
+  h2{font-size:1.62rem;color:var(--head);margin:0 0 6px;letter-spacing:-.01em;font-weight:680}
+  h2 .n{font-family:var(--mono);color:var(--faint);font-size:1.05rem;margin-right:12px;font-weight:500}
+  h3{font-size:1.16rem;color:var(--head);margin:30px 0 8px;font-weight:640}
+  p{margin:12px 0}
+  .lead{font-size:1.06rem;color:var(--text)}
+  strong{color:var(--head)}
+  ul,ol{padding-left:22px}
+  li{margin:7px 0}
+  .muted{color:var(--muted)}
+  .note{border:1px solid var(--border2);border-left-width:3px;border-radius:8px;
+    padding:14px 16px;margin:18px 0;background:var(--surface);font-size:.97rem}
+  .note.win{border-left-color:var(--green);background:rgba(74,222,128,.05)}
+  .note.warn{border-left-color:var(--amber);background:rgba(251,191,36,.05)}
+  .note.info{border-left-color:var(--sky);background:rgba(56,189,248,.05)}
+  .note.bug{border-left-color:var(--red);background:rgba(248,113,113,.05)}
+  .note b.tag{font-family:var(--mono);font-size:11.5px;letter-spacing:.08em;text-transform:uppercase;
+    display:inline-block;margin-right:8px}
+  .win b.tag{color:var(--green)} .warn b.tag{color:var(--amber)}
+  .info b.tag{color:var(--sky)} .bug b.tag{color:var(--red)}
+  pre{background:var(--bg2);border:1px solid var(--border);border-radius:10px;
+    padding:0;margin:16px 0;overflow:hidden}
+  pre .bar{display:flex;align-items:center;gap:8px;padding:8px 14px;border-bottom:1px solid var(--border);
+    background:var(--surface);font-family:var(--mono);font-size:12px;color:var(--muted)}
+  pre .bar .dot{width:11px;height:11px;border-radius:50%;background:var(--border2)}
+  pre code{display:block;padding:14px 16px;overflow-x:auto;font-size:13px;line-height:1.6;color:#cbd5e1}
+  pre code .c{color:var(--faint)}
+  pre code .k{color:var(--cyan)}
+  pre code .s{color:var(--green)}
+  pre code .v{color:var(--amber)}
+  pre code .p{color:var(--sky)}
+  :not(pre)>code{background:var(--surface2);border:1px solid var(--border);border-radius:5px;
+    padding:1.5px 6px;font-size:13px;color:#dbe4ee}
+  .tbl{overflow-x:auto;margin:18px 0;border:1px solid var(--border);border-radius:10px}
+  table{border-collapse:collapse;width:100%;font-size:13.5px}
+  th,td{padding:9px 13px;text-align:left;border-bottom:1px solid var(--border);vertical-align:top}
+  thead th{background:var(--surface);color:var(--muted);font-weight:600;
+    font-family:var(--mono);font-size:11.5px;letter-spacing:.04em;text-transform:uppercase;
+    position:sticky;top:0}
+  tbody tr:last-child td{border-bottom:none}
+  tbody tr:hover{background:rgba(56,189,248,.04)}
+  td.num{font-family:var(--mono);text-align:right}
+  .pos{color:var(--green);font-weight:600} .neg{color:var(--red);font-weight:600}
+  .flat{color:var(--muted)}
+  td .star{color:var(--cyan)}
+  .grid{display:grid;gap:14px;margin:18px 0}
+  .grid.c2{grid-template-columns:repeat(2,1fr)}
+  .grid.c3{grid-template-columns:repeat(3,1fr)}
+  .card{background:var(--surface);border:1px solid var(--border);border-radius:11px;padding:16px 17px}
+  .card h4{margin:0 0 6px;color:var(--head);font-size:1.02rem;display:flex;align-items:center;gap:9px}
+  .card h4 .ic{font-family:var(--mono);color:var(--cyan);font-size:.92rem}
+  .card p{margin:6px 0 0;font-size:.93rem;color:var(--muted)}
+  .stat{font-family:var(--mono);font-size:1.9rem;font-weight:700;color:var(--head);letter-spacing:-.02em}
+  .stat.g{color:var(--green)} .stat.r{color:var(--red)} .stat .u{font-size:1rem;color:var(--muted);font-weight:500}
+  footer{padding:34px 0 60px;color:var(--faint);font-size:13px}
+  footer .wrap{display:flex;flex-wrap:wrap;gap:6px 18px;justify-content:space-between}
+  hr.soft{border:none;border-top:1px solid var(--border);margin:26px 0}
+  @media(max-width:720px){ h1{font-size:1.8rem}.grid.c2,.grid.c3{grid-template-columns:1fr} }
+</style>
+</head>
+<body>
+
+<header class="hero">
+  <div class="wrap">
+    <span class="eyebrow">◆ kvio case study · storage I/O for LLM KV-cache offload</span>
+    <h1>The <span class="mono">QD~1</span> KV-load bottleneck<br>found with eBPF, fixed with parallel loads</h1>
+    <p class="sub">On a real 11.3&nbsp;GB/s Gen5 NVMe, LMCache's <code>raw_block</code> KV-cache
+      loader ran at <strong>~1.2&nbsp;GB/s — about 11% of the device</strong>. The eBPF NVMe record
+      shows why: reads were issued one 128&nbsp;KiB command at a time, single-threaded, queue depth
+      ~1. A one-file change that issues several objects' reads at once recovers <strong>~2.8×</strong>,
+      and — because KV-load time is what the compute-vs-load crossover turns on — it moves that
+      crossover toward smaller models.</p>
+    <div class="meta">
+      <span class="pill"><b>rig:</b> 8× H100, Samsung Gen5 NVMe, Linux 6.17</span>
+      <span class="pill"><b>tracer:</b> eBPF <code>nvme_uring_cmd_monitor</code></span>
+      <span class="pill"><b>engine:</b> LMCache <code>raw_block</code> io_uring_cmd</span>
+      <span class="pill"><b>fix:</b> <code>raw-block-parallel-load</code> @ <code>1dafbb31</code></span>
+      <span class="pill"><b>status:</b> <span style="color:var(--amber)">prototype-validated — more testing pending</span></span>
+      <span class="pill"><a href="kvio.html">← kvio main page</a></span>
+    </div>
+  </div>
+</header>
+
+<nav class="toc"><div class="wrap">
+  <a href="#symptom">Symptom</a>
+  <a href="#wire">Wire evidence</a>
+  <a href="#why">Why it matters</a>
+  <a href="#repro">Reproduce</a>
+  <a href="#fix">The fix</a>
+  <a href="#e2e">End to end</a>
+  <a href="#left">What's left</a>
+</div></nav>
+
+<main class="wrap">
+
+<section id="symptom">
+  <h2><span class="n">01</span>The symptom</h2>
+  <p class="lead">LMCache offloads LLM KV cache to raw NVMe (the <code>raw_block</code> engine, io_uring_cmd
+    passthrough on <code>/dev/ng</code>). Each KV object is a large blob — 8–20&nbsp;MiB per rank —
+    split into 128&nbsp;KiB device commands. Loading it back should be near sequential-read speed.
+    It wasn't.</p>
+  <div class="grid c3">
+    <div class="card"><h4><span class="ic">io</span>KV load, real TP4</h4>
+      <div class="stat r">~1.2<span class="u">GB/s</span></div>
+      <p>70B TP4, 4640&nbsp;MiB per request over io_uring_cmd on <code>/dev/ng1n1</code></p></div>
+    <div class="card"><h4><span class="ic">fio</span>device ceiling</h4>
+      <div class="stat g">11.3<span class="u">GB/s</span></div>
+      <p>same drive, 128&nbsp;KiB sequential read, <code>ioengine=io_uring</code></p></div>
+    <div class="card"><h4><span class="ic">%</span>device utilized</h4>
+      <div class="stat r">~11<span class="u">%</span></div>
+      <p>the loader left ~90% of the drive on the floor</p></div>
+  </div>
+  <p>The device is not the bottleneck — the software path is. The only way to know that for sure is to
+    look at the actual NVMe commands on the wire.</p>
+</section>
+
+<section id="wire">
+  <h2><span class="n">02</span>The wire evidence</h2>
+  <p>The eBPF tracer <code>nvme_uring_cmd_monitor</code> records every NVMe command on the
+    io_uring_cmd path — opcode, LBA, byte count, the issuing thread, the io_uring <code>user_data</code>,
+    and a nanosecond timestamp. Replaying a real 70B/TP4 load and reading the trace back:</p>
+  <div class="note bug"><b class="tag">serial</b> <b>72,960 read commands, all from one process / one
+    kernel thread.</b> <code>max concurrent in-flight objects = 1</code>; consecutive commands belong to
+    the same object 99.4% of the time. Each 20&nbsp;MiB object's 160 reads fire back-to-back, then the
+    next object starts — nothing overlaps.</div>
+  <div class="note bug"><b class="tag">QD~1 within an object too</b> The 160 commands of a single object
+    are submitted with a <b>~83&nbsp;µs gap</b> between consecutive submissions, while the device
+    completes a 128&nbsp;KiB read in ~16&nbsp;µs. It is submit-one, wait, submit-next — ~80% of every
+    command is software round-trip, not device time.</div>
+  <div class="note warn"><b class="tag">the knob doesn't help</b> The engine is configured
+    <code>iouring_queue_depth=8</code>, but raising it to 64 changes nothing — the serial single-object
+    number stays ~1.4&nbsp;GB/s. The ring's queue depth is never used to pipeline the many
+    non-overlapping reads of one object.</div>
+  <p class="muted">The trace also carries the LMCache <code>trace_id</code> in the high 32 bits of
+    <code>user_data</code>, so every command is attributed back to the KV object (and TP rank) that
+    caused it — that join is what makes this a precise measurement rather than an aggregate guess.</p>
+</section>
+
+<section id="why">
+  <h2><span class="n">03</span>Why this matters — the crossover turns on it</h2>
+  <p>Whether it is cheaper to <em>reload</em> a prefix's KV from storage or to <em>recompute</em> it on
+    the GPU is a live question in LLM serving. With TP held fixed at 4, and load time set purely by the
+    (crippled) ~1.2&nbsp;GB/s path, the balance decomposes cleanly:</p>
+  <div class="tbl"><table>
+    <thead><tr><th>model (TP4)</th><th class="num">GPU recompute</th><th class="num">NVMe load</th>
+      <th class="num">R = load ÷ recompute</th><th class="num">per-rank obj</th><th class="num">aggregate KV / chunk</th></tr></thead>
+    <tbody>
+      <tr><td>Llama-3.1-8B</td><td class="num">~0.38 s</td><td class="num">~1.82 s</td><td class="num">~4.8×</td><td class="num">8 MiB</td><td class="num">32 MiB</td></tr>
+      <tr><td>Llama-3.1-70B</td><td class="num">~1.90 s</td><td class="num">~4.13 s</td><td class="num"><span class="star">~2.2×</span></td><td class="num">20 MiB</td><td class="num">80 MiB (×2.50)</td></tr>
+    </tbody>
+  </table></div>
+  <p>Load time ≈ <code>aggregate_bytes ÷ 1.2&nbsp;GB/s</code>, so it grows with KV bytes (×2.27), while
+    recompute grows with compute (×5.0). R improves ×2.2 at fixed TP4 — a real model-scale effect,
+    isolated from TP. <strong>But that load number is a fixable software floor, not storage physics.</strong>
+    Speed the loader up and R falls with it — the crossover moves toward smaller models.</p>
+  <div class="note info"><b class="tag">connector-gated</b> Prior work that finds "loading loses" is
+    partly measuring QD~1, DRAM-bouncing loaders. A properly-pipelined loader changes the answer — which
+    is exactly what the fix below starts to show.</div>
+</section>
+
+<section id="repro">
+  <h2><span class="n">04</span>Reproduce it</h2>
+  <p>All three steps run on any box with an NVMe char device (<code>/dev/ngXnY</code>) and the LMCache
+    <code>raw_block</code> engine built. No GPU or model needed — storage geometry is content-independent.</p>
+  <h3>1 · Build the eBPF tracer</h3>
+  <pre><div class="bar"><span class="dot"></span>ebpf-syscall</div><code><span class="c"># in the ebpf-syscall tree; needs clang + libbpf-dev + bpftool</span>
+make LIBBPF_SYSTEM=yes nvme_uring_cmd_monitor</code></pre>
+  <h3>2 · Measure the load path under varying concurrency</h3>
+  <pre><div class="bar"><span class="dot"></span>kvio_parallel_probe.py</div><code><span class="c"># stores 128 × 20 MiB objects, then loads them back at W = 1,2,4,8,16,32</span>
+KVIO_SRC=~/LMCache <span class="k">python</span> kvio_parallel_probe.py \
+    --device <span class="v">/dev/ng1n1</span> --obj-mib <span class="v">20</span> --nobj <span class="v">128</span> \
+    --workers <span class="v">1,2,4,8,16,32</span> --qd <span class="v">8</span></code></pre>
+  <h3>3 · Confirm the wire behavior</h3>
+  <pre><div class="bar"><span class="dot"></span>analyze_load_path.py</div><code><span class="c"># run the tracer around a load, then attribute commands to objects/ranks</span>
+sudo nvme_uring_cmd_monitor --jsonl <span class="v">trace.jsonl</span> --lba-size <span class="v">4096</span> &
+<span class="c"># ... issue the load ...</span>
+<span class="k">python</span> analyze_load_path.py trace.jsonl sem.jsonl   <span class="c"># prints TIDs, in-flight objects, per-cmd gap</span></code></pre>
+  <div class="note info"><b class="tag">probe result — real NVMe</b> A trivial Python thread-pool across
+    <em>objects</em> (no engine change) already lifts the load path well off its serial floor:</div>
+  <div class="tbl"><table>
+    <thead><tr><th>load concurrency</th><th class="num">GB/s</th><th class="num">vs serial</th><th>note</th></tr></thead>
+    <tbody>
+      <tr><td>1 — serial (today)</td><td class="num">1.9</td><td class="num">1.0×</td><td class="muted">the shipped behavior</td></tr>
+      <tr><td>4 workers</td><td class="num">2.9</td><td class="num">1.5×</td><td></td></tr>
+      <tr><td>8 workers</td><td class="num"><span class="star">5.3</span></td><td class="num"><span class="star">2.8×</span></td><td>best</td></tr>
+      <tr><td>16 workers</td><td class="num">4.8–5.5</td><td class="num">2.6×</td><td class="muted">plateau ≈ 44% of device</td></tr>
+      <tr><td>32 workers</td><td class="num">3.8</td><td class="num">2.0×</td><td class="muted">contention</td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<section id="fix">
+  <h2><span class="n">05</span>The fix</h2>
+  <p>The per-object read already released the engine lock before doing I/O, and the Rust io_uring binding
+    drops the GIL during the wait — so the objects of one batched load can simply be issued concurrently.
+    The change factors the per-object body into <code>_load_one_into</code> and dispatches it over an
+    optional pool sized by a new <code>RawBlockCoreConfig.load_parallelism</code> (default 1 = unchanged).
+    The L2 adapter passes its <em>existing</em> <code>num_load_workers</code> (default 4) through, so a
+    knob that previously only sized dispatch threads now actually parallelizes the read loop.</p>
+  <pre><div class="bar"><span class="dot"></span>load_many_into — before → after</div><code><span class="c"># before: one object at a time, each read awaited before the next</span>
+<span class="k">for</span> i, (key, entry) <span class="k">in</span> enumerate(items):
+    self._read_buffers([entry.offset + header], [buf], [len], [total])   <span class="c"># QD~1</span>
+
+<span class="c"># after: issue several objects' reads at once over the load pool</span>
+<span class="k">if</span> self._load_pool <span class="k">and</span> len(pending) &gt; 1:
+    futures = [self._load_pool.submit(self._load_one_into, i, key, entry, objs, results, roe)
+               <span class="k">for</span> (i, key, entry) <span class="k">in</span> pending]
+    <span class="k">for</span> f <span class="k">in</span> futures: f.result()</code></pre>
+  <div class="grid c2">
+    <div class="card"><h4><span class="ic">Δ</span>the change</h4>
+      <p>2 files, ~120 lines. <code>load_parallelism</code> config (default 1, no behavior change unless
+        opted in); adapter wires <code>num_load_workers</code> → <code>load_parallelism</code>.
+        LMCache branch <code>raw-block-parallel-load</code>, commit <code>1dafbb31</code>.</p></div>
+    <div class="card"><h4><span class="ic">✓</span>why it's safe</h4>
+      <p>Each read touches only its own <code>results[i]</code>/<code>objs[i]</code>; the index lookup
+        holds the lock only briefly and releases it before I/O; the binding drops the GIL in the wait.
+        Concurrency proven on real NVMe (the 2.8× probe above).</p></div>
+  </div>
+  <div class="note win"><b class="tag">the payoff</b> ~2.8× on the NVMe leg flips the 70B/TP4 balance:
+    load 4.13&nbsp;s → ~1.5&nbsp;s vs recompute ~1.9&nbsp;s ⇒ <b>R ≈ 0.78 — loading wins</b>; and 8B/TP4
+    comes into range. The crossover is a connector problem, not a storage limit.</div>
+</section>
+
+<section id="e2e">
+  <h2><span class="n">06</span>End to end, in a live serving stack</h2>
+  <p>The numbers above are the storage leg. The open question was whether it moves <em>user-facing</em>
+    TTFT once the DRAM→GPU copy, the connector, and scheduling join the path. Measured on a real
+    <code>vllm serve</code> Llama-3.1-8B + LMCache MP stack, raw_block L2 on NVMe passthrough, KV resident
+    on the device — it does.</p>
+
+  <div class="grid c3">
+    <div class="card"><h4><span class="ic">TTFT</span>C=1</h4><div class="stat g">4.0×<span class="u"> faster</span></div><p>p50 3154 → 779 ms</p></div>
+    <div class="card"><h4><span class="ic">tput</span>C=4</h4><div class="stat g">5.0×<span class="u"> higher</span></div><p>0.52 → 2.60 req/s</p></div>
+    <div class="card"><h4><span class="ic">cache</span>hit rate</h4><div class="stat g">47→83%</div><p>slow loads stop timing out into recompute</p></div>
+  </div>
+
+  <p>Default connector config (<code>mq_timeout=10s</code>, recompute fallback on) — what a user sees:</p>
+  <div class="tbl"><table>
+    <thead><tr><th>metric</th><th class="num">baseline (QD~1)</th><th class="num">batched</th><th class="num">speedup</th></tr></thead>
+    <tbody>
+      <tr><td>C=1 TTFT p50</td><td class="num">3154 ms</td><td class="num">779 ms</td><td class="num"><span class="star">4.0×</span></td></tr>
+      <tr><td>C=1 TTFT p99</td><td class="num">3960 ms</td><td class="num">813 ms</td><td class="num">4.9×</td></tr>
+      <tr><td>C=4 TTFT p50</td><td class="num">7008 ms</td><td class="num">1476 ms</td><td class="num">4.7×</td></tr>
+      <tr><td>C=4 throughput</td><td class="num">0.52 req/s</td><td class="num">2.60 req/s</td><td class="num"><span class="star">5.0×</span></td></tr>
+    </tbody>
+  </table></div>
+
+  <p>With recompute rescue disabled (<code>mq_timeout=90s</code>) the isolated storage penalty is unmasked:</p>
+  <div class="tbl"><table>
+    <thead><tr><th>metric</th><th class="num">baseline (QD~1)</th><th class="num">batched</th><th class="num">speedup</th></tr></thead>
+    <tbody>
+      <tr><td>C=1 TTFT p50</td><td class="num">11885 ms</td><td class="num">763 ms</td><td class="num"><span class="star">15.6×</span></td></tr>
+      <tr><td>C=4 TTFT p50</td><td class="num">20248 ms</td><td class="num">1375 ms</td><td class="num">14.7×</td></tr>
+    </tbody>
+  </table></div>
+  <p>Batched TTFT is stable across both (779 → 763 ms) — it loads fast enough to never hit the timeout.
+    Baseline swings 3154 → 11885 ms with the timeout, proving its slowness <em>is</em> the QD~1 load.</p>
+
+  <div class="note info"><b class="tag">which fix</b> This measured the <b>batched within-object read</b>
+    (commit <code>ec0a6a58</code>) on top of the io_uring worker <b>no-hang</b> fix (<code>b839153b</code>).
+    The cross-object <code>load_parallelism</code> pool of §05 (<code>1dafbb31</code>) is complementary and
+    not yet measured end to end.</div>
+
+  <h3>Why a naive serving A/B lies — four confounds</h3>
+  <p>Each of these silently collapses the two arms to <em>equal</em>; each had to be instrumented out. Skip
+    the guards and you "measure" no difference and wrongly conclude the fix does nothing.</p>
+  <div class="grid c2">
+    <div class="card"><h4><span class="ic">1</span>L1 cache dilution</h4><p>First load promotes KV to the DRAM tier; repeats hit L1, not raw_block. → N distinct prefixes, working set ≫ L1, round-robin. <em>Guard:</em> tier shows <code>0 L1</code>.</p></div>
+    <div class="card"><h4><span class="ic">2</span>pool starvation</h4><p><code>eviction-policy noop</code> + small L1 starves the staging pool → allocs fail → silent recompute. → <code>LRU</code> + pool sized for staging. <em>Guard:</em> 0 alloc failures.</p></div>
+    <div class="card"><h4><span class="ic">3</span>recompute masking</h4><p>At low <code>mq_timeout</code> slow loads abandon to GPU recompute, capping baseline TTFT. → sweep <code>mq_timeout</code>. <em>Guard:</em> external hit rate.</p></div>
+    <div class="card"><h4><span class="ic">4</span>iostat blindness</h4><p>Block-layer counters don't see io_uring_cmd passthrough — they read ~0 under load. → NVMe controller <code>Data Units Read</code>. <em>Guard:</em> device GB read.</p></div>
+  </div>
+  <div class="note win"><b class="tag">the payoff</b> The QD~1 fix is not a microbench curiosity: 4× lower
+    TTFT and 5× throughput on a normal 8B serving load, and the cache stays useful (83% vs 47% hit rate)
+    instead of thrashing into recompute.</div>
+</section>
+
+<section id="left">
+  <h2><span class="n">07</span>What's left — honest status</h2>
+  <div class="note warn"><b class="tag">still open</b> The end-to-end serving win above is the
+    <b>batched within-object</b> fix; the cross-object <code>load_parallelism</code> pool (§05) is validated
+    only on the NVMe→DRAM leg (the 2.8× probe) and not yet inside a live serving run. Neither result yet
+    isolates the DRAM→GPU copy or the all-rank-ready barrier.</div>
+  <ul>
+    <li><strong>Single-ring ceiling (~5&nbsp;GB/s, ~44% of device).</strong> eBPF shows the thread-pool
+      still funnels through one submitter; the per-command gap only drops 83&nbsp;→&nbsp;54&nbsp;µs.
+      Reaching device bandwidth needs multiple io_uring rings (true multi-submitter), or intra-object
+      pipelining in the engine — a follow-up prototype.</li>
+    <li><strong>Skip the DRAM bounce entirely.</strong> The real endgame is NVMe→GPU DMA (GPUDirect
+      Storage / cuFile, or io_uring into a GPU dma-buf), which removes both the software round-trips and
+      the host-memory copy the probe didn't even count.</li>
+    <li><strong>Storage must scale with TP.</strong> Per-rank objects are 1/TP the size, but the
+      aggregate crossing one shared drive is constant — so the "storage scales with GPUs" case
+      (per-rank drives / striping) is the decisive test for a production crossover claim.</li>
+    <li><strong>Frontier caveat.</strong> MLA models (DeepSeek-class) replicate KV per rank, so aggregate
+      offload bytes grow ×TP — offload may never cross on a shared tier there.</li>
+  </ul>
+</section>
+
+</main>
+
+<footer><div class="wrap">
+  <span>kvio case study — the QD~1 KV-load bottleneck</span>
+  <span>tracer: eBPF <code>nvme_uring_cmd_monitor</code> · engine: LMCache <code>raw_block</code> · fix: <code>1dafbb31</code></span>
+</div></footer>
+
+</body>
+</html>

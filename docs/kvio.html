@@ -337,23 +337,58 @@
 
 <section id="results">
   <h2><span class="n">08</span>Validated results</h2>
-  <p class="muted">On Latitude bare-metal (real Micron NVMe, io_uring_cmd passthrough on
-    <code>/dev/ng</code>), CPU-side compute, fake KV content.</p>
-  <div class="grid c3">
-    <div class="card"><h4>Real-geometry offload</h4>
-      <div class="stat g">8/8</div>
-      <p>Llama-3.1-8B, 32 MiB blocks, 2052 NVMe commands — exact cmds+bytes, WAPE 0.0000%, TV 0.0000</p></div>
-    <div class="card"><h4>Record → replay</h4>
-      <div class="stat g">18/18</div>
-      <p>replayed the recorded manifest, wire-validated exact-match, WAPE 0.0000%, TV 0.0000</p></div>
-    <div class="card"><h4>Asymmetric K/V capture</h4>
-      <div class="stat g">K=2×V</div>
-      <p>packed K16/V8 <code>components</code> matched the <code>EncodedKV</code> header exactly, byte-exact round-trip</p></div>
-  </div>
-  <div class="note win"><b class="tag">bottom line</b> The capture wiring, the cross-layer
-    <code>trace_id</code> join, the fidelity metrics, and record/replay are all correct and
-    byte-faithful on real NVMe. A real GPU-driven trace over a full dataset (real access
-    patterns/timing) is the remaining, hardware-gated step.</div>
+  <p class="muted">On an 8× H100 server with real Samsung Gen5 NVMe (io_uring_cmd passthrough on
+    <code>/dev/ng</code>), the projection was validated against a <b>real GPU-driven vLLM +
+    LMCache offload</b> — the previously hardware-gated step is now closed.</p>
+
+  <div class="note win"><b class="tag">real GPU, kernel-verified</b> vLLM (Llama-3.1-8B) on an
+    H100 offloading KV to <code>/dev/ng1n1</code>: <b>230/230 objects exact</b> (cmds <em>and</em>
+    bytes), WAPE 0.0000%, size-distribution TV 0.0000, over <b>58,729 real NVMe commands</b>
+    captured by the eBPF tracer and joined by <code>trace_id</code>. Roundtrip proof: repeated
+    prompts (temp 0) regenerated <em>identical</em> outputs from NVMe-loaded KV vs. recomputed KV.
+    The GPU-free generator, run at the same geometry, reproduced that device command stream
+    <em>indistinguishably</em>.</div>
+
+  <h3>Scale &amp; parity campaign — 7 models, 1B → 70B, TP 1/2/4</h3>
+  <p class="muted">Each cell: real GPU capture → wire-validate → replay the recorded manifest →
+    regenerate GPU-free from the calculator. Every real leg was exact.</p>
+  <div class="tbl"><table>
+    <thead><tr><th>Model</th><th>KV family</th><th>TP</th><th class="num">Objects</th>
+      <th class="num">Exact-match</th><th class="num">WAPE</th></tr></thead>
+    <tbody>
+      <tr><td>Llama-3.2-1B</td><td>GQA</td><td class="num">1</td><td class="num">230</td><td class="num"><span class="star">100.0%</span></td><td class="num">0.0000%</td></tr>
+      <tr><td>Llama-3.2-3B</td><td>GQA</td><td class="num">1</td><td class="num">230</td><td class="num"><span class="star">100.0%</span></td><td class="num">0.0000%</td></tr>
+      <tr><td>Qwen3-8B</td><td>GQA · head_dim</td><td class="num">1</td><td class="num">394</td><td class="num"><span class="star">100.0%</span></td><td class="num">0.0000%</td></tr>
+      <tr><td>Qwen3-14B</td><td>GQA · head_dim</td><td class="num">1</td><td class="num">392</td><td class="num"><span class="star">100.0%</span></td><td class="num">0.0000%</td></tr>
+      <tr><td>Llama-3.1-8B</td><td>GQA</td><td class="num">2</td><td class="num">456</td><td class="num"><span class="star">100.0%</span></td><td class="num">0.0000%</td></tr>
+      <tr><td>Llama-3.1-8B</td><td>GQA</td><td class="num">4</td><td class="num">912</td><td class="num"><span class="star">100.0%</span></td><td class="num">0.0000%</td></tr>
+      <tr><td>Llama-3.1-70B</td><td>GQA</td><td class="num">4</td><td class="num">916</td><td class="num"><span class="star">100.0%</span></td><td class="num">0.0000%</td></tr>
+    </tbody>
+  </table></div>
+
+  <div class="note info"><b class="tag">tensor-parallel sharding is exact</b> Under TP=<em>N</em>, vLLM
+    runs one KV worker per rank, so a logical chunk becomes <em>N</em> per-rank objects (same
+    chunk hash, distinct <code>kv_rank</code>): object count scales <b>×N</b>, per-rank payload
+    <b>÷N</b>. The 70B case shards its 80 MiB chunk into exactly <b>4 × 20 MiB</b> per-rank objects
+    (2 of 8 KV-heads each), 161 store / 160 load commands apiece — and the calculator-driven
+    generator now reproduces that sharded pattern byte-for-byte.</div>
+
+  <div class="note info"><b class="tag">load vs recompute — capacity, not speed</b> On this
+    H100 + Gen5-NVMe rig, loading KV from NVMe is still slower than recomputing prefill on the GPU,
+    but the gap <b>collapses with scale</b>: load ÷ recompute falls from ~<b>6.9×</b> (1B) to
+    ~<b>2.2×</b> (70B, TP4). The crossover — where offload beats recompute — lies beyond 70B, or
+    on slower GPUs / faster storage. <span class="muted">(n=2/cell, ~QD1; directional, not a
+    rigorous latency benchmark — tokenizers differ across families.)</span></div>
+
+  <div class="note win"><b class="tag">bottom line</b> Capture wiring, the cross-layer
+    <code>trace_id</code> join, fidelity metrics, and record/replay are byte-faithful on real NVMe,
+    now proven against a real GPU offload across 7 models and TP degrees. The GPU-free generator
+    and the recorded-manifest replay both reproduce the real device command stream exactly, so
+    anyone can simulate a model's KV-offload I/O — including its TP sharding — with <em>no GPU</em>.</div>
+  <div class="note info"><b class="tag">case study</b> The same eBPF attribution found a concrete
+    engineering win: LMCache's KV loader ran at ~11% of a Gen5 NVMe (single-threaded, QD~1). See
+    <a href="kvio-loadpath.html"><b>The QD~1 KV-load bottleneck — found with eBPF, fixed with parallel
+    loads</b></a> for the wire evidence, how to reproduce it, and the ~2.8× fix.</div>
 </section>
 
 </main>
