@@ -573,6 +573,39 @@ def emit(captures, args, out_file):
             cur += d
             add_point(ts, 1, ev(ts, T.TYPE_COUNTER, obj_ctr, counter=cur))
 
+        # ---- device activity overview (one row, coarse spans) --------
+        if cap.cmds:
+            ov_trk = uid(L, "nvme", "overview")
+            track(ov_trk, name="IO activity", parent=nv_proc, order=5)
+            BUCKET = 100_000_000                       # 100 ms
+            buckets = defaultdict(lambda: [0, 0])      # k -> [cmds, bytes]
+            for c in cap.cmds:
+                b_ = rel(int(c["ts"])) // BUCKET
+                buckets[b_][0] += 1
+                buckets[b_][1] += int(c.get("data_len", 0))
+            run_start = prev = None
+            run = [0, 0]
+            def flush(run_start, prev, run):
+                ts0 = run_start * BUCKET
+                ts1 = (prev + 1) * BUCKET
+                add_span(ts0, ts1,
+                         ev(ts0, T.TYPE_SLICE_BEGIN, ov_trk,
+                            f"{run[1] / 1e9:.1f} GB",
+                            args_={"cmds": run[0], "bytes": run[1],
+                                   "gbps": run[1] / ((ts1 - ts0) / 1e9) / 1e9}),
+                         ev(ts1, T.TYPE_SLICE_END, ov_trk))
+            for k in sorted(buckets):
+                if prev is not None and k > prev + 1:
+                    flush(run_start, prev, run)
+                    run_start, run = None, [0, 0]
+                if run_start is None:
+                    run_start = k
+                run[0] += buckets[k][0]
+                run[1] += buckets[k][1]
+                prev = k
+            if run_start is not None:
+                flush(run_start, prev, run)
+
         # ---- device command slices -----------------------------------
         per_role = defaultdict(list)
         for c in cap.cmds:
