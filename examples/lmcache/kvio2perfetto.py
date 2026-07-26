@@ -443,7 +443,7 @@ def emit(captures, args, out_file):
         if not args.no_slba_counter:
             for op in ("write", "read"):
                 ctr_slba[op] = uid(L, "nvme", "slba", op)
-                track(ctr_slba[op], name=f"slba ({op}s)", parent=nv_proc,
+                track(ctr_slba[op], name=f"{op}s slba", parent=nv_proc,
                       unit="LBA", order=92 if op == "write" else 93)
 
         cinfo = {"label": L, "base_ns": cap.base_ns,
