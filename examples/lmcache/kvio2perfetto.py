@@ -342,7 +342,8 @@ def emit(captures, args, out_file):
     emitted = defaultdict(int)
     T = TrackEvent
 
-    def track(uuid, name=None, parent=None, pid=None, pname=None, unit=None):
+    def track(uuid, name=None, parent=None, pid=None, pname=None, unit=None,
+              order=None):
         p = b.create_packet()
         d = p.track_descriptor
         d.uuid = uuid
@@ -353,8 +354,14 @@ def emit(captures, args, out_file):
         if pid is not None:
             d.process.pid = pid
             d.process.process_name = pname
+            # children carry sibling_order_rank; without EXPLICIT ordering the
+            # UI falls back to uuid order, which differs per label and makes
+            # A/B arms' collapsed summaries render different tracks first.
+            d.child_ordering = d.EXPLICIT
         if unit is not None:
             d.counter.unit_name = unit
+        if order is not None:
+            d.sibling_order_rank = order
         b.write_packet(p)
 
     def build_event(spec):
@@ -425,19 +432,19 @@ def emit(captures, args, out_file):
         track(lm_proc, pid=1000 + 3 * li, pname=f"LMCache {L}")
         track(nv_proc, pid=1001 + 3 * li, pname=f"NVMe {args.device} {L}")
         meta_trk = uid(L, "lmcache", "meta")
-        track(meta_trk, name="capture info", parent=lm_proc)
+        track(meta_trk, name="capture info", parent=lm_proc, order=0)
         obj_ctr = uid(L, "lmcache", "inflight")
-        track(obj_ctr, name="objects in flight", parent=lm_proc, unit="objects")
+        track(obj_ctr, name="objects in flight", parent=lm_proc, unit="objects", order=1)
         ctr_cmds = uid(L, "nvme", "cmds_ms")
-        track(ctr_cmds, name="cmds/ms", parent=nv_proc, unit="cmds")
+        track(ctr_cmds, name="cmds/ms", parent=nv_proc, unit="cmds", order=90)
         ctr_mbs = uid(L, "nvme", "mb_s")
-        track(ctr_mbs, name="MB/s", parent=nv_proc, unit="MB/s")
+        track(ctr_mbs, name="MB/s", parent=nv_proc, unit="MB/s", order=91)
         ctr_slba = {}
         if not args.no_slba_counter:
             for op in ("write", "read"):
                 ctr_slba[op] = uid(L, "nvme", "slba", op)
                 track(ctr_slba[op], name=f"slba ({op}s)", parent=nv_proc,
-                      unit="LBA")
+                      unit="LBA", order=92 if op == "write" else 93)
 
         cinfo = {"label": L, "base_ns": cap.base_ns,
                  "applied_base_ns": base,
@@ -469,7 +476,7 @@ def emit(captures, args, out_file):
             sv_uuid = {}
             for lane in range(sv_n):
                 sv_uuid[lane] = uid(L, "serving", "lane", lane)
-                track(sv_uuid[lane], name=f"requests.{lane}", parent=sv_proc)
+                track(sv_uuid[lane], name=f"requests.{lane}", parent=sv_proc, order=10 + lane)
             for lane, r in sv_laned:
                 b_ = rel(int(float(r["ts_start"]) * 1e9))
                 e_ = rel(int(float(r["ts"]) * 1e9))
@@ -515,7 +522,7 @@ def emit(captures, args, out_file):
         lane_uuid = {}
         for lane in range(nlanes):
             lane_uuid[lane] = uid(L, "lmcache", "lane", lane)
-            track(lane_uuid[lane], name=f"objects.{lane}", parent=lm_proc)
+            track(lane_uuid[lane], name=f"objects.{lane}", parent=lm_proc, order=10 + lane)
 
         flow_of = {}                                  # (tid, oi) -> flow id
         span_ix = {id(it): (b_, e_) for b_, e_, it in spans}
@@ -610,10 +617,12 @@ def emit(captures, args, out_file):
                 laned_cmds = [(0, e) for e in entries]
                 ncl = 1
             role_uuid = {}
+            role_rank = {"writes": 10, "reads": 40, "other": 70, "untagged": 80}
             for lane in range(ncl):
                 name = role if ncl == 1 else f"{role}.{lane}"
                 role_uuid[lane] = uid(L, "nvme", role, "lane", lane)
-                track(role_uuid[lane], name=name, parent=nv_proc)
+                track(role_uuid[lane], name=name, parent=nv_proc,
+                      order=role_rank.get(role, 85) + lane)
 
             for lane, (ts, dur, is_real, c) in laned_cmds:
                 dlen = int(c.get("data_len", 0))
