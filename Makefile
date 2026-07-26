@@ -96,6 +96,12 @@ $(NVME_SKEL): $(NVME_BPF_OBJ)
 $(NVME_TARGET): nvme_uring_cmd_monitor.c $(NVME_SKEL)
 	$(CC) $(CFLAGS) $(INCLUDES) nvme_uring_cmd_monitor.c $(LIBS_DIR) $(LIBS) -o $@
 
+# NVMe passthrough workload generator (firing test for the monitor's
+# completion probe on hosts with no LMCache stack). Needs liburing-dev;
+# not part of 'all' so the monitors build without it.
+nvme_uring_cmd_smoke: nvme_uring_cmd_smoke.c
+	$(CC) $(CFLAGS) nvme_uring_cmd_smoke.c -luring -o $@
+
 vmlinux.h:
 	@echo "Generating vmlinux.h from running kernel..."
 	@if [ -n "$(BPFTOOL)" ] && [ -x "$(BPFTOOL)" ]; then \
