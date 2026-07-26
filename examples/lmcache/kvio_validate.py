@@ -69,7 +69,12 @@ def main():
                     help="device LBA size; commands round up to this (match --lba-size)")
     args = ap.parse_args()
 
-    sem = {o["trace_id"]: o for o in load_jsonl(args.semantic)}
+    # Only successful store/load records project device I/O: schema-2 traces
+    # also carry a kvio_meta header line (no trace_id), delete records (no
+    # device I/O), and failed-op records (error field, partial/no I/O).
+    sem = {o["trace_id"]: o for o in load_jsonl(args.semantic)
+           if o.get("op") in ("store", "load")
+           and "trace_id" in o and "error" not in o}
 
     measured = defaultdict(lambda: {"cmds": 0, "bytes": 0, "sizes": []})
     untagged = {"cmds": 0, "bytes": 0}

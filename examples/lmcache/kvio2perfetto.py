@@ -81,21 +81,23 @@ def load_jsonl(path):
 
 
 def classify(rows):
-    """Split raw rows into (semantic, nvme_cmd, nvme_cmp, anchors, other)."""
-    sem, cmd, cmp_, anchors, other = [], [], [], [], 0
+    """Split rows into (semantic, nvme_cmd, nvme_cmp, anchors, meta, other)."""
+    sem, cmd, cmp_, anchors, meta, other = [], [], [], [], [], 0
     for r in rows:
         et = r.get("event_type")
         if et == "nvme_cmd":
             cmd.append(r)
-        elif et == "nvme_cmp":          # P2 completion records (forward seam)
+        elif et == "nvme_cmp":          # P2 completion records
             cmp_.append(r)
-        elif et == "clock_anchor":      # P2 wall-clock anchors (forward seam)
+        elif et == "clock_anchor":      # P2 wall-clock anchors
             anchors.append(r)
+        elif et == "kvio_meta":         # P3 self-describing header line
+            meta.append(r)
         elif et is None and "op" in r and "trace_id" in r:
             sem.append(r)
         else:
             other += 1
-    return sem, cmd, cmp_, anchors, other
+    return sem, cmd, cmp_, anchors, meta, other
 
 
 # ---------------------------------------------------------------- helpers
@@ -181,16 +183,21 @@ class Capture:
         self.warnings = []
         sem, cmds = [], []
         self.cmps, self.anchors = [], []
+        self.kmeta = None
         if sem_path:
             rows, sk = load_jsonl(sem_path)
-            s, c, p, a, o = classify(rows)
+            s, c, p, a, m, o = classify(rows)
             sem = s
+            if m:
+                self.kmeta = m[0]
             self.stats["sem_skipped"] = sk
             self.stats["other_lines"] += o + len(c)
         if ebpf_path:
             rows, sk = load_jsonl(ebpf_path)
-            s, c, p, a, o = classify(rows)
+            s, c, p, a, m, o = classify(rows)
             cmds, self.cmps, self.anchors = c, p, a
+            if m and self.kmeta is None:
+                self.kmeta = m[0]
             self.stats["ebpf_skipped"] = sk
             self.stats["other_lines"] += o + len(s)
         self.stats["sem_records"] = len(sem)
@@ -209,6 +216,13 @@ class Capture:
             self.sem_occs[tid].append(r)
         for occs in self.sem_occs.values():
             occs.sort(key=lambda r: float(r["ts"]))
+        insts = {r.get("instance") for rs in self.sem_occs.values() for r in rs}
+        insts.discard(None)
+        if len(insts) > 1:
+            self.warnings.append(
+                f"{len(insts)} producer instances share this trace file — "
+                "device-command attribution across instances is ambiguous "
+                "(same trace_id space)")
         for c in cmds:
             c["tid"] = int(c.get("user_data", 0)) >> 32
         self.cmds = cmds
@@ -412,29 +426,44 @@ def emit(captures, args, out_file):
                 track(ctr_slba[op], name=f"slba ({op}s)", parent=nv_proc,
                       unit="LBA")
 
+        cinfo = {"label": L, "base_ns": cap.base_ns,
+                 "applied_base_ns": base,
+                 "rebased": not args.no_rebase,
+                 "sem_file": stats["sem_file"],
+                 "ebpf_file": stats["ebpf_file"],
+                 "lba_bytes": cap.lba_bytes,
+                 "anchors": len(cap.anchors)}
+        if cap.kmeta:
+            for k in ("kvio_schema", "hostname", "device_path", "io_engine",
+                      "block_align", "header_bytes", "max_data_transfer_size"):
+                if cap.kmeta.get(k) is not None:
+                    cinfo[k] = cap.kmeta[k]
         add_point(0, 0, ev(0, T.TYPE_INSTANT, meta_trk, "capture_info",
-                           args_={"label": L, "base_ns": cap.base_ns,
-                                  "applied_base_ns": base,
-                                  "rebased": not args.no_rebase,
-                                  "sem_file": stats["sem_file"],
-                                  "ebpf_file": stats["ebpf_file"],
-                                  "lba_bytes": cap.lba_bytes,
-                                  "anchors": len(cap.anchors)}))
+                           args_=cinfo))
 
         # ---- object spans (one per semantic occurrence) --------------
         spans, instants = [], []
         for tid, occs in cap.sem_occs.items():
             for oi, r in enumerate(occs):
                 end_ns = rel(int(float(r["ts"]) * 1e9))
+                # schema-2 op-start: the true leading edge (includes Python
+                # pre-submit time the device stream cannot see); legacy
+                # captures fall back to the first device command.
+                t0 = r.get("ts_start")
+                start_ns = rel(int(float(t0) * 1e9)) if t0 is not None else None
                 cmds = [c for c in cap.cmds_by_tid.get(tid, [])
                         if cap.occ_of.get(id(c)) == oi]
                 if cmds:
-                    begin_ns = rel(min(int(c["ts"]) for c in cmds))
+                    first_cmd = rel(min(int(c["ts"]) for c in cmds))
                     max_cmd = rel(max(int(c["ts"]) for c in cmds))
+                    begin_ns = (min(start_ns, first_cmd)
+                                if start_ns is not None else first_cmd)
                     if end_ns < max_cmd:        # same clock: must not happen
                         stats["clock_anomalies"] += 1
                         end_ns = max_cmd
                     spans.append((begin_ns, end_ns, (tid, oi, r, cmds)))
+                elif start_ns is not None and end_ns > start_ns:
+                    spans.append((start_ns, end_ns, (tid, oi, r, cmds)))
                 else:
                     instants.append((end_ns, tid, oi, r))
 
@@ -454,11 +483,15 @@ def emit(captures, args, out_file):
             flow_of[(tid, oi)] = fid
             nbytes = int(r.get("bytes", 0))
             name = f"{r.get('op')} {r.get('part', 'kv')} {nbytes / 1048576:.1f}MiB"
+            if r.get("error"):
+                name += " FAILED"
             a = {"trace_id": tid, "op": r.get("op"),
                  "part": r.get("part"), "bytes": nbytes,
                  "slot_offset": int(r.get("slot_offset", 0)),
                  "rank": rank, "fmt": fmt, "chunk": sha, "n_cmds": len(cmds),
                  "op_latency_ms": (end_ns - begin_ns) / 1e6,
+                 "error": r.get("error"), "instance": r.get("instance"),
+                 "producer_pid": r.get("pid"),
                  "key": str(r.get("key", ""))[-24:]}
             if len(cap.sem_occs[tid]) > 1:
                 a["occurrence"] = oi
