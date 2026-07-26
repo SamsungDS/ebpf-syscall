@@ -176,9 +176,15 @@ def analyze_label(label, cmds, objs, info, serving, batch_gap_ns):
     R["qd1"] = {}
     for opn, gaps in sorted(gaps_by_op.items()):
         g50, g95 = pct(gaps, .5), pct(gaps, .95)
-        svc = pct([c["dur"] for c in tagged if c["real"]], .5) if n_real else None
         # QD~1 signature: consecutive submissions spaced by ~a full service
-        # time (submit-wait-submit) instead of back-to-back queuing.
+        # time (submit-wait-submit) instead of back-to-back queuing.  The
+        # reference service time must be the MATCHING op's: at QD1 the
+        # device is unloaded, so its latency is the FLOOR — compare against
+        # that op's minimum-quartile latency, not a mixed-op median.
+        cmd_op = "read" if opn == "load" else "write"
+        svc_pool = [c["dur"] for c in tagged
+                    if c["real"] and c["op"] == cmd_op]
+        svc = pct(svc_pool, .25) if svc_pool else None
         if svc:
             verdict = ("QD~1 (gap ~= service time — serialized)"
                        if g50 >= 0.5 * svc else "pipelined")
