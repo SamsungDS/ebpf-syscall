@@ -476,7 +476,7 @@ def emit(captures, args, out_file):
             sv_uuid = {}
             for lane in range(sv_n):
                 sv_uuid[lane] = uid(L, "serving", "lane", lane)
-                track(sv_uuid[lane], name=f"requests.{lane}", parent=sv_proc, order=10 + lane)
+                track(sv_uuid[lane], name=f"requests.{lane:03d}", parent=sv_proc, order=10 + lane)
             for lane, r in sv_laned:
                 b_ = rel(int(float(r["ts_start"]) * 1e9))
                 e_ = rel(int(float(r["ts"]) * 1e9))
@@ -520,9 +520,13 @@ def emit(captures, args, out_file):
 
         laned, nlanes = assign_lanes(spans)
         lane_uuid = {}
-        for lane in range(nlanes):
-            lane_uuid[lane] = uid(L, "lmcache", "lane", lane)
-            track(lane_uuid[lane], name=f"objects.{lane}", parent=lm_proc, order=10 + lane)
+        if nlanes:
+            obj_grp = uid(L, "lmcache", "objgroup")
+            track(obj_grp, name="objects", parent=lm_proc, order=10)
+            for lane in range(nlanes):
+                lane_uuid[lane] = uid(L, "lmcache", "lane", lane)
+                track(lane_uuid[lane], name=f"objects.{lane:03d}", parent=obj_grp,
+                      order=lane)
 
         flow_of = {}                                  # (tid, oi) -> flow id
         span_ix = {id(it): (b_, e_) for b_, e_, it in spans}
@@ -616,13 +620,23 @@ def emit(captures, args, out_file):
             else:
                 laned_cmds = [(0, e) for e in entries]
                 ncl = 1
-            role_uuid = {}
+            # one expandable group per role; zero-padded lane names so the
+            # UI's lexicographic sort equals numeric order (10 < 2 as strings
+            # otherwise), identical layout in every arm.
             role_rank = {"writes": 10, "reads": 40, "other": 70, "untagged": 80}
-            for lane in range(ncl):
-                name = role if ncl == 1 else f"{role}.{lane}"
-                role_uuid[lane] = uid(L, "nvme", role, "lane", lane)
-                track(role_uuid[lane], name=name, parent=nv_proc,
-                      order=role_rank.get(role, 85) + lane)
+            role_uuid = {}
+            if ncl == 1:
+                role_uuid[0] = uid(L, "nvme", role, "lane", 0)
+                track(role_uuid[0], name=role, parent=nv_proc,
+                      order=role_rank.get(role, 85))
+            else:
+                grp = uid(L, "nvme", role, "group")
+                track(grp, name=role, parent=nv_proc,
+                      order=role_rank.get(role, 85))
+                for lane in range(ncl):
+                    role_uuid[lane] = uid(L, "nvme", role, "lane", lane)
+                    track(role_uuid[lane], name=f"{role}.{lane:03d}", parent=grp,
+                          order=lane)
 
             for lane, (ts, dur, is_real, c) in laned_cmds:
                 dlen = int(c.get("data_len", 0))
