@@ -175,9 +175,10 @@ def pair_completions(cmds_ts, cmps_ts):
 class Capture:
     """One (label, semantic?, ebpf?) arm, joined."""
 
-    def __init__(self, label, sem_path, ebpf_path, args):
+    def __init__(self, label, sem_path, ebpf_path, serving_path, args):
         self.label = label
         self.stats = {"sem_file": sem_path or "-", "ebpf_file": ebpf_path or "-",
+                      "serving_file": serving_path or "-",
                       "sem_skipped": 0, "ebpf_skipped": 0, "other_lines": 0,
                       "dup_trace_id": 0, "clock_anomalies": 0}
         self.warnings = []
@@ -200,6 +201,17 @@ class Capture:
                 self.kmeta = m[0]
             self.stats["ebpf_skipped"] = sk
             self.stats["other_lines"] += o + len(s)
+        # serving-layer request spans: any JSONL whose records carry
+        # ts_start + ts (monotonic seconds) and an op/name — the E6 driver
+        # emits {"op":"recompute"|"load_ttft",...} so both arms of the
+        # crossover render side by side above the device activity.
+        self.serving = []
+        if serving_path:
+            rows, sk = load_jsonl(serving_path)
+            self.serving = [r for r in rows
+                            if "ts" in r and "ts_start" in r]
+            self.stats["serving_skipped"] = sk + (len(rows) - len(self.serving))
+        self.stats["serving_spans"] = len(self.serving)
         self.stats["sem_records"] = len(sem)
         self.stats["nvme_cmd_lines"] = len(cmds)
         self.stats["nvme_cmp_lines"] = len(self.cmps)
@@ -316,6 +328,7 @@ class Capture:
         ts_candidates = [int(c["ts"]) for c in self.cmds]
         for occs in self.sem_occs.values():
             ts_candidates += [int(float(r["ts"]) * 1e9) for r in occs]
+        ts_candidates += [int(float(r["ts_start"]) * 1e9) for r in self.serving]
         self.base_ns = min(ts_candidates) if ts_candidates else 0
 
 
@@ -409,8 +422,8 @@ def emit(captures, args, out_file):
         # ---- fixed track descriptors ---------------------------------
         lm_proc = uid(L, "lmcache", "proc")
         nv_proc = uid(L, "nvme", "proc")
-        track(lm_proc, pid=1000 + 2 * li, pname=f"LMCache {L}")
-        track(nv_proc, pid=1001 + 2 * li, pname=f"NVMe {args.device} {L}")
+        track(lm_proc, pid=1000 + 3 * li, pname=f"LMCache {L}")
+        track(nv_proc, pid=1001 + 3 * li, pname=f"NVMe {args.device} {L}")
         meta_trk = uid(L, "lmcache", "meta")
         track(meta_trk, name="capture info", parent=lm_proc)
         obj_ctr = uid(L, "lmcache", "inflight")
@@ -440,6 +453,37 @@ def emit(captures, args, out_file):
                     cinfo[k] = cap.kmeta[k]
         add_point(0, 0, ev(0, T.TYPE_INSTANT, meta_trk, "capture_info",
                            args_=cinfo))
+
+        # ---- serving request spans -----------------------------------
+        if cap.serving:
+            sv_proc = uid(L, "serving", "proc")
+            track(sv_proc, pid=1002 + 3 * li, pname=f"Serving {L}")
+            sv_spans = []
+            for r in cap.serving:
+                b_ = rel(int(float(r["ts_start"]) * 1e9))
+                e_ = rel(int(float(r["ts"]) * 1e9))
+                if e_ <= b_:
+                    e_ = b_ + 1
+                sv_spans.append((b_, e_, r))
+            sv_laned, sv_n = assign_lanes(sv_spans)
+            sv_uuid = {}
+            for lane in range(sv_n):
+                sv_uuid[lane] = uid(L, "serving", "lane", lane)
+                track(sv_uuid[lane], name=f"requests.{lane}", parent=sv_proc)
+            for lane, r in sv_laned:
+                b_ = rel(int(float(r["ts_start"]) * 1e9))
+                e_ = rel(int(float(r["ts"]) * 1e9))
+                if e_ <= b_:
+                    e_ = b_ + 1
+                nm = r.get("op") or r.get("name") or "request"
+                add_span(b_, e_,
+                         ev(b_, T.TYPE_SLICE_BEGIN, sv_uuid[lane], str(nm),
+                            args_={"op": r.get("op"),
+                                   "tokens": r.get("tokens"),
+                                   "request_id": r.get("request_id"),
+                                   "ms": (e_ - b_) / 1e6}),
+                         ev(e_, T.TYPE_SLICE_END, sv_uuid[lane]))
+                emitted["serving_spans"] += 1
 
         # ---- object spans (one per semantic occurrence) --------------
         spans, instants = [], []
@@ -677,11 +721,14 @@ def main():
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--sem", help="LMCache semantic JSONL")
     ap.add_argument("--ebpf", help="eBPF nvme_uring_cmd_monitor JSONL")
+    ap.add_argument("--serving", help="serving-layer request-span JSONL "
+                    "(records with op, ts_start, ts in monotonic seconds; "
+                    "e.g. recompute vs load TTFT spans from a benchmark driver)")
     ap.add_argument("--label", default="capture", help="label for the single capture")
     ap.add_argument("--merge", action="append", default=[],
-                    metavar="LABEL=SEM,EBPF",
-                    help="add an arm: label=sem.jsonl,ebpf.jsonl (repeatable; "
-                         "use '-' to omit one side)")
+                    metavar="LABEL=SEM,EBPF[,SERVING]",
+                    help="add an arm: label=sem.jsonl,ebpf.jsonl[,serving.jsonl] "
+                         "(repeatable; use '-' to omit a component)")
     ap.add_argument("-o", "--out", required=True,
                     help="output .pftrace (.gz suffix gzips)")
     ap.add_argument("--no-rebase", action="store_true",
@@ -704,13 +751,13 @@ def main():
     if args.merge:
         for spec in args.merge:
             label, _, files = spec.partition("=")
-            semf, _, ebpff = files.partition(",")
-            arms.append((label, None if semf in ("", "-") else semf,
-                         None if ebpff in ("", "-") else ebpff))
+            parts = (files.split(",") + ["", ""])[:3]
+            arms.append(tuple([label] + [None if p in ("", "-") else p
+                                         for p in parts]))
     else:
-        arms.append((args.label, args.sem, args.ebpf))
-    if not any(s or e for _, s, e in arms):
-        ap.error("need --sem/--ebpf or --merge")
+        arms.append((args.label, args.sem, args.ebpf, args.serving))
+    if not any(s or e or v for _, s, e, v in arms):
+        ap.error("need --sem/--ebpf/--serving or --merge")
 
     try:
         import perfetto  # noqa: F401
@@ -719,7 +766,7 @@ def main():
                  "for a zero-dependency fallback see the archived JSON spike "
                  "converter in the kvio evidence bundle")
 
-    captures = [Capture(label, s, e, args) for label, s, e in arms]
+    captures = [Capture(label, s, e, v, args) for label, s, e, v in arms]
 
     opener = gzip.open if args.out.endswith(".gz") else open
     with opener(args.out, "wb") as f:
@@ -762,7 +809,8 @@ def main():
                   "Spans were segmented by op-end time; treat with care.")
     print(f"  emitted: {emitted.get('object_spans', 0)} object spans, "
           f"{emitted.get('object_instants', 0)} object instants, "
-          f"{emitted.get('cmd_slices', 0)} command slices")
+          f"{emitted.get('cmd_slices', 0)} command slices, "
+          f"{emitted.get('serving_spans', 0)} serving spans")
     total_sem = sum(s["sem_records"] - s["sem_skipped"] * 0
                     for s in (c.stats for c in captures))
     total_sem = sum(len(rs) for c in captures for rs in c.sem_occs.values())

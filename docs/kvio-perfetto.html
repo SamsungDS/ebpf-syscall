@@ -1,0 +1,262 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>kvio × Perfetto — deep introspection and visualization of KV-offload NVMe IO</title>
+<style>
+  :root{
+    --bg:#0b0d12; --bg2:#0e1117; --surface:#12161f; --surface2:#161b26;
+    --border:#1f2733; --border2:#2a3441;
+    --text:#c7d0db; --head:#e8eef5; --muted:#7e8a99; --faint:#5b6675;
+    --cyan:#22d3ee; --sky:#38bdf8; --blue:#3b82f6;
+    --green:#4ade80; --red:#f87171; --amber:#fbbf24; --violet:#a78bfa;
+    --mono:ui-monospace,"SF Mono",SFMono-Regular,Menlo,Consolas,"Liberation Mono",monospace;
+    --sans:-apple-system,BlinkMacSystemFont,"Segoe UI",Inter,Roboto,"Helvetica Neue",Arial,sans-serif;
+  }
+  *{box-sizing:border-box}
+  html{scroll-behavior:smooth}
+  body{margin:0;background:var(--bg);color:var(--text);font-family:var(--sans);
+    font-size:16px;line-height:1.65;-webkit-font-smoothing:antialiased}
+  a{color:var(--sky);text-decoration:none}
+  a:hover{color:var(--cyan);text-decoration:underline}
+  code,kbd,pre{font-family:var(--mono)}
+  .wrap{max-width:1000px;margin:0 auto;padding:0 24px}
+  header.hero{
+    border-bottom:1px solid var(--border);
+    background:
+      radial-gradient(900px 380px at 12% -8%, rgba(34,211,238,.10), transparent 60%),
+      radial-gradient(800px 360px at 92% -12%, rgba(248,113,113,.10), transparent 55%),
+      linear-gradient(180deg,var(--bg2),var(--bg));
+  }
+  .hero .wrap{padding-top:52px;padding-bottom:40px}
+  .eyebrow{display:inline-flex;align-items:center;gap:8px;font-family:var(--mono);
+    font-size:12.5px;letter-spacing:.12em;text-transform:uppercase;color:var(--cyan);
+    border:1px solid var(--border2);border-radius:999px;padding:5px 12px;background:rgba(34,211,238,.05)}
+  h1{font-size:2.4rem;line-height:1.12;margin:18px 0 10px;color:var(--head);
+    letter-spacing:-.02em;font-weight:740}
+  h1 .mono{font-family:var(--mono);background:linear-gradient(90deg,var(--cyan),var(--sky));
+    -webkit-background-clip:text;background-clip:text;color:transparent}
+  .sub{font-size:1.18rem;color:var(--muted);max-width:76ch;margin:0 0 22px}
+  .meta{display:flex;flex-wrap:wrap;gap:8px 10px;margin-top:8px}
+  .pill{font-family:var(--mono);font-size:12.5px;color:var(--text);
+    background:var(--surface);border:1px solid var(--border);border-radius:7px;padding:5px 10px}
+  .pill b{color:var(--sky);font-weight:600}
+  .pill a{color:var(--text)} .pill a:hover{color:var(--cyan)}
+  nav.toc{position:sticky;top:0;z-index:20;background:rgba(11,13,18,.86);
+    backdrop-filter:blur(10px);border-bottom:1px solid var(--border)}
+  nav.toc .wrap{display:flex;gap:4px;overflow-x:auto;padding:10px 24px}
+  nav.toc a{font-size:13.5px;color:var(--muted);padding:6px 11px;border-radius:7px;white-space:nowrap}
+  nav.toc a:hover{color:var(--head);background:var(--surface);text-decoration:none}
+  section{padding:44px 0 6px;border-bottom:1px solid var(--border)}
+  section:last-of-type{border-bottom:none}
+  h2{font-size:1.62rem;color:var(--head);margin:0 0 6px;letter-spacing:-.01em;font-weight:680}
+  h2 .n{font-family:var(--mono);color:var(--faint);font-size:1.05rem;margin-right:12px;font-weight:500}
+  h3{font-size:1.16rem;color:var(--head);margin:30px 0 8px;font-weight:640}
+  p{margin:12px 0}
+  .lead{font-size:1.06rem;color:var(--text)}
+  strong{color:var(--head)}
+  ul,ol{padding-left:22px}
+  li{margin:7px 0}
+  .muted{color:var(--muted)}
+  .note{border:1px solid var(--border2);border-left-width:3px;border-radius:8px;
+    padding:14px 16px;margin:18px 0;background:var(--surface);font-size:.97rem}
+  .note.win{border-left-color:var(--green);background:rgba(74,222,128,.05)}
+  .note.warn{border-left-color:var(--amber);background:rgba(251,191,36,.05)}
+  .note.info{border-left-color:var(--sky);background:rgba(56,189,248,.05)}
+  .note.bug{border-left-color:var(--red);background:rgba(248,113,113,.05)}
+  .note b.tag{font-family:var(--mono);font-size:11.5px;letter-spacing:.08em;text-transform:uppercase;
+    display:inline-block;margin-right:8px}
+  .win b.tag{color:var(--green)} .warn b.tag{color:var(--amber)}
+  .info b.tag{color:var(--sky)} .bug b.tag{color:var(--red)}
+  pre{background:var(--bg2);border:1px solid var(--border);border-radius:10px;
+    padding:0;margin:16px 0;overflow:hidden}
+  pre .bar{display:flex;align-items:center;gap:8px;padding:8px 14px;border-bottom:1px solid var(--border);
+    background:var(--surface);font-family:var(--mono);font-size:12px;color:var(--muted)}
+  pre .bar .dot{width:11px;height:11px;border-radius:50%;background:var(--border2)}
+  pre code{display:block;padding:14px 16px;overflow-x:auto;font-size:13px;line-height:1.6;color:#cbd5e1}
+  pre code .c{color:var(--faint)}
+  pre code .k{color:var(--cyan)}
+  pre code .s{color:var(--green)}
+  pre code .v{color:var(--amber)}
+  pre code .p{color:var(--sky)}
+  :not(pre)>code{background:var(--surface2);border:1px solid var(--border);border-radius:5px;
+    padding:1.5px 6px;font-size:13px;color:#dbe4ee}
+  .tbl{overflow-x:auto;margin:18px 0;border:1px solid var(--border);border-radius:10px}
+  table{border-collapse:collapse;width:100%;font-size:13.5px}
+  th,td{padding:9px 13px;text-align:left;border-bottom:1px solid var(--border);vertical-align:top}
+  thead th{background:var(--surface);color:var(--muted);font-weight:600;
+    font-family:var(--mono);font-size:11.5px;letter-spacing:.04em;text-transform:uppercase;
+    position:sticky;top:0}
+  tbody tr:last-child td{border-bottom:none}
+  tbody tr:hover{background:rgba(56,189,248,.04)}
+  td.num{font-family:var(--mono);text-align:right}
+  .pos{color:var(--green);font-weight:600} .neg{color:var(--red);font-weight:600}
+  .flat{color:var(--muted)}
+  td .star{color:var(--cyan)}
+  .grid{display:grid;gap:14px;margin:18px 0}
+  .grid.c2{grid-template-columns:repeat(2,1fr)}
+  .grid.c3{grid-template-columns:repeat(3,1fr)}
+  .card{background:var(--surface);border:1px solid var(--border);border-radius:11px;padding:16px 17px}
+  .card h4{margin:0 0 6px;color:var(--head);font-size:1.02rem;display:flex;align-items:center;gap:9px}
+  .card h4 .ic{font-family:var(--mono);color:var(--cyan);font-size:.92rem}
+  .card p{margin:6px 0 0;font-size:.93rem;color:var(--muted)}
+  .stat{font-family:var(--mono);font-size:1.9rem;font-weight:700;color:var(--head);letter-spacing:-.02em}
+  .stat.g{color:var(--green)} .stat.r{color:var(--red)} .stat .u{font-size:1rem;color:var(--muted);font-weight:500}
+  footer{padding:34px 0 60px;color:var(--faint);font-size:13px}
+  footer .wrap{display:flex;flex-wrap:wrap;gap:6px 18px;justify-content:space-between}
+  hr.soft{border:none;border-top:1px solid var(--border);margin:26px 0}
+  @media(max-width:720px){ h1{font-size:1.8rem}.grid.c2,.grid.c3{grid-template-columns:1fr} }
+</style>
+
+</head>
+<body>
+
+<header><div class="wrap">
+  <h1>kvio × <span class="mono">Perfetto</span><br>see every KV object and every NVMe command on one timeline</h1>
+  <p class="muted">Convert kvio's cross-layer traces — LMCache semantic object ops, eBPF NVMe passthrough
+    commands with device completions, and serving-layer request spans — into a Perfetto trace you drag onto
+    <a href="https://ui.perfetto.dev">ui.perfetto.dev</a> (processing is local to your browser), plus a
+    one-command SQL metrics report.</p>
+</div></header>
+
+<nav class="toc"><div class="wrap">
+  <a href="#why">Why</a>
+  <a href="#quickstart">Quickstart</a>
+  <a href="#timeline">The timeline</a>
+  <a href="#report">The report</a>
+  <a href="#schema">Trace schema</a>
+  <a href="#cookbook">SQL cookbook</a>
+</div></nav>
+
+<main class="wrap">
+
+<section id="why">
+  <h2><span class="n">01</span>Why a converter is the only way in</h2>
+  <p>kvio IO is <code>io_uring_cmd</code> NVMe passthrough on <code>/dev/ng*</code>, which bypasses the block
+    layer — Perfetto's stock ftrace/block ingestion (and <code>iostat</code>) see none of it. The kernel's nvme
+    driver tracepoints do fire for passthrough, but carry no <code>user_data</code> — so they cannot be joined to
+    KV objects. The eBPF tracer <code>nvme_uring_cmd_monitor</code> is <b>the only source that carries
+    trace_id</b> (<code>user_data &gt;&gt; 32</code>, planted by LMCache's raw_block engine), and
+    <code>kvio2perfetto.py</code> is the bridge from it to a semantically-joined timeline.</p>
+  <div class="grid c3">
+    <div class="card"><h4><span class="ic">⚲</span>found visually</h4><p>The QD~1 load bug (83&nbsp;µs submission
+      gaps, worth 4–15× TTFT) is one lonely command slice at a time instead of a dense band.</p></div>
+    <div class="card"><h4><span class="ic">⚑</span>flows</h4><p>Arrows tie each KV object span to its first and
+      last device command — click an object, see its IO.</p></div>
+    <div class="card"><h4><span class="ic">◷</span>real durations</h4><p>The tracer's device-completion probe
+      (fentry on <code>nvme_uring_cmd_end_io</code> — immune to CQ overflow) gives every command its true
+      latency; queue depth becomes visible as slice overlap.</p></div>
+  </div>
+</section>
+
+<section id="quickstart">
+  <h2><span class="n">02</span>Quickstart</h2>
+  <pre><div class="bar"><span class="dot"></span>capture → convert → view</div><code><span class="c"># 1. capture: eBPF device stream (+ completions) and the LMCache semantic trace</span>
+sudo ./nvme_uring_cmd_monitor --jsonl ebpf.jsonl --lba-size 4096 &amp;
+LMCACHE_KVIO_TRACE=sem.jsonl &lt;run your LMCache raw_block workload&gt;
+
+<span class="c"># 2. convert (pip install perfetto)</span>
+python3 examples/lmcache/kvio2perfetto.py --sem sem.jsonl --ebpf ebpf.jsonl -o kv.pftrace
+
+<span class="c"># 3. view: drag kv.pftrace onto https://ui.perfetto.dev  (local-only WASM)</span>
+<span class="c"># 4. metrics report</span>
+python3 examples/lmcache/kvio_tp_report.py kv.pftrace</code></pre>
+  <div class="note info"><b class="tag">A/B overlays</b> <code>--merge stock=sem1,ebpf1 --merge
+    batched=sem2,ebpf2</code> renders arms as separate process groups, each rebased to t=0 — stock-vs-batched or
+    real-vs-replay side by side. A third component per arm (<code>label=sem,ebpf,serving.jsonl</code>) adds
+    serving-layer request spans (e.g. recompute-vs-load TTFT) above the device activity.</div>
+  <div class="note warn"><b class="tag">wedged runs</b> The converter tolerates a truncated final line and
+    converts still-growing files — converting the live JSONL is the supported way to look inside a hung run.</div>
+</section>
+
+<section id="timeline">
+  <h2><span class="n">03</span>What the timeline shows</h2>
+  <div class="tbl"><table>
+    <thead><tr><th>process</th><th>tracks</th><th>content</th></tr></thead>
+    <tbody>
+      <tr><td class="mono">Serving &lt;label&gt;</td><td class="mono">requests.N</td>
+        <td>request spans from a driver (op, tokens, TTFT) — the crossover view</td></tr>
+      <tr><td class="mono">LMCache &lt;label&gt;</td><td class="mono">objects.N</td>
+        <td>one span per KV object op: store/load/delete, span = op-start → op-end (schema-2) with
+          pre-submit time visible; args: trace_id, rank/fmt, chunk, bytes, n_cmds, error</td></tr>
+      <tr><td class="mono">NVMe &lt;dev&gt; &lt;label&gt;</td><td class="mono">writes.N / reads.N / untagged</td>
+        <td>one slice per command, real duration when completions were captured (lanes = live queue depth);
+          args: slba, data_len, trace_id, role=header|payload</td></tr>
+      <tr><td colspan="2" class="mono">counters</td>
+        <td>cmds/ms, MB/s, slba-over-time (space axis: ramps = sequential, sawtooth = slot reuse),
+          objects in flight</td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<section id="report">
+  <h2><span class="n">04</span>The metrics report (P4 pack)</h2>
+  <p><code>kvio_tp_report.py</code> runs the canned analyses over any converted trace — per label, with paired
+    A/B diffs when arms share object keys:</p>
+  <ul>
+    <li><b>QD1 detector</b> — per-object submission-gap p50/p95 vs device service time; flags the serialized
+      load path in one line (verified: fires on the original buggy captures, and on a stock core today).</li>
+    <li><b>Per-command latency</b> p50/p95/p99 and <b>achieved QD</b> (%time at QD≤1) — needs the completion
+      probe.</li>
+    <li><b>Object spans</b> — device window, end-to-end, pre-submit cost; effective MB/s per op.</li>
+    <li><b>Inferred batches</b> — submission clusters split on a gap threshold; contrasts stock vs batched
+      arms with no producer-side events.</li>
+    <li><b>TP all-rank-ready barrier</b> — per chunk, max−min object end across shards (grouped by the key
+      fmt field).</li>
+    <li><b>Space axis</b> — LBA reuse, write sequentiality, header-write share. <b>Throughput</b>, untagged
+      share, failed ops, serving-span percentiles.</li>
+  </ul>
+  <p><code>--json</code> emits the same metrics machine-readably (campaign drivers consume this).</p>
+</section>
+
+<section id="schema">
+  <h2><span class="n">05</span>Trace schema (what the producers emit)</h2>
+  <div class="tbl"><table>
+    <thead><tr><th>line</th><th>source</th><th>fields</th></tr></thead>
+    <tbody>
+      <tr><td class="mono">kvio_meta</td><td>LMCache (schema 2)</td>
+        <td>schema, hostname, pid, instance, device_path, slot/align/MDTS geometry, engine,
+          monotonic+realtime clock anchors — the file is self-contained</td></tr>
+      <tr><td class="mono">store/load/delete</td><td>LMCache</td>
+        <td>trace_id, key, object_id, part, bytes, slot_offset, ts_start (op begin), ts (op end),
+          pid, instance, error (failed ops), components (K/V split)</td></tr>
+      <tr><td class="mono">nvme_cmd</td><td>eBPF tracer</td>
+        <td>ts (monotonic ns), user_data, opcode, nsid, slba, nlb, data_len, rdev, comm</td></tr>
+      <tr><td class="mono">nvme_cmp</td><td>eBPF tracer</td>
+        <td>ts, user_data, lat_ns (kernel-computed), err, hwq, cid — paired in kernel via the ioucmd
+          pointer, CQ-overflow-immune</td></tr>
+      <tr><td class="mono">cq_overflow / clock_anchor / drops</td><td>eBPF tracer</td>
+        <td>overflowed CQEs; periodic monotonic↔realtime anchors; final ringbuf-drop count</td></tr>
+    </tbody>
+  </table></div>
+  <div class="note info"><b class="tag">clocks</b> Semantic <code>time.monotonic()</code> and eBPF
+    <code>bpf_ktime_get_ns()</code> are the <em>same</em> CLOCK_MONOTONIC — no offset estimation exists or is
+    needed; semantic seconds land directly on the ns axis. Cross-boot arms are each rebased to t=0.</div>
+</section>
+
+<section id="cookbook">
+  <h2><span class="n">06</span>SQL cookbook (trace_processor)</h2>
+  <pre><div class="bar"><span class="dot"></span>python -c … or trace_processor_shell kv.pftrace</div><code><span class="c">-- every KV object with its device-command count and span</span>
+select s.name, s.dur/1e6 ms, extract_arg(s.arg_set_id,'debug.n_cmds') cmds
+from slice s join process_track pt on s.track_id=pt.id
+where pt.name like 'objects%' order by s.dur desc limit 20;
+
+<span class="c">-- real per-command latency percentiles</span>
+select count(*), min(dur), max(dur) from slice s
+join process_track pt on s.track_id=pt.id
+where pt.name like 'reads%' and extract_arg(s.arg_set_id,'debug.real_dur')=1;
+
+<span class="c">-- flows: which commands belong to object trace_id 42</span>
+select * from slice where extract_arg(arg_set_id,'debug.trace_id')=42;</code></pre>
+</section>
+
+</main>
+
+<footer><div class="wrap">
+  <span>kvio × Perfetto — cross-layer KV-offload introspection</span>
+  <span>tools: <code>kvio2perfetto.py</code> · <code>kvio_tp_report.py</code> · <code>nvme_uring_cmd_monitor</code></span>
+</div></footer>
+
+</body>
+</html>
