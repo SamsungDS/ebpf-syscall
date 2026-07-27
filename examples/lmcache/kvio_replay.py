@@ -19,10 +19,55 @@ Two input modes:
     command stream is reissued. Geometry is content-independent, so replaying
     payload_bytes of zeros reproduces the recorded commands byte-for-byte.
 """
-import argparse, json, os, sys, importlib.util, time
+import argparse, json, os, sys, importlib.util, threading, time
 
 SRC = os.environ.get("KVIO_SRC", "/home/ubuntu/lmcache-src")
 sys.path.insert(0, SRC)
+
+
+class ProgressWatchdog:
+    """Abort if a single store/load makes no progress for `timeout` seconds.
+
+    put_many / load_many_into are synchronous FFI calls into the Rust io_uring
+    engine; a rare device/engine wedge would otherwise hang the whole replay
+    indefinitely (observed once: a 70B-manifest replay sat ~16h at object 253
+    during an unattended campaign). This watchdog turns that silent 16h wedge
+    into a loud few-second abort that names the stuck object, so a campaign
+    driver can time it out and move on instead of losing a run.
+    """
+
+    def __init__(self, timeout_s):
+        self.timeout = float(timeout_s)
+        self.last = time.monotonic()
+        self.label = "init"
+        self._stop = threading.Event()
+        self._t = threading.Thread(target=self._run, daemon=True,
+                                   name="kvio-replay-watchdog")
+
+    def start(self):
+        if self.timeout > 0:
+            self._t.start()
+        return self
+
+    def tick(self, label):
+        self.last = time.monotonic()
+        self.label = label
+
+    def stop(self):
+        self._stop.set()
+
+    def _run(self):
+        poll = max(1.0, min(5.0, self.timeout / 4))
+        while not self._stop.wait(poll):
+            stuck = time.monotonic() - self.last
+            if stuck > self.timeout:
+                sys.stderr.write(
+                    f"\n[kvio_replay WATCHDOG] no progress for {stuck:.0f}s "
+                    f"(> {self.timeout:.0f}s) at '{self.label}' — aborting so the "
+                    f"run does not hang. This is the rare io_uring_cmd wedge; "
+                    f"re-run this manifest (it is not a projection error).\n")
+                sys.stderr.flush()
+                os._exit(42)
 
 import kvio_plan
 from lmcache.v1.storage_backend.raw_block import RawBlockCore, RawBlockCoreConfig
@@ -100,6 +145,7 @@ def run_record(args):
     store_ms = [[] for _ in range(n)]
     load_ms = [[] for _ in range(n)]
     passes = args.warmup + args.iters
+    wd = ProgressWatchdog(args.op_timeout).start()
     for it in range(passes):
         # fresh keys per pass so each store issues real device I/O
         keys = [encode_object_key(rbtu.make_object_key(it * n + i, model_name="replay"))
@@ -107,15 +153,18 @@ def run_record(args):
         st = [0.0] * n
         # store-all ...
         for i in range(n):
+            wd.tick(f"pass {it} store obj{i}/{n}")
             obj = rbtu.make_memory_obj(bufs[i])
             t0 = time.perf_counter(); core.put_many([keys[i]], [obj]); t1 = time.perf_counter()
             st[i] = (t1 - t0) * 1e3
         # ... then load-all (the recorded access pattern)
         for i in range(n):
+            wd.tick(f"pass {it} load obj{i}/{n}")
             empty = rbtu.make_empty_memory_obj(payloads[i])
             t2 = time.perf_counter(); core.load_many_into([keys[i].encoded], [empty]); t3 = time.perf_counter()
             if it >= args.warmup:
                 store_ms[i].append(st[i]); load_ms[i].append((t3 - t2) * 1e3)
+    wd.stop()
     try:
         core.close()
     except Exception:
@@ -158,6 +207,10 @@ def main():
     ap.add_argument("--odirect", action="store_true",
                     help="bypass the page cache (real media latency for stores)")
     ap.add_argument("--capacity-gb", type=int, default=8)
+    ap.add_argument("--op-timeout", type=float, default=120,
+                    help="watchdog: abort if any single store/load makes no "
+                         "progress for this many seconds (0 disables). Guards "
+                         "against the rare io_uring_cmd wedge.")
     args = ap.parse_args()
 
     if args.record:
@@ -185,14 +238,18 @@ def main():
             for i in range(args.slots)]
 
     store_ms, load_ms = [], []
+    wd = ProgressWatchdog(args.op_timeout).start()
     for n in range(args.warmup + args.iters):
+        wd.tick(f"iter {n} store")
         k = keys[n % args.slots]
         obj = rbtu.make_memory_obj(buf)
         t0 = time.perf_counter(); core.put_many([k], [obj]); t1 = time.perf_counter()
+        wd.tick(f"iter {n} load")
         empty = rbtu.make_empty_memory_obj(payload)
         t2 = time.perf_counter(); core.load_many_into([k.encoded], [empty]); t3 = time.perf_counter()
         if n >= args.warmup:
             store_ms.append((t1 - t0) * 1e3); load_ms.append((t3 - t2) * 1e3)
+    wd.stop()
     try:
         core.close()
     except Exception:
