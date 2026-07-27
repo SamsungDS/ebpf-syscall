@@ -115,6 +115,9 @@ $(NVMETP_TARGET): nvme_tp_monitor.c $(NVMETP_SKEL)
 nvme_uring_cmd_smoke: nvme_uring_cmd_smoke.c
 	$(CC) $(CFLAGS) nvme_uring_cmd_smoke.c -luring -o $@
 
+nvme_kv_smoke: nvme_kv_smoke.c
+	$(CC) $(CFLAGS) nvme_kv_smoke.c -luring -o $@
+
 vmlinux.h:
 	@echo "Generating vmlinux.h from running kernel..."
 	@if [ -n "$(BPFTOOL)" ] && [ -x "$(BPFTOOL)" ]; then \
@@ -146,7 +149,7 @@ clean:
 	rm -f $(MMAP_TARGET) $(MMAP_BPF_OBJ) $(MMAP_SKEL)
 	rm -f $(IOU_TARGET) $(IOU_BPF_OBJ) $(IOU_SKEL)
 	rm -f $(NVME_TARGET) $(NVME_BPF_OBJ) $(NVME_SKEL)
-	rm -f $(NVMETP_TARGET) $(NVMETP_BPF_OBJ) $(NVMETP_SKEL) nvme_uring_cmd_smoke
+	rm -f $(NVMETP_TARGET) $(NVMETP_BPF_OBJ) $(NVMETP_SKEL) nvme_uring_cmd_smoke nvme_kv_smoke
 	rm -rf $(LIBBPF_DIR)
 
 help:
