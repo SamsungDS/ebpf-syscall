@@ -139,6 +139,7 @@
   <a href="#repro">Reproduce</a>
   <a href="#fix">The fix</a>
   <a href="#e2e">End to end</a>
+  <a href="#seeit">See it</a>
   <a href="#left">What's left</a>
 </div></nav>
 
@@ -326,8 +327,53 @@ sudo nvme_uring_cmd_monitor --jsonl <span class="v">trace.jsonl</span> --lba-siz
     instead of thrashing into recompute.</div>
 </section>
 
+<section id="seeit">
+  <h2><span class="n">07</span>See it — the crossover on one timeline</h2>
+  <p>Everything above is also a <em>picture</em>. The E6 crossover cells were captured with the full kvio
+    tracing stack (eBPF device completions + schema-2 semantic trace + serving spans) and converted to
+    Perfetto timelines (<a href="kvio-perfetto.html">how-to</a>). Below: the 8B cell — the crossover point —
+    with the <b>stock</b> (QD~1) and <b>fixed</b> (batched) arms stacked. Same 18-prompt warm phase, same
+    bytes, same drive; the only variable is the load path.</p>
+
+  <figure style="margin:18px 0">
+    <img src="img/crossover-8b-serving.png" alt="Serving layer: fixed vs stock TTFT request spans"
+         style="max-width:100%;border:1px solid var(--border);border-radius:8px">
+    <figcaption class="muted" style="font-size:.9rem;margin-top:6px"><b>Request layer.</b> Warm phases
+      (<span class="mono">w</span>) are identical twins; then the measured requests diverge — fixed&#8217;s
+      TTFTs are slim ticks (~490&nbsp;ms), stock&#8217;s are the fat <span class="mono">load_ttft</span> bars
+      (~2.4&nbsp;s each) stretching to the end of the capture.</figcaption>
+  </figure>
+
+  <figure style="margin:18px 0">
+    <img src="img/crossover-8b-lmcache.png" alt="LMCache object layer: object spans and objects in flight"
+         style="max-width:100%;border:1px solid var(--border);border-radius:8px">
+    <figcaption class="muted" style="font-size:.9rem;margin-top:6px"><b>KV-object layer.</b> Each request
+      fans into ~58 object loads. Fixed&#8217;s objects are brief ticks; stock&#8217;s are long dashes — and the
+      <span class="mono">objects in flight</span> counter shows stock grinding one-object-at-a-time for the
+      whole tail of the timeline.</figcaption>
+  </figure>
+
+  <figure style="margin:18px 0">
+    <img src="img/crossover-8b-nvme.png" alt="NVMe device layer: IO activity, command mipmaps, counters, slba ramps"
+         style="max-width:100%;border:1px solid var(--border);border-radius:8px">
+    <figcaption class="muted" style="font-size:.9rem;margin-top:6px"><b>Device layer — where the DMA lives.</b>
+      The <span class="mono">IO activity</span> summary rows tell the whole story in one line each: identical
+      ~33&nbsp;GB warm writes, then fixed drains its reads in one dense ~8&nbsp;s burst while stock crawls —
+      each pale span in stock&#8217;s tail is <em>one request&#8217;s ~1.9&nbsp;GB of KV</em> trickling off the drive
+      at QD~1. During every one of those spans the GPU is idle and the NVMe controller is doing all the work
+      by DMA; the fix doesn&#8217;t change what moves, only how hard the device is allowed to work.
+      <span class="mono">MB/s</span>, <span class="mono">cmds/ms</span> and the <span class="mono">slba</span>
+      space-axis ramps confirm: same bytes, same layout, 5&#8211;7&times; the wall time.</figcaption>
+  </figure>
+
+  <div class="note info"><b class="tag">explore it yourself</b> The timelines behind these screenshots (plus
+    the 70B load-wins-4.4&times; cell and a same-drive io_uring&nbsp;vs&nbsp;cuFile&nbsp;vs&nbsp;OpenDS DMA-transport
+    trace) are in the evidence bundle as <span class="mono">.pftrace.gz</span> files — drag any of them onto
+    <a href="https://ui.perfetto.dev">ui.perfetto.dev</a> (processing is local to your browser).</div>
+</section>
+
 <section id="left">
-  <h2><span class="n">07</span>What's left — honest status</h2>
+  <h2><span class="n">08</span>What’s left — honest status</h2>
   <div class="note warn"><b class="tag">still open</b> The end-to-end serving win above is the
     <b>batched within-object</b> fix; the cross-object <code>load_parallelism</code> pool (§05) is validated
     only on the NVMe→DRAM leg (the 2.8× probe) and not yet inside a live serving run. Neither result yet
