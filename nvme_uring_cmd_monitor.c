@@ -45,6 +45,10 @@ struct nvme_cmd_event {
 	unsigned long long slba;
 	unsigned int nlb_zero;
 	unsigned int cdw12;
+	unsigned int cdw2;      /* KV key bytes 0-3 */
+	unsigned int cdw3;      /* KV key bytes 4-7 */
+	unsigned int cdw14;     /* KV key bytes 8-11 */
+	unsigned int cdw15;     /* KV key bytes 12-15 */
 	char comm[16];
 };
 
@@ -69,6 +73,7 @@ static volatile sig_atomic_t stop;
 static void on_sig(int s) { (void)s; stop = 1; }
 static FILE *out;
 static unsigned lba_size = 512;
+static int kv_mode;             /* --kv: decode the KV command set instead */
 
 static const char *nvme_op(unsigned char op)
 {
@@ -80,6 +85,41 @@ static const char *nvme_op(unsigned char op)
 	}
 }
 
+/* KV command set (Key Value Command Set Spec 1.0c).  Opcodes COLLIDE with
+ * the NVM set (Store 0x01 = Write, Retrieve 0x02 = Read), which is why KV
+ * decode is an explicit mode: the namespace's command set is a property of
+ * the device, not the command. */
+static const char *kv_op(unsigned char op)
+{
+	switch (op) {
+	case 0x01: return "store";
+	case 0x02: return "retrieve";
+	case 0x06: return "list";
+	case 0x10: return "delete";
+	case 0x14: return "exist";
+	default:   return "other";
+	}
+}
+
+/* The key travels in the SQE itself: bytes 0-7 memcpy'd into cdw2-3,
+ * bytes 8-15 into cdw14-15 (little-endian dwords in memory order), key
+ * length in cdw11 bits 0-7.  Reassemble the original bytes and hex them —
+ * this is the canonical join form the semantic side must match. */
+static void kv_key_hex(const struct nvme_cmd_event *e, char *hex, size_t cap)
+{
+	unsigned char kb[16];
+	unsigned kl = e->slba >> 32 & 0xff;      /* cdw11 low byte */
+	memcpy(kb + 0,  &e->cdw2,  4);
+	memcpy(kb + 4,  &e->cdw3,  4);
+	memcpy(kb + 8,  &e->cdw14, 4);
+	memcpy(kb + 12, &e->cdw15, 4);
+	if (kl > 16) kl = 16;
+	size_t n = 0;
+	for (unsigned i = 0; i < kl && n + 3 <= cap; i++)
+		n += snprintf(hex + n, cap - n, "%02x", kb[i]);
+	hex[n] = '\0';
+}
+
 static int handle_event(void *ctx, void *data, size_t sz)
 {
 	(void)ctx;
@@ -89,6 +129,23 @@ static int handle_event(void *ctx, void *data, size_t sz)
 
 	if (ev_type == EV_CMD && sz >= sizeof(struct nvme_cmd_event)) {
 		const struct nvme_cmd_event *e = data;
+		if (kv_mode) {
+			char hex[36];
+			kv_key_hex(e, hex, sizeof(hex));
+			fprintf(out,
+				"{\"event_type\":\"nvme_cmd\",\"pid\":%u,\"tid\":%u,\"user_data\":%llu,"
+				"\"nvme_opcode\":%u,\"op_name\":\"%s\",\"nsid\":%u,"
+				"\"key_hex\":\"%s\",\"key_len\":%u,\"value_len\":%llu,"
+				"\"data_len\":%u,\"multipath\":%u,\"cmd_op\":\"0x%llx\","
+				"\"rdev\":%u,\"comm\":\"%s\",\"ts\":%llu}\n",
+				e->pid, e->tid, e->user_data, e->nvme_opcode,
+				kv_op(e->nvme_opcode), e->nsid, hex,
+				(unsigned)(e->slba >> 32 & 0xff),
+				e->slba & 0xffffffffULL,
+				e->data_len, e->multipath, e->cmd_op,
+				e->rdev, e->comm, e->ts);
+			return 0;
+		}
 		unsigned long long nlb = (unsigned long long)e->nlb_zero + 1;
 		unsigned long long bytes = nlb * lba_size;
 		fprintf(out,
@@ -176,8 +233,14 @@ int main(int argc, char **argv)
 		else if (!strcmp(argv[i], "--dur") && i+1 < argc) dur = atoi(argv[++i]);
 		else if (!strcmp(argv[i], "--jsonl") && i+1 < argc) jsonl = argv[++i];
 		else if (!strcmp(argv[i], "--lba-size") && i+1 < argc) lba_size = (unsigned)atoi(argv[++i]);
+		else if (!strcmp(argv[i], "--kv")) kv_mode = 1;
 		else if (!strcmp(argv[i], "--help")) {
-			fprintf(stderr, "usage: %s [--pid P] [--dur S] [--jsonl PATH] [--lba-size N]\n", argv[0]);
+			fprintf(stderr, "usage: %s [--pid P] [--dur S] [--jsonl PATH] "
+				"[--lba-size N] [--kv]\n"
+				"  --kv  target is an NVMe Key-Value namespace: decode "
+				"store/retrieve/delete/exist\n"
+				"        + the 16-byte object key from the SQE "
+				"(key_hex) instead of slba/nlb\n", argv[0]);
 			return 0;
 		} else { fprintf(stderr, "unknown arg %s\n", argv[i]); return 2; }
 	}

@@ -81,6 +81,15 @@ struct nvme_cmd_event {
 	__u64 slba;         /* cdw10 | cdw11<<32 (NVM read/write) */
 	__u32 nlb_zero;     /* cdw12 & 0xffff (zero-based) */
 	__u32 cdw12;
+	/* KV command set carries the object key IN the SQE: bytes 0-7 in
+	 * cdw2-3, bytes 8-15 in cdw14-15 (memcpy order, per the KV spec and
+	 * xNVMe's kvs_cmd_set_key).  Exported raw; userspace decodes when the
+	 * namespace is KV (--kv) — opcodes collide with NVM (Store 0x01 =
+	 * Write, Retrieve 0x02 = Read) so the mode is a flag, not sniffed. */
+	__u32 cdw2;
+	__u32 cdw3;
+	__u32 cdw14;
+	__u32 cdw15;
 	char  comm[16];
 };
 
@@ -171,6 +180,10 @@ static __always_inline int handle(struct io_uring_cmd *ioucmd, __u8 multipath)
 	e->slba = (__u64)c.cdw10 | ((__u64)c.cdw11 << 32);
 	e->nlb_zero = c.cdw12 & 0xffff;
 	e->cdw12 = c.cdw12;
+	e->cdw2 = c.cdw2;
+	e->cdw3 = c.cdw3;
+	e->cdw14 = c.cdw14;
+	e->cdw15 = c.cdw15;
 	bpf_ringbuf_submit(e, 0);
 	return 0;
 }
