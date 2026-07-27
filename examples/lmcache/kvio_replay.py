@@ -172,7 +172,7 @@ def run_record(args):
 
     print(f"=== kvio replay (record): {args.record}")
     print(f"    source: {rec.get('source', '?')}")
-    print(f"    geometry: MDTS={mdts // 1024} KiB, block_align={block_align}, "
+    print(f"    geometry: max_xfer={mdts // 1024} KiB/cmd, block_align={block_align}, "
           f"engine={engine}, O_DIRECT={'on' if args.odirect else 'off'}, "
           f"{n} objects x {args.iters} iters, dev={args.device} ===")
     tot_store = tot_load = 0

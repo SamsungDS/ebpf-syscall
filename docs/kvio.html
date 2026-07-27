@@ -192,8 +192,9 @@
       <h4><span class="ic">2</span> Issue / replay</h4>
       <p>Push that store/load workload through LMCache <code>RawBlockCore</code> on a real
         device — POSIX, io_uring, or io_uring_cmd NVMe passthrough. The payload is zeros; the
-        device splits each block into <code>MDTS</code>-sized commands exactly as it would for
-        real KV.</p>
+        engine splits each block into <code>max_data_transfer_size</code>-sized commands
+        (its knob, bounded above by the device's MDTS — on passthrough there is no block
+        layer, so userspace owns the split) exactly as it would for real KV.</p>
       <p class="eg"><b>32 MiB block → 256 × 128 KiB NVMe commands</b></p>
     </div>
   </div>
@@ -205,7 +206,7 @@
 <section id="join">
   <h2><span class="n">03</span>The cross-layer <span class="mono" style="font-family:var(--mono);color:var(--cyan)">trace_id</span> join</h2>
   <p>The distinguishing feature: follow <strong>one KV object</strong> from the LMCache
-    payload, through the raw-block MDTS split, down to the individual NVMe completions — and
+    payload, through the raw-block <code>max_data_transfer_size</code> split, down to the individual NVMe completions — and
     back. This is done with a single <code>trace_id</code> threaded across three layers:</p>
   <div class="tbl"><table>
     <thead><tr><th>Layer</th><th>What it emits</th><th>Carries trace_id as</th></tr></thead>

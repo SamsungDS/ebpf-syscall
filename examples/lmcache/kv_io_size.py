@@ -8,9 +8,11 @@ KV cache is:
 
 For a stored "chunk" of T tokens, the natural logical KV object is
 `per_token_kv * T` (all layers); a per-layer slab is `per_token_kv * T /
-num_layers`. These logical I/O sizes are what an application *intends*; the drive
-fragments anything larger than its MDTS / the kernel's max request size into
-multiple commands. ebpf-syscall captures the intent; the block/NVMe layer only
+num_layers`. These logical I/O sizes are what an application *intends*; anything
+larger than the device's MDTS must be split into multiple commands BEFORE it
+reaches the drive -- by the kernel block layer on the block path, or by the
+application itself on NVMe passthrough (a drive never splits: it rejects
+oversized commands). ebpf-syscall captures the intent; the NVMe layer only
 shows the fragments.
 
 Usage: kv_io_size.py --layers 32 --kv-heads 8 --head-dim 128 [--dtype-bytes 2]
