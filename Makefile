@@ -43,7 +43,7 @@ NVME_SKEL    = nvme_uring_cmd_monitor.skel.h
 
 .PHONY: all clean setup
 
-all: setup $(TARGET) $(MMAP_TARGET) $(IOU_TARGET) $(NVME_TARGET)
+all: setup $(TARGET) $(MMAP_TARGET) $(IOU_TARGET) $(NVME_TARGET) $(NVMETP_TARGET)
 
 setup:
 ifeq ($(LIBBPF_SYSTEM),yes)
@@ -96,6 +96,19 @@ $(NVME_SKEL): $(NVME_BPF_OBJ)
 $(NVME_TARGET): nvme_uring_cmd_monitor.c $(NVME_SKEL)
 	$(CC) $(CFLAGS) $(INCLUDES) nvme_uring_cmd_monitor.c $(LIBS_DIR) $(LIBS) -o $@
 
+NVMETP_TARGET  = nvme_tp_monitor
+NVMETP_BPF_OBJ = nvme_tp_monitor.bpf.o
+NVMETP_SKEL    = nvme_tp_monitor.skel.h
+
+$(NVMETP_BPF_OBJ): nvme_tp_monitor.bpf.c vmlinux.h
+	$(CLANG) $(BPF_CFLAGS) $(INCLUDES) -c nvme_tp_monitor.bpf.c -o $@
+
+$(NVMETP_SKEL): $(NVMETP_BPF_OBJ)
+	$(BPFTOOL) gen skeleton $< > $@
+
+$(NVMETP_TARGET): nvme_tp_monitor.c $(NVMETP_SKEL)
+	$(CC) $(CFLAGS) $(INCLUDES) nvme_tp_monitor.c $(LIBS_DIR) $(LIBS) -o $@
+
 # NVMe passthrough workload generator (firing test for the monitor's
 # completion probe on hosts with no LMCache stack). Needs liburing-dev;
 # not part of 'all' so the monitors build without it.
@@ -133,6 +146,7 @@ clean:
 	rm -f $(MMAP_TARGET) $(MMAP_BPF_OBJ) $(MMAP_SKEL)
 	rm -f $(IOU_TARGET) $(IOU_BPF_OBJ) $(IOU_SKEL)
 	rm -f $(NVME_TARGET) $(NVME_BPF_OBJ) $(NVME_SKEL)
+	rm -f $(NVMETP_TARGET) $(NVMETP_BPF_OBJ) $(NVMETP_SKEL) nvme_uring_cmd_smoke
 	rm -rf $(LIBBPF_DIR)
 
 help:
