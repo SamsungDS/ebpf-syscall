@@ -139,7 +139,11 @@ def analyze_label(label, cmds, objs, info, serving, batch_gap_ns):
     # ---- commands -----------------------------------------------------
     tagged = [c for c in cmds if c["tid"]]
     untagged = [c for c in cmds if not c["tid"]]
-    total_bytes = sum(c["dlen"] or 0 for c in tagged)
+    # transports with no user_data channel (GDS, NIXL, plain block IO via the
+    # nvme-tracepoint monitor) are 100% untagged: per-command analyses fall
+    # back to ALL commands; only the per-object analyses need the tags.
+    pool = tagged if tagged else cmds
+    total_bytes = sum(c["dlen"] or 0 for c in pool)
     wall = (max((c["ts"] + c["dur"]) for c in cmds) - min(c["ts"] for c in cmds)) \
         if cmds else 0
     n_real = sum(1 for c in cmds if c["real"])
@@ -153,7 +157,7 @@ def analyze_label(label, cmds, objs, info, serving, batch_gap_ns):
 
     if n_real:
         for opname in ("write", "read"):
-            ls = [c["dur"] for c in tagged if c["op"] == opname and c["real"]]
+            ls = [c["dur"] for c in pool if c["op"] == opname and c["real"]]
             if ls:
                 out.append(f"  {opname:5s} latency: p50 {fmt_us(pct(ls, .5))}  "
                            f"p95 {fmt_us(pct(ls, .95))}  p99 {fmt_us(pct(ls, .99))}"
@@ -198,7 +202,7 @@ def analyze_label(label, cmds, objs, info, serving, batch_gap_ns):
     # ---- achieved QD (needs completions) ------------------------------
     if n_real:
         evs = []
-        for c in tagged:
+        for c in pool:
             if c["real"]:
                 evs.append((c["ts"], 1))
                 evs.append((c["ts"] + c["dur"], -1))
@@ -222,7 +226,7 @@ def analyze_label(label, cmds, objs, info, serving, batch_gap_ns):
                        "pct_time_le1": t_le1 / span}
 
     # ---- inferred batches ---------------------------------------------
-    subs = sorted(c["ts"] for c in tagged)
+    subs = sorted(c["ts"] for c in pool)
     batches, cur = [], 1
     for a, b in zip(subs, subs[1:]):
         if b - a > batch_gap_ns:
@@ -289,7 +293,7 @@ def analyze_label(label, cmds, objs, info, serving, batch_gap_ns):
                                "gap_p99": pct(barr, .99)}
 
     # ---- space axis ---------------------------------------------------
-    writes = sorted((c for c in tagged if c["op"] == "write"),
+    writes = sorted((c for c in pool if c["op"] == "write"),
                     key=lambda c: c["ts"])
     if writes:
         seen, reused = set(), 0
