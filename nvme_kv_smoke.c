@@ -130,6 +130,26 @@ int main(int argc, char **argv)
 		}
 	}
 
+	/* NVMe controller numbering is NOT stable across boots, so a saved
+	 * /dev/ngXnY name can silently point at a different namespace after
+	 * a reboot.  A KV namespace never gets a block node (the kernel
+	 * skips it: "block device for nsid N not supported (csi 1)"), so a
+	 * sibling /dev/nvmeXnY existing means this is a BLOCK namespace --
+	 * where our KV Store would be interpreted as an NVM write.  Refuse.
+	 * Select KV devices by subsystem NQN, not by remembered name. */
+	const char *ng = strrchr(dev, '/');
+	ng = ng ? ng + 1 : dev;
+	if (ng[0] == 'n' && ng[1] == 'g') {
+		char blk[64];
+		snprintf(blk, sizeof(blk), "/dev/nvme%s", ng + 2);
+		if (access(blk, F_OK) == 0) {
+			fprintf(stderr, "%s: sibling block device %s exists -- "
+				"this is a block namespace, not KV; refusing "
+				"(KV namespaces have no block node)\n", dev, blk);
+			return 1;
+		}
+	}
+
 	int fd = open(dev, O_RDWR);
 	if (fd < 0) { perror(dev); return 1; }
 	int nsid = ioctl(fd, NVME_IOCTL_ID);
