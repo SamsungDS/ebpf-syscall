@@ -329,7 +329,7 @@ sudo nvme_uring_cmd_monitor --jsonl <span class="v">trace.jsonl</span> --lba-siz
 
 <section id="seeit">
   <h2><span class="n">07</span>See it — the crossover on one timeline</h2>
-  <p>Everything above is also a <em>picture</em>. The E6 crossover cells were captured with the full kvio
+  <p>Everything above is also a <em>picture</em>. The crossover measurements were captured with the full kvio
     tracing stack (eBPF device completions + schema-2 semantic trace + serving spans) and converted to
     Perfetto timelines (<a href="kvio-perfetto.html">how-to</a>). Below: the 8B cell — the crossover point —
     with the <b>stock</b> (QD~1) and <b>fixed</b> (batched) arms stacked. Same 18-prompt warm phase, same

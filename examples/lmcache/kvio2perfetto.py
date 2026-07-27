@@ -209,9 +209,9 @@ class Capture:
             self.stats["ebpf_skipped"] = sk
             self.stats["other_lines"] += o + len(s)
         # serving-layer request spans: any JSONL whose records carry
-        # ts_start + ts (monotonic seconds) and an op/name — the E6 driver
-        # emits {"op":"recompute"|"load_ttft",...} so both arms of the
-        # crossover render side by side above the device activity.
+        # ts_start + ts (monotonic seconds) and an op/name — the crossover
+        # benchmark driver emits {"op":"recompute"|"load_ttft",...} so
+        # both arms render side by side above the device activity.
         self.serving = []
         if serving_path:
             rows, sk = load_jsonl(serving_path)

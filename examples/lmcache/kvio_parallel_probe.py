@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""E7 step-1 prototype: is the KV-load bottleneck the device or the software path?
+"""Is the KV-load bottleneck the device or the software path?
 
 The real TP4 captures showed the LMCache raw_block load path is single-threaded,
 QD~1 (per-128KiB-command serial submit-wait ~83us, ~11% of the drive's 11.3 GB/s).
