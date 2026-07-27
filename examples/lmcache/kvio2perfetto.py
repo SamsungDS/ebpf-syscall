@@ -343,7 +343,7 @@ def emit(captures, args, out_file):
     T = TrackEvent
 
     def track(uuid, name=None, parent=None, pid=None, pname=None, unit=None,
-              order=None):
+              order=None, explicit=False):
         p = b.create_packet()
         d = p.track_descriptor
         d.uuid = uuid
@@ -354,14 +354,15 @@ def emit(captures, args, out_file):
         if pid is not None:
             d.process.pid = pid
             d.process.process_name = pname
-            # children carry sibling_order_rank; without EXPLICIT ordering the
-            # UI falls back to uuid order, which differs per label and makes
-            # A/B arms' collapsed summaries render different tracks first.
-            d.child_ordering = d.EXPLICIT
         if unit is not None:
             d.counter.unit_name = unit
         if order is not None:
             d.sibling_order_rank = order
+        if explicit:
+            # meaningful only on non-process parents: tracks whose parent_uuid
+            # is a PROCESS descriptor are flattened into process-associated
+            # siblings and their ordering falls back to lexicographic.
+            d.child_ordering = d.EXPLICIT
         b.write_packet(p)
 
     def build_event(spec):
@@ -435,15 +436,20 @@ def emit(captures, args, out_file):
         track(meta_trk, name="capture info", parent=lm_proc, order=0)
         obj_ctr = uid(L, "lmcache", "inflight")
         track(obj_ctr, name="objects in flight", parent=lm_proc, unit="objects", order=1)
+        # the sole top-level slice branch under the NVMe process: its authored
+        # overview IS the collapsed summary (the summary DFS selects the first
+        # valid dataset and prunes its subtree -- everything lives below it).
+        nv_root = uid(L, "nvme", "activity")
+        track(nv_root, name="IO activity", parent=nv_proc, explicit=True)
         ctr_cmds = uid(L, "nvme", "cmds_ms")
-        track(ctr_cmds, name="cmds/ms", parent=nv_proc, unit="cmds", order=90)
+        track(ctr_cmds, name="cmds/ms", parent=nv_root, unit="cmds", order=90)
         ctr_mbs = uid(L, "nvme", "mb_s")
-        track(ctr_mbs, name="MB/s", parent=nv_proc, unit="MB/s", order=91)
+        track(ctr_mbs, name="MB/s", parent=nv_root, unit="MB/s", order=91)
         ctr_slba = {}
         if not args.no_slba_counter:
             for op in ("write", "read"):
                 ctr_slba[op] = uid(L, "nvme", "slba", op)
-                track(ctr_slba[op], name=f"{op}s slba", parent=nv_proc,
+                track(ctr_slba[op], name=f"{op}s slba", parent=nv_root,
                       unit="LBA", order=92 if op == "write" else 93)
 
         cinfo = {"label": L, "base_ns": cap.base_ns,
@@ -575,10 +581,7 @@ def emit(captures, args, out_file):
 
         # ---- device activity overview (one row, coarse spans) --------
         if cap.cmds:
-            # Emit the overview spans DIRECTLY on the process track: Perfetto
-            # renders a collapsed process group from its root track's slices,
-            # so this is what the summary pane shows without expanding.
-            ov_trk = nv_proc
+            ov_trk = nv_root
             BUCKET = 100_000_000                       # 100 ms
             buckets = defaultdict(lambda: [0, 0])      # k -> [cmds, bytes]
             for c in cap.cmds:
@@ -662,12 +665,12 @@ def emit(captures, args, out_file):
             role_uuid = {}
             if ncl == 1:
                 role_uuid[0] = uid(L, "nvme", role, "lane", 0)
-                track(role_uuid[0], name=role, parent=nv_proc,
+                track(role_uuid[0], name=role, parent=nv_root,
                       order=role_rank.get(role, 85))
             else:
                 grp = uid(L, "nvme", role, "group")
-                track(grp, name=role, parent=nv_proc,
-                      order=role_rank.get(role, 85))
+                track(grp, name=role, parent=nv_root,
+                      order=role_rank.get(role, 85), explicit=True)
                 for lane in range(ncl):
                     role_uuid[lane] = uid(L, "nvme", role, "lane", lane)
                     track(role_uuid[lane], name=f"{role}.{lane:03d}", parent=grp,
