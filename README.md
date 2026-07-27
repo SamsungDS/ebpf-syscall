@@ -14,6 +14,19 @@ whoami
 # Verify you can use sudo
 sudo -v
 ```
+
+**Custom kernels need `CONFIG_DEBUG_INFO_BTF=y`.** Every tracer here
+attaches via BTF-typed programs (fentry/tp_btf), so the running kernel
+must provide `/sys/kernel/btf/vmlinux` — and the NVMe monitors also
+need module BTF (`CONFIG_DEBUG_INFO_BTF_MODULES=y`, default y) for
+nvme_core attach points. Stock Debian/Ubuntu/Fedora kernels ship both.
+Self-built kernels frequently lose them: enabling BTF requires
+`pahole` (package `dwarves`) at build time, and `make olddefconfig`
+**silently drops** `DEBUG_INFO_BTF` when pahole is missing; build
+scripts that strip debug info for speed take BTF with it. Keep DWARF
+generation on (`CONFIG_DEBUG_INFO_DWARF_TOOLCHAIN_DEFAULT=y`) and use
+`INSTALL_MOD_STRIP=1` at install — stripping keeps `.BTF` sections, so
+modules stay small without losing attachability.
 ## 2. Clone repository
 ```
 git clone https://github.com/SamsungDS/ebpf-syscall.git
