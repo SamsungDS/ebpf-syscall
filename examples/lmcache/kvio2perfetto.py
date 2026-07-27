@@ -575,8 +575,10 @@ def emit(captures, args, out_file):
 
         # ---- device activity overview (one row, coarse spans) --------
         if cap.cmds:
-            ov_trk = uid(L, "nvme", "overview")
-            track(ov_trk, name="IO activity", parent=nv_proc, order=5)
+            # Emit the overview spans DIRECTLY on the process track: Perfetto
+            # renders a collapsed process group from its root track's slices,
+            # so this is what the summary pane shows without expanding.
+            ov_trk = nv_proc
             BUCKET = 100_000_000                       # 100 ms
             buckets = defaultdict(lambda: [0, 0])      # k -> [cmds, bytes]
             for c in cap.cmds:
