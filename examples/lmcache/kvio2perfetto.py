@@ -15,6 +15,13 @@ estimation is done (or needed): semantic events are placed at ts*1e9 on the
 eBPF nanosecond timeline.  The join key is trace_id = user_data >> 32;
 trace_id 0 is untagged traffic (metadata IO, foreign passthrough users).
 
+NVMe Key-Value namespaces (--join-by-key): the KV command set carries the
+16-byte object key inside the SQE, so a monitor --kv capture has key_hex on
+every command and the join runs on the key itself — exact per-object
+attribution with the initiator library (NIXL XNVME_KV, xNVMe) completely
+unmodified.  Semantic records match via their key_hex field, else the utf-8
+hex of their key string.
+
 Output mapping (one process group per --label / --merge arm):
   Process "LMCache <label>"   object spans on auto-assigned lanes
                               (span = first device cmd .. semantic op-end),
@@ -216,6 +223,26 @@ class Capture:
         self.stats["nvme_cmd_lines"] = len(cmds)
         self.stats["nvme_cmp_lines"] = len(self.cmps)
 
+        # --- key-join remap (KV namespaces, --join-by-key) -------------
+        # The NVMe KV command set carries the 16-byte object key inside
+        # the SQE, so the eBPF capture (monitor --kv) emits key_hex per
+        # command.  Joining on the key needs zero cooperation from the
+        # initiator library (NIXL / xNVMe run unmodified — no user_data
+        # tagging): synthesize a dense trace_id per distinct key and the
+        # entire downstream (occurrence segmentation, spans, lanes,
+        # flows) applies unchanged.  Semantic records join via their own
+        # key_hex, else the utf-8 hex of their key string (= the wire
+        # bytes any client that memcpys a string key produces).  Device
+        # commands whose key no semantic record claims stay untagged.
+        self.join_by_key = bool(getattr(args, "join_by_key", False))
+        if self.join_by_key:
+            keymap = {}
+            for r in sem:
+                kh = r.get("key_hex") or str(r.get("key", "")).encode().hex()
+                r["trace_id"] = keymap.setdefault(kh.lower(), len(keymap) + 1)
+            for c in cmds:
+                c["tid"] = keymap.get(str(c.get("key_hex", "")).lower(), 0)
+
         # --- join ------------------------------------------------------
         # A trace_id can legitimately repeat only if two RawBlockCore
         # instances share one trace file (P3 adds an instance field); keep
@@ -236,7 +263,8 @@ class Capture:
                 "device-command attribution across instances is ambiguous "
                 "(same trace_id space)")
         for c in cmds:
-            c["tid"] = int(c.get("user_data", 0)) >> 32
+            if "tid" not in c:
+                c["tid"] = int(c.get("user_data", 0)) >> 32
         self.cmds = cmds
         self.cmds_by_tid = defaultdict(list)
         for c in cmds:
@@ -286,6 +314,7 @@ class Capture:
         # The capture-time --lba-size is not recorded in the JSONL; a wrong
         # value silently classifies every store command as payload.  Test
         # the flag value plus the common candidates and keep the best.
+        # KV joins have no slot_offset/slba geometry: skip the sampling.
         self.lba_bytes = args.lba_bytes
         cand = []
         for v in (args.lba_bytes, 4096, 512):
@@ -293,6 +322,9 @@ class Capture:
                 cand.append(v)
         score = {v: 0 for v in cand}
         sampled = 0
+        if self.join_by_key:
+            self._rebase()
+            return
         for tid, occs in self.sem_occs.items():
             for oi, r in enumerate(occs):
                 if r.get("op") != "store":
@@ -324,7 +356,9 @@ class Capture:
                     "sampled stores) and using it")
                 self.lba_bytes = best
 
-        # --- rebase ----------------------------------------------------
+        self._rebase()
+
+    def _rebase(self):
         ts_candidates = [int(c["ts"]) for c in self.cmds]
         for occs in self.sem_occs.values():
             ts_candidates += [int(float(r["ts"]) * 1e9) for r in occs]
@@ -616,10 +650,10 @@ def emit(captures, args, out_file):
         for c in cap.cmds:
             if c["tid"] == 0:
                 role = "untagged"
-            elif c.get("op_name") == "write":
-                role = "writes"
-            elif c.get("op_name") == "read":
-                role = "reads"
+            elif c.get("op_name") in ("write", "store"):
+                role = "writes"          # KV Store = data toward the device
+            elif c.get("op_name") in ("read", "retrieve"):
+                role = "reads"           # KV Retrieve = data from the device
             else:
                 role = "other"
             per_role[role].append(c)
@@ -725,7 +759,8 @@ def emit(captures, args, out_file):
         stats["header_cmds"] = header_cmds
         stats["lanes"] = nlanes
         n_store_spans = sum(1 for _, _, it in spans if it[2].get("op") == "store")
-        if n_store_spans and header_cmds == 0:
+        if n_store_spans and header_cmds == 0 and not cap.join_by_key:
+            # KV objects have no header write — the check is block-only.
             cap.warnings.append(
                 "0 header commands classified across "
                 f"{n_store_spans} stores — check --lba-bytes")
@@ -803,6 +838,12 @@ def main():
                     help="keep only events in this window (seconds, post-rebase)")
     ap.add_argument("--trace-id", metavar="A[-B]",
                     help="keep only this trace_id (range)")
+    ap.add_argument("--join-by-key", action="store_true",
+                    help="join semantic records to device commands by KV "
+                         "object key instead of user_data trace_id (NVMe "
+                         "Key-Value namespaces: capture with monitor --kv; "
+                         "the SQE carries the key, so unmodified initiators "
+                         "-- NIXL, xNVMe -- get full object attribution)")
     ap.add_argument("--no-slba-counter", action="store_true")
     ap.add_argument("--device", default="ng", help="device label (old captures "
                     "record no device id)")
@@ -864,7 +905,9 @@ def main():
             print("  WARNING: semantic op-end earlier than last device command "
                   "— should be impossible on one host/boot; check inputs.")
             ok = False
-        if s["dup_trace_id"]:
+        if s["dup_trace_id"] and not cap.join_by_key:
+            # under --join-by-key a store+load pair per key IS two
+            # occurrences of one synthetic id — expected, not a warning.
             print(f"  WARNING: {s['dup_trace_id']} duplicate trace_id(s) — "
                   "multiple producer instances sharing one trace file? "
                   "Spans were segmented by op-end time; treat with care.")
