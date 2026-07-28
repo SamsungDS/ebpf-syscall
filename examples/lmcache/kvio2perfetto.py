@@ -58,6 +58,7 @@ Query: python -c "from perfetto.trace_processor import TraceProcessor; ..."
 from __future__ import annotations
 
 import argparse
+import bisect
 import gzip
 import hashlib
 import json
@@ -243,6 +244,73 @@ class Capture:
             for c in cmds:
                 c["tid"] = keymap.get(str(c.get("key_hex", "")).lower(), 0)
 
+        # --- offset-join (--join-by-offset) ----------------------------
+        # Attribute device commands to KV objects by (byte range, time
+        # window) instead of a cooperative user_data cookie: every
+        # semantic record carries slot_offset/bytes/ts_start/ts, and every
+        # command carries slba/ts.  This needs NOTHING from the I/O
+        # engine, so transports that cannot tag (POSIX, cuFile/GDS, stock
+        # engines) get object attribution -- provided the semantic
+        # offsets and the device offsets live in the same address space
+        # (true on raw block devices; a file-backed store needs an extent
+        # map first).  Slots are disjoint in space, so the only spatial
+        # candidate for a command is the greatest slot base <= its byte
+        # offset; slot reuse across passes is disambiguated by the
+        # [ts_start, ts] window.  When commands ALSO carry cookies, the
+        # cookie is kept as ground truth and an agreement rate is
+        # reported -- the parity check for this join.
+        self.join_by_offset = bool(getattr(args, "join_by_offset", False))
+        if self.join_by_offset:
+            hdr = int((self.kmeta or {}).get("header_bytes", 0) or 0)
+            ba = int((self.kmeta or {}).get("block_align", 4096) or 4096)
+            slack_ns = 5_000_000
+            by_lo = defaultdict(list)      # slot base -> [(t0,t1,hi,rec)]
+            for i, r in enumerate(sem):
+                if r.get("slot_offset") is None:
+                    continue
+                lo = int(r["slot_offset"])
+                pay = ((int(r.get("bytes", 0)) + ba - 1) // ba) * ba
+                t1 = int(float(r["ts"]) * 1e9) + slack_ns
+                t0 = int(float(r.get("ts_start", r["ts"])) * 1e9) - slack_ns
+                r["_cookie_tid"] = r.get("trace_id")   # ground truth, if any
+                r["trace_id"] = i + 1                  # synthetic, unique
+                by_lo[lo].append((t0, t1, lo + hdr + pay, r))
+            ulos = sorted(by_lo)
+            dirmap = {"store": "write", "load": "read"}
+            n_gt = n_agree = n_off_only = 0
+            for c in cmds:
+                cookie = int(c.get("user_data", 0)) >> 32
+                c["tid"] = 0
+                if "slba" not in c:
+                    continue
+                nlb = int(c.get("nlb", 0))
+                lba = (int(c["bytes"]) // nlb if nlb and c.get("bytes")
+                       else args.lba_bytes)
+                off = int(c["slba"]) * lba
+                ts = int(c["ts"])
+                j = bisect.bisect_right(ulos, off) - 1
+                if j < 0:
+                    continue
+                best = None
+                for t0, t1, hi, r in by_lo[ulos[j]]:
+                    if off < hi and t0 <= ts <= t1:
+                        if best is None:
+                            best = r
+                        if dirmap.get(r.get("op")) == c.get("op_name"):
+                            best = r
+                            break
+                if best is not None:
+                    c["tid"] = best["trace_id"]
+                    if cookie:
+                        n_gt += 1
+                        if best.get("_cookie_tid") == cookie:
+                            n_agree += 1
+                    else:
+                        n_off_only += 1
+            self.stats["offset_join_gt_cmds"] = n_gt
+            self.stats["offset_join_agree"] = n_agree
+            self.stats["offset_join_extra"] = n_off_only
+
         # --- join ------------------------------------------------------
         # A trace_id can legitimately repeat only if two RawBlockCore
         # instances share one trace file (P3 adds an instance field); keep
@@ -322,7 +390,7 @@ class Capture:
                 cand.append(v)
         score = {v: 0 for v in cand}
         sampled = 0
-        if self.join_by_key:
+        if self.join_by_key or self.join_by_offset:
             self._rebase()
             return
         for tid, occs in self.sem_occs.items():
@@ -852,6 +920,14 @@ def main():
                          "Key-Value namespaces: capture with monitor --kv; "
                          "the SQE carries the key, so unmodified initiators "
                          "-- NIXL, xNVMe -- get full object attribution)")
+    ap.add_argument("--join-by-offset", action="store_true",
+                    help="attribute device commands to KV objects by byte "
+                         "range + time window (slot_offset/ts from the "
+                         "semantic trace vs slba/ts from the capture): no "
+                         "user_data cookie needed, so untaggable transports "
+                         "(POSIX, cuFile/GDS) get object attribution on raw "
+                         "block devices; when cookies are also present an "
+                         "agreement rate is reported as the parity check")
     ap.add_argument("--no-slba-counter", action="store_true")
     ap.add_argument("--device", default="ng", help="device label (old captures "
                     "record no device id)")
@@ -913,7 +989,14 @@ def main():
             print("  WARNING: semantic op-end earlier than last device command "
                   "— should be impossible on one host/boot; check inputs.")
             ok = False
-        if s["dup_trace_id"] and not cap.join_by_key:
+        if s.get("offset_join_gt_cmds"):
+            gt, ag = s["offset_join_gt_cmds"], s["offset_join_agree"]
+            print(f"  offset-join parity vs user_data cookies: {ag}/{gt} "
+                  f"({100.0 * ag / gt:.2f}%) agree"
+                  f"{'' if ag == gt else '  <-- INVESTIGATE'}"
+                  f" | offset-attributed cookieless cmds: "
+                  f"{s['offset_join_extra']}")
+        if s["dup_trace_id"] and not cap.join_by_key and not cap.join_by_offset:
             # under --join-by-key a store+load pair per key IS two
             # occurrences of one synthetic id — expected, not a warning.
             print(f"  WARNING: {s['dup_trace_id']} duplicate trace_id(s) — "
