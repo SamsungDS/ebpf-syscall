@@ -648,7 +648,11 @@ def emit(captures, args, out_file):
         # ---- device command slices -----------------------------------
         per_role = defaultdict(list)
         for c in cap.cmds:
-            if c["tid"] == 0:
+            # KV commands carry their object key in the capture, so they are
+            # attributable even when no semantic record claims them (an
+            # unmodified initiator like NIXL emits none) — group them by op
+            # rather than dumping them on the untagged track.
+            if c["tid"] == 0 and not c.get("key_hex"):
                 role = "untagged"
             elif c.get("op_name") in ("write", "store"):
                 role = "writes"          # KV Store = data toward the device
@@ -741,8 +745,12 @@ def emit(captures, args, out_file):
                          ev(ts, T.TYPE_SLICE_BEGIN, role_uuid[lane],
                             c.get("op_name", "cmd"), flows=flows,
                             tflows=tflows,
-                            args_={"slba": int(c.get("slba", 0)),
+                            args_={"slba": (int(c["slba"])
+                                            if "slba" in c else None),
                                    "data_len": dlen,
+                                   "key_hex": c.get("key_hex"),
+                                   "key_len": c.get("key_len"),
+                                   "value_len": c.get("value_len"),
                                    "trace_id": tid or None, "role": crole,
                                    "real_dur": is_real}),
                          ev(ts + dur, T.TYPE_SLICE_END, role_uuid[lane]),
