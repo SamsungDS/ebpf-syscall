@@ -22,12 +22,8 @@ enum io_direction {
     VWRITE
 };
 
-// Syscall event structure (must match BPF program byte-for-byte).
-// The open_flags_str field MUST stay 20 bytes to match
-// syscall_monitor.bpf.c's struct syscall_event - any divergence shifts
-// the offsets of ddir/ret/error_code in this view of the ring-buffer
-// event and userspace ends up reading 'ret' from never-written tail
-// memory (i.e. zero). See commit log for the full story.
+/* Must match syscall_monitor.bpf.c's struct syscall_event byte-for-byte;
+ * open_flags_str is 20 bytes to keep the fields below it aligned. */
 struct syscall_event {
     uint64_t timestamp;
     uint32_t pid;
