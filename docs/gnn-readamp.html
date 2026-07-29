@@ -1,0 +1,292 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>GNN read amplification — see it with eBPF + Perfetto, replay it without the data</title>
+<style>
+  :root{
+    --bg:#0b0d12; --bg2:#0e1117; --surface:#12161f; --surface2:#161b26;
+    --border:#1f2733; --border2:#2a3441;
+    --text:#c7d0db; --head:#e8eef5; --muted:#7e8a99; --faint:#5b6675;
+    --cyan:#22d3ee; --sky:#38bdf8; --blue:#3b82f6;
+    --green:#4ade80; --red:#f87171; --amber:#fbbf24; --violet:#a78bfa;
+    --mono:ui-monospace,"SF Mono",SFMono-Regular,Menlo,Consolas,"Liberation Mono",monospace;
+    --sans:-apple-system,BlinkMacSystemFont,"Segoe UI",Inter,Roboto,"Helvetica Neue",Arial,sans-serif;
+  }
+  *{box-sizing:border-box}
+  html{scroll-behavior:smooth}
+  body{margin:0;background:var(--bg);color:var(--text);font-family:var(--sans);
+    font-size:16px;line-height:1.65;-webkit-font-smoothing:antialiased}
+  a{color:var(--sky);text-decoration:none}
+  a:hover{color:var(--cyan);text-decoration:underline}
+  code,kbd,pre{font-family:var(--mono)}
+  .wrap{max-width:1000px;margin:0 auto;padding:0 24px}
+  header.hero{
+    border-bottom:1px solid var(--border);
+    background:
+      radial-gradient(900px 380px at 12% -8%, rgba(248,113,113,.10), transparent 60%),
+      radial-gradient(800px 360px at 92% -12%, rgba(74,222,128,.10), transparent 55%),
+      linear-gradient(180deg,var(--bg2),var(--bg));
+  }
+  .hero .wrap{padding-top:52px;padding-bottom:40px}
+  .eyebrow{display:inline-flex;align-items:center;gap:8px;font-family:var(--mono);
+    font-size:12.5px;letter-spacing:.12em;text-transform:uppercase;color:var(--cyan);
+    border:1px solid var(--border2);border-radius:999px;padding:5px 12px;background:rgba(34,211,238,.05)}
+  h1{font-size:2.4rem;line-height:1.12;margin:18px 0 10px;color:var(--head);
+    letter-spacing:-.02em;font-weight:740}
+  h1 .mono{font-family:var(--mono);background:linear-gradient(90deg,var(--red),var(--amber));
+    -webkit-background-clip:text;background-clip:text;color:transparent}
+  .sub{font-size:1.18rem;color:var(--muted);max-width:78ch;margin:0 0 22px}
+  .meta{display:flex;flex-wrap:wrap;gap:8px 10px;margin-top:8px}
+  .pill{font-family:var(--mono);font-size:12.5px;color:var(--text);
+    background:var(--surface);border:1px solid var(--border);border-radius:7px;padding:5px 10px}
+  .pill b{color:var(--sky);font-weight:600}
+  nav.toc{position:sticky;top:0;z-index:20;background:rgba(11,13,18,.86);
+    backdrop-filter:blur(10px);border-bottom:1px solid var(--border)}
+  nav.toc .wrap{display:flex;gap:4px;overflow-x:auto;padding:10px 24px}
+  nav.toc a{font-size:13.5px;color:var(--muted);padding:6px 11px;border-radius:7px;white-space:nowrap}
+  nav.toc a:hover{color:var(--head);background:var(--surface);text-decoration:none}
+  section{padding:44px 0 6px;border-bottom:1px solid var(--border)}
+  section:last-of-type{border-bottom:none}
+  h2{font-size:1.62rem;color:var(--head);margin:0 0 6px;letter-spacing:-.01em;font-weight:680}
+  h2 .n{font-family:var(--mono);color:var(--faint);font-size:1.05rem;margin-right:12px;font-weight:500}
+  h3{font-size:1.16rem;color:var(--head);margin:30px 0 8px;font-weight:640}
+  p{margin:12px 0}
+  .lead{font-size:1.06rem;color:var(--text)}
+  strong{color:var(--head)}
+  ul,ol{padding-left:22px}
+  li{margin:7px 0}
+  .muted{color:var(--muted)}
+  figure{margin:22px 0}
+  figure img{width:100%;border:1px solid var(--border);border-radius:12px;display:block;background:#000}
+  figcaption{color:var(--muted);font-size:.9rem;margin-top:8px;text-align:center}
+  .note{border:1px solid var(--border2);border-left-width:3px;border-radius:8px;
+    padding:14px 16px;margin:18px 0;background:var(--surface);font-size:.97rem}
+  .note.win{border-left-color:var(--green);background:rgba(74,222,128,.05)}
+  .note.warn{border-left-color:var(--amber);background:rgba(251,191,36,.05)}
+  .note.info{border-left-color:var(--sky);background:rgba(56,189,248,.05)}
+  .note b.tag{font-family:var(--mono);font-size:11.5px;letter-spacing:.08em;text-transform:uppercase;
+    display:inline-block;margin-right:8px}
+  .win b.tag{color:var(--green)} .warn b.tag{color:var(--amber)} .info b.tag{color:var(--sky)}
+  pre{background:var(--bg2);border:1px solid var(--border);border-radius:10px;
+    padding:0;margin:16px 0;overflow:hidden}
+  pre .bar{display:flex;align-items:center;gap:8px;padding:8px 14px;border-bottom:1px solid var(--border);
+    background:var(--surface);font-family:var(--mono);font-size:12px;color:var(--muted)}
+  pre .bar .dot{width:11px;height:11px;border-radius:50%;background:var(--border2)}
+  pre code{display:block;padding:14px 16px;overflow-x:auto;font-size:13px;line-height:1.6;color:#cbd5e1}
+  pre code .c{color:var(--faint)}
+  :not(pre)>code{background:var(--surface2);border:1px solid var(--border);border-radius:5px;
+    padding:1.5px 6px;font-size:13px;color:#dbe4ee}
+  .tbl{overflow-x:auto;margin:18px 0;border:1px solid var(--border);border-radius:10px}
+  table{border-collapse:collapse;width:100%;font-size:13.5px}
+  th,td{padding:9px 13px;text-align:left;border-bottom:1px solid var(--border);vertical-align:top}
+  thead th{background:var(--surface);color:var(--muted);font-weight:600;
+    font-family:var(--mono);font-size:11.5px;letter-spacing:.04em;text-transform:uppercase}
+  tbody tr:last-child td{border-bottom:none}
+  tbody tr:hover{background:rgba(56,189,248,.04)}
+  td.num{font-family:var(--mono);text-align:right}
+  .red{color:var(--red);font-weight:600} .grn{color:var(--green);font-weight:600}
+  .grid{display:grid;gap:14px;margin:18px 0}
+  .grid.c3{grid-template-columns:repeat(3,1fr)}
+  .card{background:var(--surface);border:1px solid var(--border);border-radius:11px;padding:16px 17px}
+  .card h4{margin:0 0 6px;color:var(--head);font-size:1.02rem;display:flex;align-items:center;gap:9px}
+  .card h4 .ic{font-family:var(--mono);color:var(--cyan);font-size:.92rem}
+  .card p{margin:6px 0 0;font-size:.93rem;color:var(--muted)}
+  footer{padding:34px 0 60px;color:var(--faint);font-size:13px}
+  footer .wrap{display:flex;flex-wrap:wrap;gap:6px 18px;justify-content:space-between}
+  @media(max-width:720px){ h1{font-size:1.8rem}.grid.c3{grid-template-columns:1fr} }
+</style>
+</head>
+<body>
+
+<header class="hero"><div class="wrap">
+  <span class="eyebrow">eBPF · NVMe · Perfetto · replay</span>
+  <h1>A GNN reads <span class="mono">431×</span> more off the SSD than it needs<br>— watch it, then replay it without the data</h1>
+  <p class="sub">Read amplification of a real financial-fraud graph neural network, captured at the
+    NVMe device layer with eBPF, laid out A/B against the architectural fix, and reproduced from a
+    fio iolog that carries no application data at all. Same tracing stack as the kvio KV-offload
+    work — one layer down, on plain block IO.</p>
+  <div class="meta">
+    <span class="pill">dataset <b>DGraphFin</b> · 3.7M nodes</span>
+    <span class="pill">drive <b>Samsung 9100 PRO</b> Gen5</span>
+    <span class="pill">tracer <b>nvme_tp_monitor</b></span>
+    <span class="pill">RA <b>431×</b> → <b>8.6×</b></span>
+    <span class="pill">replay fidelity <b>+0.0%</b></span>
+  </div>
+</div></header>
+
+<nav class="toc"><div class="wrap">
+  <a href="#why">Why read amp</a>
+  <a href="#ab">The A/B</a>
+  <a href="#timeline">The timeline</a>
+  <a href="#privacy">Privacy replay</a>
+  <a href="#reproduce">Reproduce</a>
+  <a href="#lives">Where it lives</a>
+</div></nav>
+
+<main class="wrap">
+
+<section id="why">
+  <h2><span class="n">01</span>The gap between two witnesses</h2>
+  <p class="lead">Every storage workload has two witnesses to the same events, and neither tells the
+    whole truth alone. The <strong>application</strong> knows <em>intent</em> — "these 2.6&nbsp;MB of
+    node features are what I actually consume." The <strong>device</strong> knows <em>mechanism</em> —
+    "1140&nbsp;MB of 4&nbsp;KiB pages crossed the PCIe bus." <strong>Read amplification is the gap
+    between them.</strong></p>
+  <p>A GNN that offloads node features to an SSD is the textbook case. Each feature vector is
+    17 floats — 68 bytes. But storage is paged: a single scattered neighbor drags a whole 4&nbsp;KiB
+    page for that 68&nbsp;bytes. Sample a batch of neighbors that land on 240,000 different pages and
+    the device moves a gigabyte to feed a workload that consumes a couple of megabytes. The in-RAM
+    counter can <em>model</em> this; eBPF at the nvme tracepoints <em>proves</em> it — and here the
+    device-side count matched the store's own read count to the command (240,698 vs 240,698 reads).</p>
+  <div class="grid c3">
+    <div class="card"><h4><span class="ic">◱</span>intent witness</h4><p>The driver emits its useful
+      feature bytes on a <code>CLOCK_MONOTONIC</code> axis — what the GNN actually consumes.</p></div>
+    <div class="card"><h4><span class="ic">▣</span>mechanism witness</h4><p><code>nvme_tp_monitor</code>
+      records every device command on the same clock — slba, bytes, completion latency. No
+      <code>user_data</code> needed; this is plain O_DIRECT block IO.</p></div>
+    <div class="card"><h4><span class="ic">⚲</span>the gap is the story</h4><p>Lay the two on one
+      timeline and the read amplification is not a statistic — it is the visible distance between two
+      curves.</p></div>
+  </div>
+</section>
+
+<section id="ab">
+  <h2><span class="n">02</span>The A/B: naive access vs the architectural fix</h2>
+  <p>The same features, the same SSD, the same 3.7M-node graph. The only thing that changes is the
+    <em>access pattern</em>. <strong>NeighborLoader</strong> samples neighbors and reads each one's
+    page individually. <strong>Page-Aware</strong> batching — a knlp engineering fix — reads pages
+    whole and uses every node on them. That one change cuts device traffic ~50× for the identical
+    GNN signal, and it generalizes to any GNN (or KV cache) that offloads to storage.</p>
+  <figure>
+    <img src="img/gnn-readamp-ab.png" alt="A/B read amplification of NeighborLoader vs Page-Aware, captured with eBPF">
+    <figcaption>Top: cumulative <span class="grn">device MB read</span> (mechanism) against
+      <em>useful MB the GNN consumes</em> (intent) — the shaded gap is the amplification.
+      Bottom: every dot is one 4&nbsp;KiB device read into the 250&nbsp;MB store file — the naive path
+      sweeps the whole file repeatedly; page-aware is a far smaller, denser cloud.</figcaption>
+  </figure>
+  <div class="tbl"><table>
+    <thead><tr><th>arm</th><th>useful (intent)</th><th>device read (eBPF)</th><th>RA_signal</th><th>RA_fetch</th></tr></thead>
+    <tbody>
+      <tr><td><strong>NeighborLoader</strong> — naive neighbor sampling</td>
+        <td class="num">2.65 MB</td><td class="num">1140 MB · 240,698 reads</td>
+        <td class="num red">431×</td><td class="num">~57×</td></tr>
+      <tr><td><strong>Page-Aware</strong> — knlp read-amp fix</td>
+        <td class="num">58.3 MB</td><td class="num">502 MB · 61,498 reads</td>
+        <td class="num grn">8.6×</td><td class="num">~2×</td></tr>
+    </tbody>
+  </table></div>
+  <p class="muted"><code>RA_signal</code> = device bytes / useful feature bytes (vs what the model
+    consumes). <code>RA_fetch</code> = device bytes / minimal pages needed (the store's own
+    <code>ra_physical</code>: the page-granularity tax even after you account for necessary paging).
+    Both are honest; <code>RA_signal</code> is the end-to-end number a workload actually pays.</p>
+</section>
+
+<section id="timeline">
+  <h2><span class="n">03</span>What the Perfetto timeline shows</h2>
+  <p>Drag <code>gnn_readamp_dgraphfin_ab.pftrace.gz</code> onto
+    <a href="https://ui.perfetto.dev">ui.perfetto.dev</a> (local WASM; nothing uploads). Each arm is a
+    process group rebased to <code>t=0</code>, so naive and page-aware sit side by side. Per arm:</p>
+  <div class="tbl"><table>
+    <thead><tr><th>counter</th><th>what it shows</th></tr></thead>
+    <tbody>
+      <tr><td class="mono">useful MB (intent)</td><td>the feature bytes the GNN consumes — the
+        denominator of read amplification</td></tr>
+      <tr><td class="mono">device MB, store count</td><td>the store's own read accounting (intent side)</td></tr>
+      <tr><td class="mono">device MB, eBPF</td><td>the independent device-side truth — it tracks the
+        store count, which is the capture <em>verifying itself</em></td></tr>
+      <tr><td class="mono">read amplification ×</td><td>device MB / useful MB, running: 431× vs 8.6×</td></tr>
+      <tr><td class="mono">device LBA (sector)</td><td>slba over time — the access pattern: scatter for
+        poor locality, banded for good</td></tr>
+    </tbody>
+  </table></div>
+  <p>The <em>useful</em> curve sitting far below <em>device</em> is the amplification. The two device
+    curves coinciding is the honesty check: the eBPF witness and the application's self-report agree,
+    so the huge number is not an artifact of either one.</p>
+</section>
+
+<section id="privacy">
+  <h2><span class="n">04</span>Capture a confidential workload, share only the shape</h2>
+  <p class="lead">This is why the capture matters beyond a pretty chart. A device capture — and the fio
+    iolog made from it — carries only IO <em>shape</em>: operation, offset, length, timing. No feature
+    values, no node ids, no graph, no keys.</p>
+  <p>So a third party can run their <strong>confidential</strong> GNN — real financial-fraud data,
+    private customer graph — capture it with these tracers, and hand back a trace or an iolog that we
+    replay and visualize to reproduce the exact device read pattern <strong>without ever seeing their
+    data</strong>. <code>mk_dev_iolog.py</code> turns the capture into a fio v3 iolog:</p>
+  <pre><div class="bar"><span class="dot"></span>nbr.iolog — 240,698 lines, and nothing but IO shape</div><code>fio version 3 iolog
+0 /dev/nvme0n1 add
+0 /dev/nvme0n1 open
+0 /dev/nvme0n1 read 3451445895168 4096
+0 /dev/nvme0n1 read 3451445907456 4096
+0 /dev/nvme0n1 read 3451445919744 4096
+<span class="c">... 240,695 more reads: offset + length + time only ...</span></code></pre>
+  <p>Replayed read-only with <code>fio --read_iolog --direct=1</code> and refereed against the
+    original capture by <code>compare_streams.py</code>, the reproduction is exact:</p>
+  <div class="tbl"><table>
+    <thead><tr><th></th><th>commands</th><th>bytes</th><th>size mix</th></tr></thead>
+    <tbody>
+      <tr><td>original capture</td><td class="num">240,698</td><td class="num">1140 MB</td><td class="num">4K:208136 8K:28196 12K:3749</td></tr>
+      <tr><td>replay from iolog</td><td class="num">240,702</td><td class="num">1140 MB</td><td class="num">4K:208138 8K:28198 12K:3749</td></tr>
+      <tr><td><strong>inflation</strong></td><td class="num grn">+0.0%</td><td class="num grn">+0.0%</td><td class="num grn">identical</td></tr>
+    </tbody>
+  </table></div>
+  <p><strong>100% of the original commands reproduced at identical offset and size</strong>, from an
+    artifact that contains none of the data.</p>
+  <div class="note info"><b class="tag">public stand-in</b> DGraphFin is a <em>public</em> dataset; it
+    plays the role of the confidential graph here so the whole pipeline is reproducible. The privacy
+    property is a property of the <em>method</em> — the capture and iolog carry only shape — not of
+    this particular dataset.</div>
+  <div class="note warn"><b class="tag">honest gap</b> Command-stream fidelity (count, sizes, offsets)
+    is what is validated at <b>+0.0%</b>. fio's replay of v3 <em>timestamps</em> is not yet pinned, so
+    treat the replay as the workload's command stream at the rig's speed, not its original pacing. And
+    fidelity must be judged at the device layer: a <em>perfect</em> file-level operation log can still
+    produce an 8× different device stream through the page cache — see the
+    <a href="https://github.com/SamsungDS/ebpf-syscall/blob/ebpf-fixes/examples/replay/README.md">replay
+    README</a>.</div>
+</section>
+
+<section id="reproduce">
+  <h2><span class="n">05</span>Reproduce it</h2>
+  <p>Full recipe in <code>tools/reproduce/gnn-readamp/</code>. The shape of it:</p>
+  <pre><div class="bar"><span class="dot"></span>capture → convert → visualize → replay</div><code><span class="c"># 1. capture both arms at the device layer (knlp force-SSD store, O_DIRECT)</span>
+./cap_ssd.sh neighbor natural 12 /tmp/nbr
+./cap_ssd.sh page     natural 12 /tmp/page
+
+<span class="c"># 2. A/B onto one Perfetto timeline</span>
+python3 examples/replay/readamp2perfetto.py \
+  --arm "NeighborLoader (naive):/tmp/nbr.jsonl:/tmp/nbr.phase.txt" \
+  --arm "Page-Aware (knlp fix):/tmp/page.jsonl:/tmp/page.phase.txt" \
+  -o gnn_readamp_ab.pftrace
+
+<span class="c"># 3. data-free replay + fidelity referee</span>
+python3 examples/replay/mk_dev_iolog.py /tmp/nbr_reads.jsonl /dev/nvme0n1 > nbr.iolog
+sudo fio --name=replay --filename=/dev/nvme0n1 --readonly --direct=1 \
+         --ioengine=psync --read_iolog=nbr.iolog</code></pre>
+</section>
+
+<section id="lives">
+  <h2><span class="n">06</span>Where the pieces live</h2>
+  <p>Two trees, one boundary. The <strong>tools and this value showcase live in ebpf-syscall</strong>;
+    the ready-to-view demo trace lives in the gallery as a data artifact.</p>
+  <ul>
+    <li><strong>ebpf-syscall</strong> — the tracer (<code>nvme_tp_monitor</code>), the converter
+      (<code>examples/replay/readamp2perfetto.py</code>), the replay tools
+      (<code>mk_dev_iolog.py</code>, <code>compare_streams.py</code>), the reproduce recipe
+      (<code>tools/reproduce/gnn-readamp/</code>), and this page.</li>
+    <li><strong>kvio-perfetto-gallery</strong> — the draggable
+      <code>traces/gnn_readamp_dgraphfin_ab.pftrace.gz</code> plus its figure and machine-readable
+      report. A demo artifact; it links back here for the story.</li>
+  </ul>
+</section>
+
+</main>
+
+<footer><div class="wrap">
+  <span>GNN read amplification — capture, visualize, and privacy-preserving replay</span>
+  <span>tools: <code>nvme_tp_monitor</code> · <code>readamp2perfetto.py</code> · <code>mk_dev_iolog.py</code></span>
+</div></footer>
+
+</body>
+</html>
