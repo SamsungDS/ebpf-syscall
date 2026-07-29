@@ -13,3 +13,5 @@ libbpf/
 /nvme_uring_cmd_monitor
 /examples/io_uring/io_uring_demo
 /examples/io_uring/nvme_uring_cmd_rw
+docs/_extra/
+docs/_build/
