@@ -33,7 +33,8 @@ sudo apt-get install -y \
     linux-tools-$(uname -r) \
     build-essential \
     git \
-    curl
+    curl \
+    libcjson-dev
 
 # Verify installations
 clang --version
@@ -217,7 +218,7 @@ Detailed event logging enabled
 Monitoring syscalls for 60 seconds...
 Press Ctrl+C to stop early
 
-Monitoring... 59s elapsed, 1s remaining [93868 events captured]]
+Monitoring... 59s elapsed, 1s remaining [93868 events captured]
 Collecting results... Captured 93868 individual events
 
 =====================================================================================
@@ -475,4 +476,58 @@ Generated files:
   - syscall_analysis_20251009_050718_viz_offset_patterns.png (access patterns)
 
 Visualization complete!
+```
+
+## 5. Replaying Syscalls with syscall_replayer
+
+The `syscall_replayer` tool parses JSON log output from `syscall_monitor` and reconstructs syscall information for analysis and replay.
+
+### Build syscall_replayer
+```
+make syscall_replayer
+```
+
+### Usage
+After capturing events with `syscall_monitor` and exporting to JSON:
+
+```bash
+# Run syscall_monitor and export data
+sudo ./syscall_monitor
+# Export to JSON when prompted
+
+# Format the JSON file with fix_json.py before feeding it to the parser
+# This will generate a file named syscall_event_fixed.json
+#process_name is optional, if not provided, all processes will be parsed, else
+#only syscalls from the specified process will be parsed.
+sudo python3 fix_json.py filename process_name
+
+# Run the syscall_event_fixed.json from previous step through filter_syscall_log.py
+# for additional filtering. This will generate a file named final_replay.json used by 
+# the replayer.
+python3 filter_syscall_log.py syscall_event_fixed.json final_replay.json
+
+#Replay the syscalls from final_replay.json , --serial option for single threaded replay,
+# --paced for replay with original timestamps.
+sudo ./syscall_replayer --paced
+```
+
+The replayer will:
+- Parse each JSON entry from the syscall log
+- Display parsed syscall information
+- Report any parsing errors with line numbers
+
+### Example Input Format
+The JSON input should follow this format:
+```json
+{"timestamp_ns": 1234567890, "timestamp_ms": 1234.567, "pid": 1234, "process_name": "test", "syscall_nr": 0, "syscall_name": "read", "fd": 3, "size": 4096, "offset": 0, "filename": "/tmp/test.txt", "io_direction": "read", "ret": 4096, "error_code": 0}
+```
+
+### Expected Output for replayer 
+```
+replayer] openat ts=354657598244078: absolute path, dirfd is ignored
+[replayer] openat '/mnt/nvme2n1/bm_offload_data/QuantTrio-Qwen3-Coder-480B-A35B-Instruct-AWQ@8@3@1737aa809f0562c1@half.pt' cap_fd=266 → replay_fd=5
+[replayer] OK   ts=354657598244078  pid=705300 openat       fd=-100 size=1        off=0        got ret=5
+[replayer] OK   ts=354657598247297  pid=705300 read         fd=266  size=8126464  off=0        got ret=8126464
+[replayer] dispatcher finished — total=96411  ok=92446  failed=0      skipped=3965   mismatch=0
+
 ```
