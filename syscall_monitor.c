@@ -569,7 +569,7 @@ static void export_to_json(struct syscall_stat *stats, int stat_count,
             fprintf(fp, "      \"fd\": %u,\n", e->fd);
             fprintf(fp, "      \"size\": %lu,\n", e->size);
             fprintf(fp, "      \"offset\": %lu\n", e->offset);
-	    fprintf(fp, "      \"filename\": \"%s\",\n", e->filename);
+	    fprintf(fp, "      \"filename\": \"%s\"\n", e->filename);
 	    fprintf(fp, "      \"open_flags_hex\": %u,\n", e->open_flags_hex);
 	    fprintf(fp, "      \"open_flags_str\": \"%s\"\n", e->open_flags_str);
 	    fprintf(fp, "      \"io_direction\": \"%s\",\n", e->ddir == 0 ? "READ" : e->ddir == 1 ? "WRITE" : e->ddir == 2 ? "VREAD" : "VWRITE");
