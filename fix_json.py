@@ -12,7 +12,7 @@ import re
 import sys
 from pathlib import Path
 
-def fix_json_formatting(input_file, output_file):
+def fix_json_formatting(input_file, output_file, process_name=None):
     """Fix JSON formatting issues and extract raw_events"""
 
     try:
@@ -117,10 +117,20 @@ def fix_json_formatting(input_file, output_file):
             # Try to parse as JSON to validate
             parsed = json.loads(fixed_json_str)
             print(f"✓ JSON validation successful")
-            print(f"  Found {len(parsed)} syscall events" if isinstance(parsed, list) else f"  Parsed JSON structure")
+            if isinstance(parsed, list):
+                print(f"  Found {len(parsed)} syscall events")
+                # Filter: keep only entries belonging to the requested process
+                if process_name:
+                    filtered = [entry for entry in parsed if entry.get("process_name") == process_name]
+                    print(f"  After filtering for '{process_name}': {len(filtered)} syscall events")
+                else:
+                    filtered = parsed
+                fixed_json_str = json.dumps(filtered, indent=2)
+            else:
+                print(f"  Parsed JSON structure")
         except json.JSONDecodeError as e:
             print(f"⚠ Warning: JSON validation failed: {e}")
-            print(f"  Proceeding with best-effort fix...")
+            print(f"  Proceeding with best-effort fix (no fio filter applied)...")
 
         # Write to output file
         with open(output_file, 'w') as f:
@@ -147,13 +157,15 @@ def fix_json_formatting(input_file, output_file):
 
 if __name__ == '__main__':
     if len(sys.argv) < 2:
-        print("Usage: python3 fix_json.py <input_file>")
-        print("\nExample:")
-        print("  python3 fix_json.py /home/swarna/sample_syscall_events.json")
+        print("Usage: python3 fix_json.py <input_file> [process_name]")
+        print("\nExamples:")
+        print("  python3 fix_json.py /home/user/sample_syscall_events.json")
+        print("  python3 fix_json.py /home/user/sample_syscall_events.json fio")
         print("\nOutput will be created as: syscall_events_fixed.json in the same directory")
         sys.exit(1)
 
     input_file = sys.argv[1]
+    process_name = sys.argv[2] if len(sys.argv) >= 3 else None
 
     # Generate output filename in the same directory as input
     input_path = Path(input_file)
@@ -162,9 +174,12 @@ if __name__ == '__main__':
 
     print(f"Fixing JSON formatting...")
     print(f"Input:  {input_file}")
-    print(f"Output: {output_file}\n")
+    print(f"Output: {output_file}")
+    if process_name:
+        print(f"Filter: process_name == '{process_name}'")
+    print()
 
-    if fix_json_formatting(str(input_file), str(output_file)):
+    if fix_json_formatting(str(input_file), str(output_file), process_name=process_name):
         print(f"\n✓ Done! You can now use:")
         print(f"  cp {output_file} {output_dir}/syscall_events.json")
         print(f"  sudo ./syscall_replayer")
