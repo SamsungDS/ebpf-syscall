@@ -135,8 +135,9 @@
       device command is attributed back to the KV object that caused it via a cross-layer
       <code>trace_id</code> join, and validated byte-for-byte against the projection.</p>
     <div class="meta">
-      <span class="pill"><b>engine:</b> LMCache <code>raw_block</code> io_uring_cmd passthrough</span>
-      <span class="pill"><b>tracer:</b> eBPF <code>nvme_uring_cmd_monitor</code></span>
+      <span class="pill"><b>engine:</b> LMCache <code>raw_block</code> — passthrough, POSIX, io_uring</span>
+      <span class="pill"><b>join:</b> <code>offset-join</code> — engine-free, backend-decoupled</span>
+      <span class="pill"><b>tracer:</b> eBPF <code>nvme_uring_cmd_monitor</code> / <code>nvme_tp_monitor</code></span>
       <span class="pill"><b>needs:</b> an NVMe char device (<code>/dev/ngXnY</code>)</span>
       <span class="pill"><b>GPU:</b> not required</span>
       <span class="pill"><b>validated:</b> <span style="color:var(--green)">byte-exact on real NVMe</span></span>
@@ -148,7 +149,7 @@
 <nav class="toc"><div class="wrap">
   <a href="#what">What it is</a>
   <a href="#how">How it works</a>
-  <a href="#join">The trace_id join</a>
+  <a href="#join">Object → command mapping</a>
   <a href="#parts">Components</a>
   <a href="#deps">Dependencies</a>
   <a href="#run">How to run</a>
@@ -204,26 +205,118 @@
 </section>
 
 <section id="join">
-  <h2><span class="n">03</span>The cross-layer <span class="mono" style="font-family:var(--mono);color:var(--cyan)">trace_id</span> join</h2>
-  <p>The distinguishing feature: follow <strong>one KV object</strong> from the LMCache
-    payload, through the raw-block <code>max_data_transfer_size</code> split, down to the individual NVMe completions — and
-    back. This is done with a single <code>trace_id</code> threaded across three layers:</p>
+  <h2><span class="n">03</span>Mapping a KV object to its NVMe commands</h2>
+  <p>A single KV store or load does not map to a single disk operation. LMCache hands its
+    <code>raw_block</code> engine one KV <strong>object</strong>; the engine splits it into many
+    NVMe commands (each capped at the device's maximum transfer size). Down at the device, the
+    eBPF tracer sees only those raw commands — an offset, a length, a direction — with <em>no
+    idea</em> which object produced them. This layer's whole job is to reconnect them: take one
+    object and find the exact commands it caused, and go the other way too.</p>
+
+  <h3 style="margin-top:1.6rem">Our original implementation — a tag threaded through the stack</h3>
+  <p>kvio gives every KV-object operation a unique integer we call its <code>trace_id</code> —
+    literally "this store/load, of this object." The trick is getting that label all the way down
+    to the device tracer. io_uring already hands each submission a 64-bit scratch field,
+    <code>user_data</code>, which the kernel returns untouched on completion; programs normally use
+    it as a <strong>completion counter</strong> to match a finished I/O back to the request that
+    started it. That counter was already there. Our original change simply packed the
+    <code>trace_id</code> into the unused <strong>high half</strong> of that same field:</p>
+  <pre><code><span class="v">user_data</span> = (<span class="s">trace_id</span> &lt;&lt; 32) | <span class="k">counter</span></code></pre>
+  <p class="muted"><span class="s">■</span> <code>trace_id</code> — the object's id, the part kvio
+    <strong>added</strong> (high 32 bits). &nbsp; <span class="k">■</span> <code>counter</code> —
+    io_uring's own completion counter, <strong>already there</strong> (low 32 bits, untouched).</p>
+  <p>Because the low half is unchanged, io_uring's completion matching still works exactly as
+    before. The eBPF tracer reads <code>user_data</code> off each NVMe command and recovers the
+    object as <code>trace_id = user_data &gt;&gt; 32</code> — one logical object joined to its N wire
+    commands. <span class="muted">The catch: this needs a change to LMCache's engine. (Every
+    io_uring request carries a <code>user_data</code> field — not just passthrough — but it never
+    travels on the NVMe wire, and ordinary POSIX I/O has no request cookie at all, so this join
+    only reaches as far as the passthrough path our monitor can tie together.)</span></p>
+  <div class="note win"><b class="tag">why K vs V matters</b> A KV cache stores two tensors for
+    every block of tokens — the <strong>Keys (K)</strong> and the <strong>Values (V)</strong>.
+    Traditionally they are bundled into a single object and written together with the same data
+    type, so knowing "which object" is enough. <strong>Asymmetric quantization changes that</strong>:
+    K and V can use different data types / precisions (for example K kept at higher precision than
+    V), making them different-sized halves of the same block. Being able to attribute device bytes
+    to K versus V — not just to the object — is what lets you see that split down at the disk.</div>
+
+  <h3 style="margin-top:1.8rem">The current implementation — no LMCache change needed</h3>
+  <p>The tag works, but needing an engine change — and a <code>user_data</code> field that only
+    passthrough has — is a real limitation. The current kvio <strong>removes it entirely</strong>:
+    it attributes each device command to a KV object using only two things the trace and the
+    semantic record <em>already</em> carry — the command's <strong>byte offset</strong> and its
+    <strong>timestamp</strong>. No engine change — it works across any NVMe path the Linux
+    driver tracepoint can see (POSIX, io_uring on a file, local cuFile/GDS).</p>
+  <div class="grid c2">
+    <div class="card"><h4><span class="ic">▸</span> Space — the device offset</h4>
+      <p>Each object is written to its own <strong>slot</strong>: a distinct, non-overlapping byte
+        range on the device. The object that owns a command is simply the one whose slot the
+        command's offset falls into.</p></div>
+    <div class="card"><h4><span class="ic">▸</span> Time — the monotonic window</h4>
+      <p>The same slot gets reused for later objects, so we also require the command's timestamp to
+        fall inside that object op's <code>[start, end]</code> window — the same monotonic clock on
+        both sides — which separates one use of a slot from the next, and a store from a load.</p></div>
+  </div>
+  <div class="note info"><b class="tag">what is FIEMAP?</b> On a raw block device the object's slot
+    offset and the command's offset are already the same number. But a <strong>file</strong> backend
+    writes at a <em>file</em> offset, while the device reports a <em>physical</em> block address
+    (LBA) — and only the filesystem knows where a file's bytes actually landed on disk.
+    <strong>FIEMAP</strong> is the Linux ioctl that answers exactly that:
+    <a href="https://man7.org/linux/man-pages/man2/ioctl_fiemap.2.html" target="_blank"><code>ioctl(fd, FS_IOC_FIEMAP, …)</code></a>
+    returns a file's <em>extents</em> — each one a <code>(file offset&nbsp;→&nbsp;physical device
+    block)</code> mapping. kvio runs it <strong>once</strong> to build a file→LBA table; after that
+    the object slots and the device commands live in the same coordinate system and the offset+time
+    join just works.</div>
+
+  <h4 style="margin-top:1.6rem">Worked examples — one command, mapped to its object</h4>
+  <p class="muted">Illustrative records, trimmed to the fields that do the join.</p>
+
+  <p><strong>1 · io_uring_cmd passthrough</strong> — the object's tag rides in the command:</p>
+  <pre><code><span class="k">semantic</span>  {<span class="v">"op"</span>:<span class="s">"store"</span>, <span class="v">"object_id"</span>:42, <span class="v">"trace_id"</span>:42, <span class="v">"bytes"</span>:262144}
+<span class="k">command</span>   {<span class="v">"op"</span>:<span class="s">"write"</span>, <span class="v">"slba"</span>:57344, <span class="v">"bytes"</span>:131072, <span class="v">"user_data"</span>:<span class="s">"0x0000002a_00000005"</span>}
+<span class="k">join</span>      user_data &gt;&gt; 32  =  0x2a  =  <span class="s">42</span>   →   object 42</code></pre>
+
+  <p><strong>2 · NVMe Key-Value command set</strong> — the 16-byte object key is <em>inside</em> the command, so no cookie is needed at all:</p>
+  <pre><code><span class="k">semantic</span>  {<span class="v">"op"</span>:<span class="s">"store"</span>, <span class="v">"key_hex"</span>:<span class="s">"a7f3c1…9b"</span>, <span class="v">"bytes"</span>:262144}
+<span class="k">command</span>   {<span class="v">"op"</span>:<span class="s">"kv_store"</span>, <span class="v">"key_hex"</span>:<span class="s">"a7f3c1…9b"</span>, <span class="v">"bytes"</span>:262144}
+<span class="k">join</span>      key_hex matches   →   same object      <span class="muted">(unmodified client, zero engine change)</span></code></pre>
+
+  <p><strong>3 · POSIX <code>O_DIRECT</code> on a file</strong> — offset + time, using FIEMAP to line the offsets up:</p>
+  <pre><code><span class="k">fiemap</span>    file 0x0700000..0x0740000  →  device LBA 57344     <span class="muted">(once, via FS_IOC_FIEMAP)</span>
+<span class="k">semantic</span>  {<span class="v">"object_id"</span>:7, <span class="v">"slot_dev_off"</span>:29360128, <span class="v">"bytes"</span>:262144,
+           <span class="v">"ts_start"</span>:1828074395351013, <span class="v">"ts"</span>:1828074395894120}
+<span class="k">command</span>   {<span class="v">"op"</span>:<span class="s">"write"</span>, <span class="v">"slba"</span>:57344, <span class="v">"bytes"</span>:131072, <span class="v">"ts"</span>:1828074395502771}
+<span class="k">join</span>      offset  57344 × 512 = 29360128  ∈  object 7's slot [29360128, 29622272)
+          time    1828074395502771       ∈  [ts_start, ts]      →  the store
+                                                                   →  <span class="s">object 7</span></code></pre>
+  <p class="muted">The 256&nbsp;KiB object splits into two 128&nbsp;KiB writes; the second (slba 57600)
+    lands in the same slot and joins to the same object. cuFile / GDS uses this identical
+    offset+time path — no engine change — pending a GPU-direct-capable box.</p>
+  <div class="note win"><b class="tag">the shift</b> Because attribution no longer depends on the
+    engine, kvio stops being a passthrough tool and becomes <strong>backend-decoupled</strong>
+    across the NVMe paths the Linux driver tracepoint can observe — POSIX
+    <code>pread</code>/<code>pwrite</code>, io_uring on a file, local cuFile/GDS. (Paths that own
+    the controller in user space — SPDK/VFIO, xNVMe-SPDK — bypass that tracepoint and are out of
+    scope.) Capture the device commands with <code>nvme_tp_monitor</code>, attribute them per KV
+    object by offset+time, and replay the command stream elsewhere with device-shape fidelity
+    (<em>payload-free</em>: no bytes, no keys). The <code>user_data</code> path becomes just the
+    ground-truth calibration arm.</div>
+
+  <h4 style="margin-top:1.4rem">Validation status</h4>
   <div class="tbl"><table>
-    <thead><tr><th>Layer</th><th>What it emits</th><th>Carries trace_id as</th></tr></thead>
+    <thead><tr><th>Backend</th><th>Join</th><th>Status</th></tr></thead>
     <tbody>
-      <tr><td>LMCache <code>raw_block</code></td><td>a semantic record per KV object op: <code>op</code>, <code>bytes</code>, <code>part</code>, <code>object_id</code>, <code>components</code></td><td>the record's <code>trace_id</code> field</td></tr>
-      <tr><td>io_uring / rust engine</td><td>the submission for each device command</td><td class="num">user_data = (trace_id&lt;&lt;32) | counter</td></tr>
-      <tr><td>eBPF NVMe tracer</td><td>every <code>nvme_setup_cmd</code>: opcode, slba, nlb, bytes</td><td>reads back <code>user_data</code></td></tr>
+      <tr><td><code>raw_block</code> / io_uring_cmd</td><td>user_data <em>and</em> offset-join</td><td><span style="color:var(--green)">proven</span> — offset-join in exact agreement with the user_data ground truth</td></tr>
+      <tr><td>NVMe KV command set</td><td>key-join (key is in the SQE)</td><td><span style="color:var(--green)">proven</span> — unmodified clients, exact per-object</td></tr>
+      <tr><td>POSIX <code>O_DIRECT</code> on a file (XFS) + FIEMAP</td><td>offset-join</td><td><span style="color:var(--green)">proven</span> — every object command attributed to the correct object; op (write/read) recovered from the time window; filesystem-overhead commands correctly rejected</td></tr>
+      <tr><td>cuFile / GDS</td><td>offset-join</td><td><span style="color:#c90">projected</span> — same shape, pending a GPU-direct-capable box</td></tr>
     </tbody>
   </table></div>
-  <p>The validator recovers the object for any command as <code>trace_id = user_data &gt;&gt; 32</code>,
-    joining one logical intent to its N (≤ MDTS) wire commands. The low 32 bits stay a unique
-    completion counter, so CQE matching is unchanged.</p>
-  <div class="note win"><b class="tag">K/V aware</b> The semantic record carries a
-    <code>part</code> (<code>kv</code>/<code>k</code>/<code>v</code>) and, for packed
-    asymmetric-KV blobs, a <code>components</code> breakdown (K / V / scale bytes) read from
-    the <code>EncodedKV</code> header — so a store's device bytes can be attributed to K vs V
-    once the codec emits an asymmetric split.</p>
+  <div class="note info"><b class="tag">other AI workloads</b> When a workload has no clean object
+    abstraction the way a KV cache does, the same capture still drives a <strong>device-exact fio
+    replay</strong> (<code>fio --read_iolog --direct=1</code> from the driver trace): the command
+    stream is reproduced faithfully at the device layer even where per-object attribution isn't
+    available.</div>
 </section>
 
 <section id="parts">
