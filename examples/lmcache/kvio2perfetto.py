@@ -277,7 +277,14 @@ class Capture:
                 by_lo[lo].append((t0, t1, lo + hdr + pay, r))
             ulos = sorted(by_lo)
             dirmap = {"store": "write", "load": "read"}
+            # A proper spatiotemporal INTERVAL join: a command is attributed to an
+            # object only if it lies FULLY inside that object's slot
+            # ([off, off+len) within [lo, hi)) AND its time falls in an op window.
+            # A command that starts in a slot but ends past hi spans an object
+            # boundary (block-layer bio merge) or a gap -- report it separately and
+            # do NOT force it onto one object.
             n_gt = n_agree = n_off_only = 0
+            n_unique = n_cross = n_gap = n_unmatched = n_cookie = 0
             for c in cmds:
                 cookie = int(c.get("user_data", 0)) >> 32
                 c["tid"] = 0
@@ -287,29 +294,57 @@ class Capture:
                 lba = (int(c["bytes"]) // nlb if nlb and c.get("bytes")
                        else args.lba_bytes)
                 off = int(c["slba"]) * lba
+                cmd_len = int(c.get("bytes", 0)) or (nlb * lba)
+                cmd_end = off + cmd_len
                 ts = int(c["ts"])
+                if cookie:
+                    n_cookie += 1
                 j = bisect.bisect_right(ulos, off) - 1
                 if j < 0:
+                    n_unmatched += 1
                     continue
-                best = None
-                for t0, t1, hi, r in by_lo[ulos[j]]:
-                    if off < hi and t0 <= ts <= t1:
+                lo = ulos[j]
+                ops = by_lo[lo]
+                hi = ops[0][2]                    # slot end (shared by this object's ops)
+                if off >= hi:                     # starts in a gap after the slot
+                    n_unmatched += 1
+                    continue
+                if cmd_end > hi:                  # spills past the slot end
+                    nxt = ulos[j + 1] if j + 1 < len(ulos) else None
+                    if nxt is not None and nxt < cmd_end:
+                        n_cross += 1              # reaches into the next object
+                    else:
+                        n_gap += 1               # runs off into an unallocated gap
+                    continue
+                best = None                       # fully contained -> pick op by time window
+                for t0, t1, _hi, r in ops:
+                    if t0 <= ts <= t1:
                         if best is None:
                             best = r
                         if dirmap.get(r.get("op")) == c.get("op_name"):
                             best = r
                             break
-                if best is not None:
-                    c["tid"] = best["trace_id"]
-                    if cookie:
-                        n_gt += 1
-                        if best.get("_cookie_tid") == cookie:
-                            n_agree += 1
-                    else:
-                        n_off_only += 1
+                if best is None:
+                    n_unmatched += 1              # in-slot spatially, no time window matched
+                    continue
+                c["tid"] = best["trace_id"]
+                n_unique += 1
+                if cookie:
+                    n_gt += 1
+                    if best.get("_cookie_tid") == cookie:
+                        n_agree += 1
+                else:
+                    n_off_only += 1
+            # legacy keys (attributed == uniquely attributed)
             self.stats["offset_join_gt_cmds"] = n_gt
             self.stats["offset_join_agree"] = n_agree
             self.stats["offset_join_extra"] = n_off_only
+            # interval-join accounting (report over ALL commands)
+            self.stats["offset_join_unique"] = n_unique
+            self.stats["offset_join_cross_object"] = n_cross
+            self.stats["offset_join_gap_spill"] = n_gap
+            self.stats["offset_join_unmatched"] = n_unmatched
+            self.stats["offset_join_cookie_cmds"] = n_cookie
 
         # --- join ------------------------------------------------------
         # A trace_id can legitimately repeat only if two RawBlockCore
@@ -996,6 +1031,15 @@ def main():
                   f"{'' if ag == gt else '  <-- INVESTIGATE'}"
                   f" | offset-attributed cookieless cmds: "
                   f"{s['offset_join_extra']}")
+        if cap.join_by_offset:
+            print(f"  offset-join interval accounting: "
+                  f"unique={s.get('offset_join_unique', 0)} "
+                  f"cross-object={s.get('offset_join_cross_object', 0)} "
+                  f"gap-spill={s.get('offset_join_gap_spill', 0)} "
+                  f"unmatched={s.get('offset_join_unmatched', 0)}"
+                  + (f"  <-- cross-boundary commands present (bio merges); "
+                     "attribute bytes, not whole commands"
+                     if s.get('offset_join_cross_object') else ""))
         if s["dup_trace_id"] and not cap.join_by_key and not cap.join_by_offset:
             # under --join-by-key a store+load pair per key IS two
             # occurrences of one synthetic id — expected, not a warning.
