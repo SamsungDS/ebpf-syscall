@@ -308,10 +308,18 @@
     <tbody>
       <tr><td><code>raw_block</code> / io_uring_cmd</td><td>user_data <em>and</em> offset-join</td><td><span style="color:var(--green)">proven</span> — offset-join in exact agreement with the user_data ground truth</td></tr>
       <tr><td>NVMe KV command set</td><td>key-join (key is in the SQE)</td><td><span style="color:var(--green)">proven</span> — unmodified clients, exact per-object</td></tr>
-      <tr><td>POSIX <code>O_DIRECT</code> on a file (XFS) + FIEMAP</td><td>offset-join</td><td><span style="color:var(--green)">proven</span> — every object command attributed to the correct object; op (write/read) recovered from the time window; filesystem-overhead commands correctly rejected</td></tr>
+      <tr><td>POSIX <code>O_DIRECT</code> on a file (XFS) + FIEMAP</td><td>offset-join</td><td><span style="color:var(--green)">proven</span> — every object command attributed to the correct object; op (write/read) recovered from the time window; filesystem-overhead commands rejected; block-layer-merged commands spanning two objects split and byte-attributed (192 real merges validated)</td></tr>
       <tr><td>cuFile / GDS</td><td>offset-join</td><td><span style="color:#c90">projected</span> — same shape, pending a GPU-direct-capable box</td></tr>
     </tbody>
   </table></div>
+  <div class="note win"><b class="tag">one command isn't always one object</b> The Linux block
+    layer merges adjacent I/O, so a single NVMe command can span the tail of one object and the
+    head of the next — this happens whenever objects are smaller than the device's maximum command
+    size. The join intersects each command's <em>whole</em> byte range with the object slots: a
+    command fully inside one slot goes to that object; a command that straddles a boundary has its
+    bytes attributed to each object it touches and is reported separately — never guessed onto one.
+    Proven on real hardware: 192 merged 128&nbsp;KiB commands, each spanning four 32&nbsp;KiB
+    objects, split correctly.</div>
   <div class="note info"><b class="tag">other AI workloads</b> When a workload has no clean object
     abstraction the way a KV cache does, the same capture still drives a <strong>device-exact fio
     replay</strong> (<code>fio --read_iolog --direct=1</code> from the driver trace): the command
