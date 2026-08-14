@@ -19,23 +19,31 @@
 // ring buffer, and the pid filter applies transitively (completions run in
 // IRQ context where current is meaningless; only tracked submissions match).
 //
-// Optional: fentry on the CQ-overflow path (io_cqring_event_overflow on 6.8,
-// io_cqe_overflow on newer kernels) so overflowed completions appear as
-// their own events; userspace probes vmlinux BTF and autoloads whichever
-// symbol exists.
+// Optional: fentry on the CQ-overflow paths (io_cqring_event_overflow on 6.8;
+// io_alloc_ocqe on newer kernels, with io_cqe_overflow plus
+// io_cqe_overflow_locked as a fallback) so overflowed completions appear as
+// their own events.  io_alloc_ocqe is common to both modern CQ locking modes;
+// the two helper probes must otherwise be attached together.  Userspace probes
+// vmlinux BTF and selects exactly one complete strategy to avoid double counts.
 //
 // Grounded in live BTF (kernel 6.8, nvme_core module BTF):
 //   struct io_uring_cmd { struct file *file; const struct io_uring_sqe *sqe;
 //                         ...; u32 cmd_op; ... }
 //   io_uring_sqe.cmd[] is at offset 48 (verified via pahole).
-//   nvme_uring_cmd_end_io(struct request *req, blk_status_t err)
-//     (FUNC_PROTO vlen=2 'req','err'; static but address-taken as
-//      req->end_io, so present in BTF and fentry-attachable)
+//   nvme_uring_cmd_end_io(struct request *req, blk_status_t err,
+//                         const struct io_comp_batch *iob)
+//     (FUNC_PROTO vlen=3; this probe intentionally consumes the stable req/err
+//      prefix; static but address-taken as req->end_io, so present in BTF and
+//      fentry-attachable)
 //   struct nvme_uring_cmd is uapi (not in vmlinux BTF) -> defined locally.
 #include "vmlinux.h"
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_tracing.h>
 #include <bpf/bpf_core_read.h>
+
+/* Added with the modern CQ-overflow helpers.  Keep this forward declaration
+ * so the source still compiles with a vmlinux.h generated on older kernels. */
+struct io_big_cqe;
 
 #define SQE_CMD_OFF 48   /* io_uring_sqe.cmd[] offset */
 
@@ -246,20 +254,38 @@ static __always_inline int emit_ovf(__u64 user_data, __s32 res)
 	return 0;
 }
 
+static __always_inline int emit_cqe_ovf(const struct io_cqe *cqe)
+{
+	struct io_cqe snapshot = {};
+
+	if (cqe)
+		bpf_probe_read_kernel(&snapshot, sizeof(snapshot), cqe);
+	return emit_ovf(snapshot.user_data, snapshot.res);
+}
+
 SEC("fentry/io_cqring_event_overflow")   /* 6.8 */
 int BPF_PROG(cq_ovf_68, struct io_ring_ctx *ring_ctx, __u64 user_data, __s32 res)
 { return emit_ovf(user_data, res); }
 
-SEC("fentry/io_cqe_overflow")            /* 6.16+ (ctx, struct io_uring_cqe *) */
-int BPF_PROG(cq_ovf_616, struct io_ring_ctx *ring_ctx, struct io_uring_cqe *cqe)
+SEC("fentry/io_alloc_ocqe")              /* 6.16+, both CQ locking modes */
+int BPF_PROG(cq_ovf_alloc, struct io_ring_ctx *ring_ctx, struct io_cqe *cqe,
+	     struct io_big_cqe *big_cqe, gfp_t gfp)
 {
-	__u64 ud = 0;
-	__s32 res = 0;
-	if (cqe) {
-		bpf_probe_read_kernel(&ud, sizeof(ud), &cqe->user_data);
-		bpf_probe_read_kernel(&res, sizeof(res), &cqe->res);
-	}
-	return emit_ovf(ud, res);
+	return emit_cqe_ovf(cqe);
+}
+
+SEC("fentry/io_cqe_overflow")            /* 6.16+ */
+int BPF_PROG(cq_ovf_616, struct io_ring_ctx *ring_ctx, struct io_cqe *cqe,
+	     struct io_big_cqe *big_cqe)
+{
+	return emit_cqe_ovf(cqe);
+}
+
+SEC("fentry/io_cqe_overflow_locked")
+int BPF_PROG(cq_ovf_locked, struct io_ring_ctx *ring_ctx, struct io_cqe *cqe,
+	     struct io_big_cqe *big_cqe)
+{
+	return emit_cqe_ovf(cqe);
 }
 
 char _license[] SEC("license") = "GPL";

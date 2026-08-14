@@ -12,7 +12,8 @@
 //   {"event_type":"clock_anchor",...} monotonic_ns + realtime_ns, at start and
 //                                    every 10s — lets consumers align this
 //                                    trace with wall-clock logs
-//   {"event_type":"drops","dropped":N} final line: ringbuf reserve failures
+//   {"event_type":"drops","dropped":N,...} final line: producer drops,
+//                                    consumer drain, and optional quiescence
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -172,17 +173,22 @@ static int handle_event(void *ctx, void *data, size_t sz)
 	return 0;
 }
 
-static void emit_anchor(void)
+static int emit_anchor(void)
 {
 	struct timespec mono, real;
-	clock_gettime(CLOCK_MONOTONIC, &mono);
-	clock_gettime(CLOCK_REALTIME, &real);
-	fprintf(out,
+	int ret;
+
+	if (clock_gettime(CLOCK_MONOTONIC, &mono) ||
+	    clock_gettime(CLOCK_REALTIME, &real))
+		return -errno;
+	ret = fprintf(out,
 		"{\"event_type\":\"clock_anchor\",\"monotonic_ns\":%llu,"
 		"\"realtime_ns\":%llu}\n",
 		(unsigned long long)mono.tv_sec * 1000000000ULL + mono.tv_nsec,
 		(unsigned long long)real.tv_sec * 1000000000ULL + real.tv_nsec);
-	fflush(out);
+	if (ret < 0 || fflush(out))
+		return errno ? -errno : -EIO;
+	return 0;
 }
 
 static int vmlinux_has_func(const char *name)
@@ -202,14 +208,26 @@ static int vmlinux_has_func(const char *name)
  * step 2: - CQ-overflow probes (signature drift safety net)
  * step 3: - device completion probe (legacy submission-only behavior) */
 static struct nvme_uring_cmd_monitor_bpf *
-open_load_attach(unsigned int pid, int step, int have68, int have616)
+open_load_attach(unsigned int pid, int step, int have68, int have616,
+		 int have_locked, int have_alloc, int trace_overflow)
 {
 	struct nvme_uring_cmd_monitor_bpf *skel = nvme_uring_cmd_monitor_bpf__open();
+	int use_legacy = trace_overflow && have68;
+	int use_alloc = trace_overflow && !have68 && have_alloc;
+	int use_modern = trace_overflow && !have68 && !have_alloc &&
+			 have616 && have_locked;
+
 	if (!skel)
 		return NULL;
 	skel->rodata->targ_pid = pid;
-	bpf_program__set_autoload(skel->progs.cq_ovf_68, step < 2 && have68);
-	bpf_program__set_autoload(skel->progs.cq_ovf_616, step < 2 && have616 && !have68);
+	bpf_program__set_autoload(skel->progs.cq_ovf_68,
+				  step < 2 && use_legacy);
+	bpf_program__set_autoload(skel->progs.cq_ovf_616,
+				  step < 2 && use_modern);
+	bpf_program__set_autoload(skel->progs.cq_ovf_locked,
+				  step < 2 && use_modern);
+	bpf_program__set_autoload(skel->progs.cq_ovf_alloc,
+				  step < 2 && use_alloc);
 	if (step >= 1)
 		bpf_program__set_autoload(skel->progs.ns_head_chr, false);
 	if (step >= 3)
@@ -227,6 +245,12 @@ int main(int argc, char **argv)
 	unsigned int pid = 0;
 	int dur = 0;
 	const char *jsonl = NULL;
+	unsigned long long drained = 0;
+	int poll_error = 0;
+	int drain_error = 0;
+	int exit_code = 0;
+	int quiesced = 0;
+	int trace_overflow = 1;
 
 	for (int i = 1; i < argc; i++) {
 		if (!strcmp(argv[i], "--pid") && i+1 < argc) pid = (unsigned)atoi(argv[++i]);
@@ -234,15 +258,27 @@ int main(int argc, char **argv)
 		else if (!strcmp(argv[i], "--jsonl") && i+1 < argc) jsonl = argv[++i];
 		else if (!strcmp(argv[i], "--lba-size") && i+1 < argc) lba_size = (unsigned)atoi(argv[++i]);
 		else if (!strcmp(argv[i], "--kv")) kv_mode = 1;
+		else if (!strcmp(argv[i], "--quiesced")) quiesced = 1;
+		else if (!strcmp(argv[i], "--no-cq-overflow")) trace_overflow = 0;
 		else if (!strcmp(argv[i], "--help")) {
 			fprintf(stderr, "usage: %s [--pid P] [--dur S] [--jsonl PATH] "
-				"[--lba-size N] [--kv]\n"
+				"[--lba-size N] [--kv] [--quiesced --no-cq-overflow]\n"
 				"  --kv  target is an NVMe Key-Value namespace: decode "
 				"store/retrieve/delete/exist\n"
 				"        + the 16-byte object key from the SQE "
-				"(key_hex) instead of slba/nlb\n", argv[0]);
+				"(key_hex) instead of slba/nlb\n"
+				"  --quiesced  assert PID-scoped producers are stopped "
+				"before signaling the monitor\n"
+				"  --no-cq-overflow  disable system-wide overflow probes\n",
+				argv[0]);
 			return 0;
 		} else { fprintf(stderr, "unknown arg %s\n", argv[i]); return 2; }
+	}
+	if (quiesced && (!pid || dur || trace_overflow)) {
+		fprintf(stderr,
+			"--quiesced requires --pid, no --dur, and "
+			"--no-cq-overflow\n");
+		return 2;
 	}
 
 	out = stdout;
@@ -250,13 +286,23 @@ int main(int argc, char **argv)
 
 	int have68 = vmlinux_has_func("io_cqring_event_overflow");
 	int have616 = vmlinux_has_func("io_cqe_overflow");
-	if (!have68 && !have616)
-		fprintf(stderr, "note: no CQ-overflow symbol in vmlinux BTF; overflow probe off\n");
+	int have_locked = vmlinux_has_func("io_cqe_overflow_locked");
+	int have_alloc = vmlinux_has_func("io_alloc_ocqe");
+	int use_legacy = trace_overflow && have68;
+	int use_alloc = trace_overflow && !have68 && have_alloc;
+	int use_modern = trace_overflow && !have68 && !have_alloc &&
+			 have616 && have_locked;
+
+	if (trace_overflow && !use_legacy && !use_alloc && !use_modern)
+		fprintf(stderr,
+			"note: no complete CQ-overflow probe set in vmlinux "
+			"BTF; overflow probes off\n");
 
 	struct nvme_uring_cmd_monitor_bpf *skel = NULL;
 	int step;
 	for (step = 0; step <= 3 && !skel; step++) {
-		skel = open_load_attach(pid, step, have68, have616);
+		skel = open_load_attach(pid, step, have68, have616,
+					have_locked, have_alloc, trace_overflow);
 		if (!skel && step < 3)
 			fprintf(stderr, "attach step %d failed; degrading (%s)\n", step,
 				step == 0 ? "dropping multipath head probe" :
@@ -271,24 +317,106 @@ int main(int argc, char **argv)
 
 	signal(SIGINT, on_sig); signal(SIGTERM, on_sig);
 	fprintf(stderr, "nvme_uring_cmd_monitor: attached (pid=%u, lba=%u, "
-		"completions=%s, cq_overflow=%s)\n", pid, lba_size,
+		"completions=%s, cq_overflow=%s, cq_overflow_locked=%s, "
+		"cq_overflow_alloc=%s, "
+		"cq_overflow_complete=%s, quiesced=%s)\n", pid, lba_size,
 		step < 3 ? "on" : "OFF",
-		(step < 2 && (have68 || have616)) ? "on" : "off");
+		(step < 2 && (use_legacy || use_modern || use_alloc)) ? "on" : "off",
+		(step < 2 && use_modern) ? "on" : "off",
+		(step < 2 && use_alloc) ? "on" : "off",
+		(step < 2 && (use_modern || use_alloc)) ? "yes" : "no",
+		quiesced ? "yes" : "no");
+	fprintf(out,
+		"{\"event_type\":\"capabilities\",\"completions\":%s,"
+		"\"cq_overflow_legacy\":%s,\"cq_overflow_unlocked\":%s,"
+		"\"cq_overflow_locked\":%s,"
+		"\"cq_overflow_alloc\":%s,\"cq_overflow_complete\":%s,"
+		"\"quiesced_contract\":%s}\n",
+		step < 3 ? "true" : "false",
+		(step < 2 && use_legacy) ? "true" : "false",
+		(step < 2 && use_modern) ? "true" : "false",
+		(step < 2 && use_modern) ? "true" : "false",
+		(step < 2 && use_alloc) ? "true" : "false",
+		(step < 2 && (use_modern || use_alloc)) ? "true" : "false",
+		quiesced ? "true" : "false");
 
-	emit_anchor();
+	poll_error = emit_anchor();
+	if (poll_error)
+		fprintf(stderr, "initial clock anchor failed: %s\n",
+			strerror(-poll_error));
 	time_t t0 = time(NULL), last_anchor = t0;
-	while (!stop) {
+	while (!stop && !poll_error) {
 		int n = ring_buffer__poll(rb, 200);
-		if (n < 0 && n != -EINTR) break;
+		if (n < 0 && n != -EINTR) {
+			poll_error = n;
+			fprintf(stderr, "ring buffer poll failed: %s\n",
+				strerror(-n));
+			break;
+		}
 		time_t now = time(NULL);
-		if (difftime(now, last_anchor) >= 10) { emit_anchor(); last_anchor = now; }
+		if (difftime(now, last_anchor) >= 10) {
+			poll_error = emit_anchor();
+			if (poll_error) {
+				fprintf(stderr, "clock anchor failed: %s\n",
+					strerror(-poll_error));
+				break;
+			}
+			last_anchor = now;
+		}
 		if (dur && difftime(now, t0) >= dur) break;
 	}
+
+	/* Detach the producers before draining the userspace consumer.  In the
+	 * quiesced mode the controller also holds the target at its done/F
+	 * barrier, so its PID-scoped command stream has already stopped. */
+	nvme_uring_cmd_monitor_bpf__detach(skel);
+	for (;;) {
+		int n = ring_buffer__consume(rb);
+
+		if (n > 0) {
+			drained += (unsigned int)n;
+			continue;
+		}
+		if (n < 0) {
+			drain_error = n;
+			fprintf(stderr, "ring buffer drain failed: %s\n",
+				strerror(-n));
+		}
+		break;
+	}
+	if (poll_error || drain_error)
+		exit_code = 1;
+	{
+		int anchor_error = emit_anchor();
+
+		if (anchor_error) {
+			fprintf(stderr, "final clock anchor failed: %s\n",
+				strerror(-anchor_error));
+			exit_code = 1;
+		}
+	}
+	if (fprintf(out,
+		"{\"event_type\":\"drops\",\"dropped\":%llu,"
+		"\"drained_after_detach\":%llu,\"consumer_drained\":%s,"
+		"\"quiesced_contract\":%s,\"consumer_complete\":%s}\n",
+		(unsigned long long)skel->bss->dropped, drained,
+		exit_code ? "false" : "true",
+		quiesced ? "true" : "false",
+		(quiesced && !exit_code) ? "true" : "false") < 0 ||
+	    fflush(out)) {
+		perror("flush trace output");
+		exit_code = 1;
+	}
 	ring_buffer__free(rb);
-	fprintf(out, "{\"event_type\":\"drops\",\"dropped\":%llu}\n",
-		(unsigned long long)skel->bss->dropped);
 	nvme_uring_cmd_monitor_bpf__destroy(skel);
-	if (jsonl) fclose(out);
-	fprintf(stderr, "nvme_uring_cmd_monitor: done\n");
-	return 0;
+	if (jsonl && fclose(out)) {
+		perror("close trace output");
+		exit_code = 1;
+	}
+	fprintf(stderr,
+		"nvme_uring_cmd_monitor: done (drained_after_detach=%llu, "
+		"consumer_drained=%s, consumer_complete=%s)\n",
+		drained, exit_code ? "no" : "yes",
+		(quiesced && !exit_code) ? "yes" : "no");
+	return exit_code;
 }

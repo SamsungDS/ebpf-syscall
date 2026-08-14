@@ -215,8 +215,8 @@ External NVMe command evidence
 
 JSON and CQEs prove the userspace workload outcome, but not device-level trace
 attribution.  Capture command evidence in a separate, non-performance run and
-fail the run unless the tracer reports zero drops and overflow, exactly
-``count`` unique ``nvme_cmd`` records, and exactly ``count`` matching
+fail the run unless the tracer reports zero producer drops, exactly ``count``
+unique ``nvme_cmd`` records, and exactly ``count`` matching
 ``nvme_cmp`` records keyed by ``user_data``.  The low 32 bits of ``user_data``
 must be the complete sequence ``0..count-1``; its high 32 bits must match the
 expected trace group.  Every command must be opcode ``0x02`` with
@@ -226,3 +226,38 @@ expected trace group.  Every command must be opcode ``0x02`` with
 ``cdw12[15:0] == blocks_per_io - 1``.  Every matching completion must report
 zero error.  Command-setup records without matching successful completions are
 not proof that I/O reached the device.
+
+For this proof, start the monitor with the workload PID plus ``--quiesced`` and
+``--no-cq-overflow``.  The overflow hooks are system-wide, so disabling them
+leaves only PID-scoped command records and their transitively filtered device
+completions as ring-buffer producers.  The smoke JSON's ``cq.koverflow`` start,
+end, and delta values are the authoritative CQ-overflow proof.  The optional
+BPF overflow events are supplementary diagnostics: on modern kernels the
+capability record reports complete coverage only when the shared
+``io_alloc_ocqe`` helper attached, or when both ``io_cqe_overflow`` and
+``io_cqe_overflow_locked`` attached.  The allocator strategy is preferred
+because it covers both paths without double-counting and remains attachable
+when the compiler inlines the locked wrapper.
+
+The workload must remain blocked after ``done`` while the controller signals
+and waits for the monitor.  Submission fentry returns before request issue,
+device end-io fentry returns before the CQE can be reaped, and ``done`` follows
+the final CQE.  It is therefore the causal quiescence boundary for these
+PID-scoped producers.  The monitor then detaches every BPF link, consumes the
+ring buffer until it is empty, emits a final clock anchor, and writes its
+terminal ``drops`` record.  Require monitor exit status zero and all of these
+terminal fields:
+
+* ``dropped == 0``;
+* ``consumer_drained == true``;
+* ``quiesced_contract == true``;
+* ``consumer_complete == true``; and
+* ``drained_after_detach >= 0`` (the value is informational).
+
+Only after the monitor has exited successfully may the controller send ``F``
+to let the workload unregister its buffers and exit.  This ordering proves
+that no committed command or completion record was abandoned in
+the userspace ring-buffer consumer and prevents PID reuse during attribution.
+The monitor rejects ``--quiesced`` without a nonzero ``--pid``, with ``--dur``,
+or without ``--no-cq-overflow``.  An ordinary duration expiry or signal does
+not claim this completeness contract.
