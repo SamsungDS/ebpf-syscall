@@ -24,6 +24,12 @@ from the repository's ``docs/*.html``.
    kvio-perfetto
    gnn-readamp
 
+.. toctree::
+   :maxdepth: 1
+   :caption: Tools
+
+   nvme-uring-cmd-smoke
+
 Styled showcase pages
 ---------------------
 
