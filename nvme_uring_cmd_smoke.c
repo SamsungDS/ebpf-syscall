@@ -55,13 +55,17 @@ struct nvme_uring_cmd {
 #ifndef BLOCK_URING_CMD_ALLOC_IOBUF
 #define BLOCK_URING_CMD_ALLOC_IOBUF	_IO(0x12, 1)
 #endif
+#ifndef BLOCK_URING_CMD_ALLOC_IOBUF_F_STRICT_PGSIZE
+#define BLOCK_URING_CMD_ALLOC_IOBUF_F_STRICT_PGSIZE	(1U << 0)
+#endif
 #ifndef IORING_URING_CMD_FIXED
 #define IORING_URING_CMD_FIXED		(1U << 0)
 #endif
 
 /* Allocate a pool buffer of @len into buffer-table @slot (carried in plain SQE
  * fields so it works on the 128-byte NVMe ring). Returns the cqe res. */
-static int alloc_iobuf(struct io_uring *ring, int fd, unsigned slot, unsigned len)
+static int alloc_iobuf(struct io_uring *ring, int fd, unsigned slot, unsigned len,
+		       int strict)
 {
 	struct io_uring_sqe *sqe = io_uring_get_sqe(ring);
 	struct io_uring_cqe *cqe;
@@ -74,6 +78,7 @@ static int alloc_iobuf(struct io_uring *ring, int fd, unsigned slot, unsigned le
 	sqe->cmd_op = BLOCK_URING_CMD_ALLOC_IOBUF;
 	sqe->addr = slot;			/* target slot */
 	sqe->addr3 = len;			/* buffer length */
+	sqe->len = strict ? BLOCK_URING_CMD_ALLOC_IOBUF_F_STRICT_PGSIZE : 0;
 	if (io_uring_submit_and_wait(ring, 1) < 0) return -errno;
 	if (io_uring_peek_cqe(ring, &cqe)) return -EAGAIN;
 	res = cqe->res;
@@ -87,7 +92,7 @@ int main(int argc, char **argv)
 	unsigned count = 256, qd = 8, len = 4096, lba = 512;
 	unsigned cmds_per_obj = 8;
 	unsigned long long trace_base = 7000;
-	int premap = 0, hugepage = 0;
+	int premap = 0, strict_premap = 0, hugepage = 0;
 
 	for (int i = 1; i < argc; i++) {
 		if (!strcmp(argv[i], "--dev") && i+1 < argc) dev = argv[++i];
@@ -98,13 +103,19 @@ int main(int argc, char **argv)
 		else if (!strcmp(argv[i], "--cmds-per-obj") && i+1 < argc) cmds_per_obj = (unsigned)atoi(argv[++i]);
 		else if (!strcmp(argv[i], "--trace-base") && i+1 < argc) trace_base = strtoull(argv[++i], NULL, 0);
 		else if (!strcmp(argv[i], "--premap")) premap = 1;
+		else if (!strcmp(argv[i], "--strict-premap")) {
+			premap = 1;
+			strict_premap = 1;
+		}
 		else if (!strcmp(argv[i], "--hugepage")) hugepage = 1;
 		else {
 			fprintf(stderr, "usage: %s [--dev D] [--count N] [--qd Q] "
 				"[--len B] [--lba-size N] [--cmds-per-obj N] [--trace-base T] "
-				"[--premap]\n"
+				"[--premap | --strict-premap] [--hugepage]\n"
 				"  --premap: issue via a premapped blk_iobuf_pool buffer "
 				"(ALLOC_IOBUF + URING_CMD_FIXED) instead of a user buffer.\n"
+				"  --strict-premap: additionally require IOMMU leaves at least "
+				"as large as the pool folio.\n"
 				"           Needs the pool provisioned (nvme_core.iobuf_pool_*) "
 				"and a non-multipath-head /dev/ng (nvme_core.multipath=N).\n",
 				argv[0]);
@@ -112,6 +123,10 @@ int main(int argc, char **argv)
 		}
 	}
 	if (!cmds_per_obj) cmds_per_obj = 1;
+	if (premap && hugepage) {
+		fprintf(stderr, "--hugepage cannot be combined with a premap mode\n");
+		return 2;
+	}
 
 	int fd = open(dev, O_RDONLY);
 	if (fd < 0) { perror(dev); return 1; }
@@ -145,7 +160,7 @@ int main(int argc, char **argv)
 			perror("register_buffers_sparse"); return 1;
 		}
 		for (unsigned i = 0; i < qd; i++) {
-			int r = alloc_iobuf(&ring, fd, i, len);
+			int r = alloc_iobuf(&ring, fd, i, len, strict_premap);
 			if (r < 0) {
 				fprintf(stderr, "ALLOC_IOBUF slot %u: %s -- is the pool "
 					"provisioned (nvme_core.iobuf_pool_folios/order) and is "
@@ -154,7 +169,8 @@ int main(int argc, char **argv)
 				return 1;
 			}
 		}
-		fprintf(stderr, "premap: %u pool buffers of %u bytes registered\n", qd, len);
+		fprintf(stderr, "%spremap: %u pool buffers of %u bytes registered\n",
+			strict_premap ? "strict-" : "", qd, len);
 	}
 
 	unsigned submitted = 0, completed = 0, errors = 0;
