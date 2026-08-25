@@ -1,0 +1,191 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+"""kvio -- KV-cache storage IO: project, drive, record, attribute, replay.
+
+One entry point for the kvio toolkit in this tree. Engine-driving commands run
+against the REAL LMCache raw_block engine, vendored and built in-tree
+(`make kvio`) -- no LMCache install needed. Recording uses this tree's eBPF
+tracers; attribution is the offset-join (no engine cookies); replay is
+device-exact fio.
+
+    make kvio            # build the vendored Rust engine (needs cargo)
+    ./kvio doctor        # check the build, python deps, tracers
+    ./kvio plan ...      # GPU-free projection of a model's KV NVMe stream
+    ./kvio workload ...  # drive the real engine with a serving-shaped workload
+    ./kvio record ...    # capture the device command stream (nvme_tp_monitor)
+    ./kvio perfetto ...  # attribute + convert to a Perfetto trace
+    ./kvio iolog ...     # device capture -> fio v3 iolog
+    ./kvio compare ...   # grade a replay against its capture
+
+Set KVIO_USE_SYSTEM_LMCACHE=1 to run against an installed LMCache instead of
+the vendored one.
+"""
+import os
+import sys
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+TOP = os.path.dirname(os.path.dirname(HERE))
+VENDOR = os.path.join(HERE, "vendor", "lmcache")
+BUILD = os.path.join(HERE, "build")
+
+# command -> (path-relative-to-TOP, one-line help, needs_engine)
+COMMANDS = {
+    # projection / planning (no device, no engine build needed)
+    "plan":         ("examples/lmcache/kvio_plan.py",
+                     "GPU-free projection of a model x config's KV NVMe IO stream", False),
+    # engine-driving (vendored RawBlockCore + built Rust module)
+    "workload":     ("tools/kvio/workload.py",
+                     "drive the real raw_block engine with a serving-shaped request mix", True),
+    "sweep":        ("examples/lmcache/kvio_sweep.py",
+                     "put_many/load_many_into across a parameter sweep", True),
+    "replay":       ("examples/lmcache/kvio_replay.py",
+                     "materialize a projected workload against a real device", True),
+    "validate":     ("examples/lmcache/kvio_validate.py",
+                     "is the projection faithful vs a recording?", True),
+    # record / attribute / report (tracer + converters; no engine needed)
+    "record":       ("nvme_tp_monitor",
+                     "record the device command stream (driver tracepoints)", False),
+    "perfetto":     ("examples/lmcache/kvio2perfetto.py",
+                     "attribute (offset/key join) + convert to a Perfetto trace", False),
+    "report":       ("examples/lmcache/kvio_tp_report.py",
+                     "SQL metrics over a converted trace", False),
+    "sem2manifest": ("examples/lmcache/kvio_sem2manifest.py",
+                     "semantic JSONL -> replay manifest", False),
+    "iolog":        ("examples/replay/mk_dev_iolog.py",
+                     "device capture -> fio v3 iolog (op/offset/length/time)", False),
+    "compare":      ("examples/replay/compare_streams.py",
+                     "grade a fio replay against its capture at the NVMe layer", False),
+    # proofs / probes (engine)
+    "put-many-proof": ("examples/lmcache/kvio_put_many_proof.py",
+                       "run-proof: real put_many/load_many_into round-trip", True),
+    "asym-proof":     ("examples/lmcache/kvio_asym_proof.py",
+                       "run-proof: packed asymmetric-KV producer wiring", True),
+    "parallel-probe": ("examples/lmcache/kvio_parallel_probe.py",
+                       "is the KV-load bottleneck the device or the software path?", True),
+}
+
+
+def usage(out=sys.stdout):
+    out.write(__doc__.split("\n\n")[0] + "\n\nCommands:\n")
+    for name, (_, help_line, engine) in COMMANDS.items():
+        tag = " [engine]" if engine else ""
+        out.write(f"  {name:<15} {help_line}{tag}\n")
+    out.write("  doctor          check the build, python deps, and tracers\n")
+    out.write("\n[engine] commands use the vendored LMCache raw_block engine: "
+              "run `make kvio` first.\nSee tools/kvio/README.md.\n")
+
+
+def engine_env():
+    env = dict(os.environ)
+    if env.get("KVIO_USE_SYSTEM_LMCACHE") == "1":
+        return env
+    prepend = [VENDOR, BUILD, HERE]
+    old = env.get("PYTHONPATH")
+    env["PYTHONPATH"] = os.pathsep.join(prepend + ([old] if old else []))
+    return env
+
+
+def doctor():
+    ok = True
+
+    def check(label, good, hint=""):
+        nonlocal ok
+        mark = "ok  " if good else "FAIL"
+        print(f"  [{mark}] {label}" + ("" if good else f"  -> {hint}"))
+        ok = ok and good
+
+    print("kvio doctor:")
+    if os.environ.get("KVIO_USE_SYSTEM_LMCACHE") == "1":
+        print("  [note] KVIO_USE_SYSTEM_LMCACHE=1: engine checks run against "
+              "the installed LMCache, not the vendor")
+    check("vendored LMCache surface present",
+          os.path.isfile(os.path.join(
+              VENDOR, "lmcache/v1/storage_backend/raw_block/core.py")),
+          "run tools/kvio/sync-lmcache.sh")
+    check("Rust engine built (lmcache_rust_raw_block_io.so)",
+          os.path.isfile(os.path.join(BUILD, "lmcache_rust_raw_block_io.so")),
+          "run `make kvio` (needs cargo; build on a real box)")
+
+    # python deps from PROVENANCE: first fenced block = required, second =
+    # optional (try-guarded upstream; absence tolerated -- warn only)
+    blocks, cur, in_block = [], None, False
+    prov = os.path.join(VENDOR, "PROVENANCE.md")
+    if os.path.isfile(prov):
+        for line in open(prov):
+            if line.startswith("```"):
+                if in_block:
+                    blocks.append(cur)
+                in_block = not in_block
+                cur = [] if in_block else None
+                continue
+            if in_block and line.strip():
+                cur.append(line.strip())
+    required = blocks[0] if blocks else []
+    optional = blocks[1] if len(blocks) > 1 else []
+    PIP_NAME = {"yaml": "PyYAML", "cpuinfo": "py-cpuinfo", "zmq": "pyzmq"}
+    import importlib.util
+    for dep in required:
+        pip = PIP_NAME.get(dep, dep)
+        check(f"python dep: {dep}",
+              importlib.util.find_spec(dep) is not None,
+              f"pip install {pip}" + (" (CPU wheel is fine)" if dep == "torch" else ""))
+    for dep in optional:
+        if importlib.util.find_spec(dep) is None:
+            print(f"  [note] optional dep absent (tolerated): {dep}")
+
+    # the real end-to-end import, with the vendored paths
+    import subprocess
+    r = subprocess.run(
+        [sys.executable, "-c",
+         "from lmcache.v1.storage_backend.raw_block import RawBlockCore; "
+         "from lmcache_rust_raw_block_io import RawBlockDevice; print('ok')"],
+        env=engine_env(), capture_output=True, text=True)
+    check("engine imports end-to-end (RawBlockCore + Rust module)",
+          r.returncode == 0,
+          (r.stderr.strip().splitlines() or ["?"])[-1])
+
+    check("tracer built: nvme_tp_monitor",
+          os.path.isfile(os.path.join(TOP, "nvme_tp_monitor")), "run `make`")
+    import shutil as _sh
+    check("fio present (for `kvio compare` replays)",
+          _sh.which("fio") is not None, "install fio")
+    print("doctor:", "all good" if ok else "problems found")
+    return 0 if ok else 1
+
+
+def main():
+    args = sys.argv[1:]
+    if not args or args[0] in ("-h", "--help", "help"):
+        usage()
+        return 0
+    cmd, rest = args[0], args[1:]
+    if cmd == "doctor":
+        return doctor()
+    if cmd not in COMMANDS:
+        sys.stderr.write(f"kvio: unknown command '{cmd}'\n\n")
+        usage(sys.stderr)
+        return 2
+    rel, _, needs_engine = COMMANDS[cmd]
+    target = os.path.join(TOP, rel)
+    if cmd == "record":
+        if not os.path.isfile(target):
+            sys.stderr.write("kvio record: nvme_tp_monitor not built -- run `make`\n")
+            return 1
+        try:
+            os.execv(target, [target] + rest)
+        except OSError as e:
+            sys.stderr.write(f"kvio record: cannot exec {rel}: {e}\n")
+            return 1
+    if not os.path.isfile(target):
+        sys.stderr.write(f"kvio {cmd}: missing {rel}\n")
+        return 1
+    env = engine_env() if needs_engine else dict(os.environ)
+    try:
+        os.execvpe(sys.executable, [sys.executable, target] + rest, env)
+    except OSError as e:
+        sys.stderr.write(f"kvio {cmd}: cannot exec {sys.executable}: {e}\n")
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

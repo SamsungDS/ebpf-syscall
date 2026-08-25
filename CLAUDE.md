@@ -102,6 +102,19 @@ worked example: a GNN reading node features off an SSD at 431× read
 amplification, captured, charted A/B against the page-aware fix, and
 replayed from a data-free iolog at +0.0% command inflation.
 
+## The kvio tool (`make kvio` → `./kvio`)
+
+`tools/kvio/` is the user-facing KV-cache-IO tool: one `./kvio` entry point
+over the whole loop — `plan` (GPU-free projection), `workload`/`sweep` (drive a
+device with **LMCache's real raw_block engine**, vendored in-tree),
+`record` (the `nvme_tp_monitor` tracer), `perfetto` (offset-join attribution),
+`iolog`/`compare` (device-exact fio replay). The engine's data path is a Rust
+pyo3 module: `make kvio` builds the vendored crate (needs cargo; build on a
+real box). `tools/kvio/sync-lmcache.sh` refreshes the vendored LMCache surface
+(runtime import closure + Rust crate) from a pinned upstream ref and fails
+loudly on an upstream API break; `vendor/lmcache/` is machine-managed — never
+hand-edit it. Rationale and measured churn: `tools/kvio/README.md`.
+
 ## Reproduce recipes
 
 Every showcase effort gets its own `tools/reproduce/<effort>/` with a

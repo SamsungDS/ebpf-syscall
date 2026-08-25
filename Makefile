@@ -41,7 +41,7 @@ NVME_TARGET  = nvme_uring_cmd_monitor
 NVME_BPF_OBJ = nvme_uring_cmd_monitor.bpf.o
 NVME_SKEL    = nvme_uring_cmd_monitor.skel.h
 
-.PHONY: all clean setup
+.PHONY: all clean setup kvio
 
 all: setup $(TARGET) $(MMAP_TARGET) $(IOU_TARGET) $(NVME_TARGET) $(NVMETP_TARGET)
 
@@ -118,6 +118,31 @@ nvme_uring_cmd_smoke: nvme_uring_cmd_smoke.c
 nvme_kv_smoke: nvme_kv_smoke.c
 	$(CC) $(CFLAGS) nvme_kv_smoke.c -luring -o $@
 
+# kvio -- KV-cache storage IO tool (project/drive/record/attribute/replay).
+# Its engine-driving commands run LMCache's real raw_block engine, vendored
+# under tools/kvio/vendor (refresh: tools/kvio/sync-lmcache.sh). The engine's
+# data path is a Rust pyo3 extension module; this builds it in-tree and drops
+# a ./kvio entry point. Needs cargo (rustup) + python3; not part of 'all' so
+# the monitors build without a Rust toolchain. See tools/kvio/README.md.
+KVIO_DIR   = tools/kvio
+KVIO_CRATE = $(KVIO_DIR)/vendor/lmcache/rust/raw_block
+KVIO_SO    = $(KVIO_DIR)/build/lmcache_rust_raw_block_io.so
+
+kvio:
+	@command -v cargo >/dev/null 2>&1 || { \
+		echo "ERROR: cargo not found -- kvio's engine is a Rust pyo3 module."; \
+		echo "Install rust (https://rustup.rs) and re-run 'make kvio'."; \
+		exit 1; }
+	@test -f $(KVIO_CRATE)/Cargo.toml || { \
+		echo "ERROR: vendored engine missing -- run $(KVIO_DIR)/sync-lmcache.sh"; \
+		exit 1; }
+	CARGO_TARGET_DIR=$(KVIO_CRATE)/target cargo build --release --manifest-path $(KVIO_CRATE)/Cargo.toml
+	@mkdir -p $(KVIO_DIR)/build
+	cp $(KVIO_CRATE)/target/release/liblmcache_rust_raw_block_io.so $(KVIO_SO)
+	python3 $(KVIO_DIR)/build_native.py
+	@ln -sf $(KVIO_DIR)/kvio kvio
+	@echo "kvio built: ./kvio -- try './kvio doctor' then './kvio --help'"
+
 vmlinux.h:
 	@echo "Generating vmlinux.h from running kernel..."
 	@if [ -n "$(BPFTOOL)" ] && [ -x "$(BPFTOOL)" ]; then \
@@ -150,11 +175,15 @@ clean:
 	rm -f $(IOU_TARGET) $(IOU_BPF_OBJ) $(IOU_SKEL)
 	rm -f $(NVME_TARGET) $(NVME_BPF_OBJ) $(NVME_SKEL)
 	rm -f $(NVMETP_TARGET) $(NVMETP_BPF_OBJ) $(NVMETP_SKEL) nvme_uring_cmd_smoke nvme_kv_smoke
+	rm -f kvio
+	rm -rf $(KVIO_DIR)/build $(KVIO_CRATE)/target
+	rm -f $(KVIO_DIR)/vendor/lmcache/lmcache/lmcache_native*.so
 	rm -rf $(LIBBPF_DIR)
 
 help:
 	@echo "Available targets:"
 	@echo "  all          - Build the complete project"
+	@echo "  kvio         - Build the kvio tool (vendored Rust engine; needs cargo)"
 	@echo "  install-deps - Install system dependencies"
 	@echo "  setup        - Setup libbpf and check tools"
 	@echo "  clean        - Clean build artifacts"

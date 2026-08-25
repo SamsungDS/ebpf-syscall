@@ -34,7 +34,9 @@ import json
 import os
 import sys
 
-SRC = os.environ.get("KVIO_SRC", "/home/ubuntu/lmcache-src")
+SRC = (os.environ.get("KVIO_SRC") or os.environ.get("LMCACHE_SRC")
+       or os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                       "..", "..", "tools", "kvio", "vendor", "lmcache"))
 DEV = os.environ.get("KVIO_DEV", "/dev/ng0n1")
 SEM = os.environ.get("KVIO_SEM", "/tmp/sem.jsonl")
 sys.path.insert(0, SRC)

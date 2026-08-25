@@ -8,7 +8,9 @@ No GPU: MemoryObj is a CPU uint8 tensor.
 import os, sys, importlib.util
 
 # absolute (this runs under sudo, where ~ would expand to /root)
-SRC = "/home/ubuntu/lmcache-src"
+SRC = (os.environ.get("KVIO_SRC") or os.environ.get("LMCACHE_SRC")
+       or os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                       "..", "..", "tools", "kvio", "vendor", "lmcache"))
 sys.path.insert(0, SRC)
 os.environ["LMCACHE_KVIO_TRACE"] = "/tmp/sem.jsonl"
 open("/tmp/sem.jsonl", "w").close()

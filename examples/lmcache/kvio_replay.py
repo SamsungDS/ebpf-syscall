@@ -21,7 +21,9 @@ Two input modes:
 """
 import argparse, json, os, sys, importlib.util, threading, time
 
-SRC = os.environ.get("KVIO_SRC", "/home/ubuntu/lmcache-src")
+SRC = (os.environ.get("KVIO_SRC") or os.environ.get("LMCACHE_SRC")
+       or os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                       "..", "..", "tools", "kvio", "vendor", "lmcache"))
 sys.path.insert(0, SRC)
 
 

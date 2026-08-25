@@ -15,3 +15,10 @@ libbpf/
 /examples/io_uring/nvme_uring_cmd_rw
 docs/_extra/
 docs/_build/
+
+# kvio build artifacts (make kvio)
+/kvio
+tools/kvio/build/
+tools/kvio/vendor/lmcache/rust/raw_block/target/
+__pycache__/
+tools/kvio/vendor/lmcache/lmcache/lmcache_native*.so
