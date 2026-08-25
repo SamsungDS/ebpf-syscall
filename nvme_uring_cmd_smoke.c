@@ -80,8 +80,9 @@ struct nvme_uring_cmd {
 #define DEFAULT_CMDS_PER_OBJ	8U
 #define DEFAULT_TRACE_BASE	UINT64_C(7000)
 
-/* One uint64_t timestamp/latency per command: 32 MiB at this ceiling. */
-#define MAX_COMMANDS		(1U << 22)
+/* One uint64_t timestamp/latency per command: 1 GiB at this ceiling. Raised
+ * from 1<<22 so a time-window run (millions of small random reads) fits. */
+#define MAX_COMMANDS		(1U << 27)
 #define LATENCY_DONE_BIT	(UINT64_C(1) << 63)
 
 struct options {
@@ -100,6 +101,10 @@ struct options {
 	bool premap;
 	bool strict_premap;
 	bool hugepage;
+	bool random_read;	/* pick a random aligned LBA per command */
+	uint64_t range_bytes;	/* LBA window random reads draw from (0 = seq span) */
+	bool poll;		/* IORING_SETUP_IOPOLL: poll completions on this core */
+	int sqpoll_cpu;		/* >=0: IORING_SETUP_SQPOLL pinned to this CPU */
 };
 
 struct geometry {
@@ -216,6 +221,8 @@ static void usage(FILE *out, const char *program)
 		"                         (legacy unregistered unless --fixed is added)\n"
 		"  --premap              allocate registered blk_iobuf_pool slots\n"
 		"  --strict-premap       also require pool-sized IOMMU leaves\n"
+		"  --random              random aligned LBA per command (default sequential)\n"
+		"  --range-gib G         LBA window random reads draw from (default: seq span)\n"
 		"  --ready-fd FD         event fd for ready/done protocol\n"
 		"  --start-fd FD         control fd for S/F protocol (must pair with\n"
 		"                         --ready-fd)\n"
@@ -283,6 +290,10 @@ enum {
 	OPT_HUGEPAGE,
 	OPT_READY_FD,
 	OPT_START_FD,
+	OPT_RANDOM,
+	OPT_RANGE_GIB,
+	OPT_POLL,
+	OPT_SQPOLL_CPU,
 };
 
 /* Returns 1 for --help, 0 for success, and -EINVAL for a CLI error. */
@@ -304,6 +315,10 @@ static int parse_options(int argc, char **argv, struct options *opts)
 		{ "hugepage", no_argument, NULL, OPT_HUGEPAGE },
 		{ "ready-fd", required_argument, NULL, OPT_READY_FD },
 		{ "start-fd", required_argument, NULL, OPT_START_FD },
+		{ "random", no_argument, NULL, OPT_RANDOM },
+		{ "range-gib", required_argument, NULL, OPT_RANGE_GIB },
+		{ "poll", no_argument, NULL, OPT_POLL },
+		{ "sqpoll-cpu", required_argument, NULL, OPT_SQPOLL_CPU },
 		{ "help", no_argument, NULL, 'h' },
 		{ NULL, 0, NULL, 0 },
 	};
@@ -364,6 +379,26 @@ static int parse_options(int argc, char **argv, struct options *opts)
 		case OPT_HUGEPAGE:
 			opts->hugepage = true;
 			break;
+		case OPT_RANDOM:
+			opts->random_read = true;
+			break;
+		case OPT_RANGE_GIB: {
+			uint32_t gib;
+			ret = parse_u32_nonzero(optarg, &gib);
+			if (!ret)
+				opts->range_bytes = (uint64_t)gib << 30;
+			break;
+		}
+		case OPT_POLL:
+			opts->poll = true;
+			break;
+		case OPT_SQPOLL_CPU: {
+			uint32_t cpu;
+			ret = parse_u32_nonzero(optarg, &cpu);
+			if (!ret)
+				opts->sqpoll_cpu = (int)cpu;
+			break;
+		}
 		case OPT_READY_FD:
 			ret = parse_fd(optarg, &opts->ready_fd);
 			break;
@@ -981,6 +1016,19 @@ static int run_workload(struct io_uring *ring, int fd, uint32_t nsid,
 {
 	uint64_t window_start = 0, window_end = 0;
 	int ret = 0;
+	/* random-read state: draw an aligned object index from the range */
+	uint64_t range_span = opts->range_bytes ? opts->range_bytes :
+			      (uint64_t)opts->count * opts->io_len;
+	uint64_t range_objs = range_span / opts->io_len;
+	uint64_t rng_state;
+
+	if (!range_objs)
+		range_objs = 1;
+	/* seed varies per process without wall-clock: address + pid + dev */
+	rng_state = (uint64_t)(uintptr_t)&window_start ^
+		    ((uint64_t)getpid() << 32) ^ (uint64_t)(uintptr_t)opts->dev;
+	if (!rng_state)
+		rng_state = 0x9e3779b97f4a7c15ULL;
 
 	ret = monotonic_ns(&window_start);
 	if (ret) {
@@ -1027,7 +1075,16 @@ static int run_workload(struct io_uring *ring, int fd, uint32_t nsid,
 			command->addr = command_buffer_addr(opts,
 				opts->premap ? NULL : backing->iovecs[slot].iov_base);
 			command->data_len = opts->io_len;
-			slba = (uint64_t)sequence * geometry->blocks_per_io;
+			if (opts->random_read) {
+				rng_state ^= rng_state << 13;
+				rng_state ^= rng_state >> 7;
+				rng_state ^= rng_state << 17;
+				slba = (rng_state % range_objs) *
+					geometry->blocks_per_io;
+			} else {
+				slba = (uint64_t)sequence *
+					geometry->blocks_per_io;
+			}
 			command->cdw10 = (uint32_t)slba;
 			command->cdw11 = (uint32_t)(slba >> 32);
 			command->cdw12 = geometry->blocks_per_io - 1U;
@@ -1423,6 +1480,7 @@ int main(int argc, char **argv)
 		.trace_base = DEFAULT_TRACE_BASE,
 		.ready_fd = -1,
 		.start_fd = -1,
+		.sqpoll_cpu = -1,
 	};
 	struct hugepage_meminfo hugepages_before = {};
 	struct hugepage_meminfo hugepages_after_setup = {};
@@ -1486,6 +1544,13 @@ int main(int argc, char **argv)
 	}
 
 	params.flags = IORING_SETUP_SQE128 | IORING_SETUP_CQE32;
+	if (opts.poll)
+		params.flags |= IORING_SETUP_IOPOLL;
+	if (opts.sqpoll_cpu >= 0) {
+		params.flags |= IORING_SETUP_SQPOLL | IORING_SETUP_SQ_AFF;
+		params.sq_thread_cpu = (unsigned int)opts.sqpoll_cpu;
+		params.sq_thread_idle = 2000; /* ms before the poll thread sleeps */
+	}
 	ret = io_uring_queue_init_params(opts.qd, &ring, &params);
 	if (ret < 0) {
 		fprintf(stderr, "io_uring_queue_init_params: %s\n", strerror(-ret));
