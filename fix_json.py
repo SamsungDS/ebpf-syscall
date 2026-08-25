@@ -12,8 +12,13 @@ import re
 import sys
 from pathlib import Path
 
-def fix_json_formatting(input_file, output_file, process_name=None):
-    """Fix JSON formatting issues and extract raw_events"""
+def fix_json_formatting(input_file, output_file, process_name=None, pids=None):
+    """Fix JSON formatting issues and extract raw_events.
+
+    Filtering is mutually exclusive: if `pids` is given, entries are kept
+    when their "pid" is in `pids`; otherwise `process_name` is used to
+    match the "process_name" field.
+    """
 
     try:
         with open(input_file, 'r') as f:
@@ -119,8 +124,11 @@ def fix_json_formatting(input_file, output_file, process_name=None):
             print(f"✓ JSON validation successful")
             if isinstance(parsed, list):
                 print(f"  Found {len(parsed)} syscall events")
-                # Filter: keep only entries belonging to the requested process
-                if process_name:
+                # Filter: keep only entries belonging to the requested process(es)
+                if pids:
+                    filtered = [entry for entry in parsed if entry.get("pid") in pids]
+                    print(f"  After filtering for pids {sorted(pids)}: {len(filtered)} syscall events")
+                elif process_name:
                     filtered = [entry for entry in parsed if entry.get("process_name") == process_name]
                     print(f"  After filtering for '{process_name}': {len(filtered)} syscall events")
                 else:
@@ -157,15 +165,26 @@ def fix_json_formatting(input_file, output_file, process_name=None):
 
 if __name__ == '__main__':
     if len(sys.argv) < 2:
-        print("Usage: python3 fix_json.py <input_file> [process_name]")
+        print("Usage: python3 fix_json.py <input_file> [process_name | pid1,pid2,...]")
         print("\nExamples:")
         print("  python3 fix_json.py /home/user/sample_syscall_events.json")
         print("  python3 fix_json.py /home/user/sample_syscall_events.json fio")
+        print("  python3 fix_json.py /home/user/sample_syscall_events.json 153047,153048,153049")
+        print("  python3 fix_json.py /home/user/sample_syscall_events.json 153047 153048 153049")
         print("\nOutput will be created as: syscall_events_fixed.json in the same directory")
         sys.exit(1)
 
     input_file = sys.argv[1]
-    process_name = sys.argv[2] if len(sys.argv) >= 3 else None
+    process_name = None
+    pids = None
+
+    if len(sys.argv) >= 3:
+        # Accept pids separated by commas and/or spaces across the remaining args
+        tokens = [t for t in re.split(r'[,\s]+', ' '.join(sys.argv[2:])) if t]
+        if tokens and all(t.isdigit() for t in tokens):
+            pids = {int(t) for t in tokens}
+        else:
+            process_name = ' '.join(sys.argv[2:])
 
     # Generate output filename in the same directory as input
     input_path = Path(input_file)
@@ -175,14 +194,15 @@ if __name__ == '__main__':
     print(f"Fixing JSON formatting...")
     print(f"Input:  {input_file}")
     print(f"Output: {output_file}")
-    if process_name:
+    if pids:
+        print(f"Filter: pid in {sorted(pids)}")
+    elif process_name:
         print(f"Filter: process_name == '{process_name}'")
     print()
 
-    if fix_json_formatting(str(input_file), str(output_file), process_name=process_name):
-        print(f"\n✓ Done! You can now use:")
-        print(f"  cp {output_file} {output_dir}/syscall_events.json")
-        print(f"  sudo ./syscall_replayer")
+    if fix_json_formatting(str(input_file), str(output_file), process_name=process_name, pids=pids):
+        print(f"\n✓ Done! You can now proceed to filter using filter_syscall_log.py")
+        print(f"  Generated output file {output_file} ")
         sys.exit(0)
     else:
         sys.exit(1)
