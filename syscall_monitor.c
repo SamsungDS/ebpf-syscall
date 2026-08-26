@@ -22,7 +22,8 @@ enum io_direction {
     VWRITE
 };
 
-// Syscall event structure (must match BPF program)
+/* Must match syscall_monitor.bpf.c's struct syscall_event byte-for-byte;
+ * open_flags_str is 20 bytes to keep the fields below it aligned. */
 struct syscall_event {
     uint64_t timestamp;
     uint32_t pid;
@@ -78,6 +79,13 @@ static int max_events = MAX_EVENTS;
 static bool detailed_logging = false;
 static int events_dropped = 0;
 
+// CLI-driven, non-interactive run options
+static bool opt_non_interactive = false;
+static int  opt_duration = -1;               // seconds; -1 = unset
+static int  opt_detailed_logging = -1;       // -1 unset, 0 off, 1 on
+static const char *opt_json_out = NULL;      // path or NULL
+static const char *opt_label = NULL;         // workload label or NULL
+
 // Syscall name mapping
 static const char* get_syscall_name(uint32_t nr) {
     switch(nr) {
@@ -106,6 +114,43 @@ static const char* get_syscall_name(uint32_t nr) {
 static void sig_handler(int sig) {
     printf("\nReceived signal %d, stopping monitor...\n", sig);
     running = false;
+}
+
+// Escape a string for JSON output: handles quote, backslash, and control chars.
+// Caller supplies a big-enough destination buffer; truncation is safe.
+static void json_escape(char *dst, size_t dst_sz, const char *src, size_t src_max) {
+    size_t o = 0;
+    if (dst_sz == 0) return;
+    for (size_t i = 0; i < src_max && src[i] != '\0'; i++) {
+        unsigned char c = (unsigned char)src[i];
+        const char *esc = NULL;
+        char ubuf[8];
+        switch (c) {
+            case '"':  esc = "\\\""; break;
+            case '\\': esc = "\\\\"; break;
+            case '\b': esc = "\\b"; break;
+            case '\f': esc = "\\f"; break;
+            case '\n': esc = "\\n"; break;
+            case '\r': esc = "\\r"; break;
+            case '\t': esc = "\\t"; break;
+            default:
+                if (c < 0x20) {
+                    snprintf(ubuf, sizeof(ubuf), "\\u%04x", c);
+                    esc = ubuf;
+                }
+                break;
+        }
+        if (esc) {
+            size_t n = strlen(esc);
+            if (o + n + 1 >= dst_sz) break;
+            memcpy(dst + o, esc, n);
+            o += n;
+        } else {
+            if (o + 2 >= dst_sz) break;
+            dst[o++] = (char)c;
+        }
+    }
+    dst[o] = '\0';
 }
 
 // Ring buffer event handler with dynamic reallocation
@@ -503,7 +548,13 @@ static void export_to_json(struct syscall_stat *stats, int stat_count,
     fprintf(fp, "    \"total_events\": %d,\n", event_count);
     fprintf(fp, "    \"monitoring_duration\": %.3f,\n", duration);
     fprintf(fp, "    \"unique_syscalls\": %d,\n", stat_count);
-    fprintf(fp, "    \"unique_processes\": %d\n", process_count);
+    fprintf(fp, "    \"unique_processes\": %d,\n", process_count);
+    if (opt_label && opt_label[0] != '\0') {
+        char esc[256];
+        json_escape(esc, sizeof(esc), opt_label, 255);
+        fprintf(fp, "    \"workload_label\": \"%s\",\n", esc);
+    }
+    fprintf(fp, "    \"detailed_logging\": %s\n", detailed_logging ? "true" : "false");
     fprintf(fp, "  },\n");
     
     // Summary
@@ -559,22 +610,29 @@ static void export_to_json(struct syscall_stat *stats, int stat_count,
         fprintf(fp, "  \"raw_events\": [\n");
         for(int i = 0; i < event_count; i++) {
             struct syscall_event *e = &events[i];
+            char esc_comm[64];
+            char esc_filename[512];
+            char esc_flags[64];
+            json_escape(esc_comm, sizeof(esc_comm), e->comm, MAX_COMM_LEN);
+            json_escape(esc_filename, sizeof(esc_filename), e->filename, sizeof(e->filename));
+            json_escape(esc_flags, sizeof(esc_flags), e->open_flags_str, sizeof(e->open_flags_str));
             fprintf(fp, "    {\n");
             fprintf(fp, "      \"timestamp_ns\": %lu,\n", e->timestamp);
             fprintf(fp, "      \"timestamp_ms\": %.3f,\n", e->timestamp / 1000000.0);
             fprintf(fp, "      \"pid\": %u,\n", e->pid);
-            fprintf(fp, "      \"process_name\": \"%s\",\n", e->comm);
+            fprintf(fp, "      \"process_name\": \"%s\",\n", esc_comm);
             fprintf(fp, "      \"syscall_nr\": %u,\n", e->syscall_nr);
             fprintf(fp, "      \"syscall_name\": \"%s\",\n", get_syscall_name(e->syscall_nr));
             fprintf(fp, "      \"fd\": %u,\n", e->fd);
             fprintf(fp, "      \"size\": %lu,\n", e->size);
             fprintf(fp, "      \"offset\": %ld,\n", (int64_t)e->offset);
-	    fprintf(fp, "      \"filename\": \"%s\"\n", e->filename);
-	    fprintf(fp, "      \"open_flags_hex\": %u,\n", e->open_flags_hex);
-	    fprintf(fp, "      \"open_flags_str\": \"%s\"\n", e->open_flags_str);
-	    fprintf(fp, "      \"io_direction\": \"%s\",\n", e->ddir == 0 ? "READ" : e->ddir == 1 ? "WRITE" : e->ddir == 2 ? "VREAD" : "VWRITE");
-	    fprintf(fp, "      \"ret\": %ld,\n", e->ret);
-	    fprintf(fp, "      \"error_code\": %ld,\n", e->error_code);
+	    fprintf(fp, "      \"filename\": \"%s\",\n", esc_filename);
+            fprintf(fp, "      \"open_flags_hex\": %u,\n", e->open_flags_hex);
+            fprintf(fp, "      \"open_flags_str\": \"%s\",\n", esc_flags);
+            fprintf(fp, "      \"io_direction\": \"%s\",\n",
+                    e->ddir == 0 ? "READ" : e->ddir == 1 ? "WRITE" : e->ddir == 2 ? "VREAD" : "VWRITE");
+            fprintf(fp, "      \"ret\": %ld,\n", e->ret);
+            fprintf(fp, "      \"error_code\": %ld\n", e->error_code);
             fprintf(fp, "    }%s\n", (i < event_count - 1) ? "," : "");
         }
         fprintf(fp, "  ]\n");
@@ -625,10 +683,33 @@ int main(int argc, char **argv) {
             if (max_events < 1000) max_events = 1000;
             if (max_events > 10000000) max_events = 10000000;
             i++;
+        } else if (strcmp(argv[i], "--duration") == 0 && i + 1 < argc) {
+            opt_duration = atoi(argv[i + 1]);
+            if (opt_duration <= 0) opt_duration = 1;
+            if (opt_duration > 3600) opt_duration = 3600;
+            i++;
+        } else if (strcmp(argv[i], "--detailed") == 0) {
+            opt_detailed_logging = 1;
+        } else if (strcmp(argv[i], "--no-detailed") == 0) {
+            opt_detailed_logging = 0;
+        } else if (strcmp(argv[i], "--json-out") == 0 && i + 1 < argc) {
+            opt_json_out = argv[i + 1];
+            i++;
+        } else if (strcmp(argv[i], "--label") == 0 && i + 1 < argc) {
+            opt_label = argv[i + 1];
+            i++;
+        } else if (strcmp(argv[i], "--no-prompt") == 0) {
+            opt_non_interactive = true;
         } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
             printf("Usage: %s [OPTIONS]\n", argv[0]);
             printf("Options:\n");
             printf("  --max-events N    Set maximum events to capture (default: %d)\n", MAX_EVENTS);
+            printf("  --duration N      Monitoring duration in seconds (non-interactive)\n");
+            printf("  --detailed        Enable detailed per-event logging (ring buffer)\n");
+            printf("  --no-detailed     Disable detailed per-event logging\n");
+            printf("  --json-out PATH   Auto-export results to PATH as JSON (implies no prompt for export)\n");
+            printf("  --label NAME      Workload label stored in JSON metadata (e.g. random_read)\n");
+            printf("  --no-prompt       Skip all interactive prompts; use flag defaults\n");
             printf("  --help, -h        Show this help message\n");
             return 0;
         }
@@ -647,21 +728,28 @@ int main(int argc, char **argv) {
     
     // Setup libbpf logging
     libbpf_set_print(libbpf_print_fn);
-    
-    // Ask user about detailed logging
-    printf("Enable detailed event logging? (y/N): ");
-    fflush(stdout);
-    if (fgets(input, sizeof(input), stdin)) {
-        detailed_logging = (input[0] == 'y' || input[0] == 'Y');
+
+    // Resolve detailed-logging / duration from flags or (if interactive) prompts.
+    if (opt_detailed_logging >= 0) {
+        detailed_logging = (opt_detailed_logging == 1);
+    } else if (!opt_non_interactive) {
+        printf("Enable detailed event logging? (y/N): ");
+        fflush(stdout);
+        if (fgets(input, sizeof(input), stdin)) {
+            detailed_logging = (input[0] == 'y' || input[0] == 'Y');
+        }
     }
-    
-    // Get monitoring duration
-    printf("Enter monitoring duration in seconds (default %d): ", duration);
-    fflush(stdout);
-    if (fgets(input, sizeof(input), stdin) && strlen(input) > 1) {
-        int user_duration = atoi(input);
-        if (user_duration > 0 && user_duration <= 3600) {
-            duration = user_duration;
+
+    if (opt_duration > 0) {
+        duration = opt_duration;
+    } else if (!opt_non_interactive) {
+        printf("Enter monitoring duration in seconds (default %d): ", duration);
+        fflush(stdout);
+        if (fgets(input, sizeof(input), stdin) && strlen(input) > 1) {
+            int user_duration = atoi(input);
+            if (user_duration > 0 && user_duration <= 3600) {
+                duration = user_duration;
+            }
         }
     }
     
@@ -733,19 +821,46 @@ int main(int argc, char **argv) {
     
     printf("\nCollecting results... Captured %d individual events\n", event_count);
     
-    // Collect aggregated syscall data from BPF maps
+    // Collect aggregated syscall data from BPF maps.
+    //
+    // bpf_map_get_next_key(map, key, next_key) returns the key that follows
+    // 'key' in iteration order. When 'key' exists in the map, the first key
+    // in the map is NEVER returned - the helper returns the one *after* it.
+    // When 'key' does not exist the helper returns the first key instead.
+    //
+    // The old code initialized 'key' to zero and walked from there. Because
+    // syscall number 0 is 'read' and the raw_syscalls/sys_exit tracepoint
+    // populates syscall_sizes[0] on every successful read(), the very first
+    // iteration would always get the key *after* 0, silently dropping the
+    // 'read' row from the aggregated stats. For idle / mostly-metadata
+    // workloads this was usually hidden because other syscalls were also
+    // present. But for workloads where syscall 0 is the *only* populated
+    // key - e.g. a tight stdin/stdout read loop - stat_count ends at 0, the
+    // function then prints "No syscall data collected" and bails without
+    // exporting JSON, even though the ring buffer received hundreds of
+    // thousands of events.
+    //
+    // The libbpf-documented way to start iteration is to pass NULL as the
+    // previous key, which asks the kernel for the first key unconditionally.
+    // Switch to that pattern and keep a separate backing uint32_t for
+    // subsequent calls. Also cache the two map fds so we're not re-deriving
+    // them on every iteration.
     struct syscall_stat stats[256] = {0};
     int stat_count = 0;
-    
-    uint32_t key = 0, next_key;
+
+    uint32_t next_key;
     uint64_t size_val, count_val;
-    
-    // Iterate through syscall_sizes map
-    while (bpf_map_get_next_key(bpf_map__fd(skel->maps.syscall_sizes), &key, &next_key) == 0) {
-        if (bpf_map_lookup_elem(bpf_map__fd(skel->maps.syscall_sizes), &next_key, &size_val) == 0) {
+    const uint32_t *prev_key = NULL;
+    uint32_t cur_key = 0;
+
+    int sizes_fd = bpf_map__fd(skel->maps.syscall_sizes);
+    int counts_fd = bpf_map__fd(skel->maps.syscall_counts);
+
+    while (bpf_map_get_next_key(sizes_fd, prev_key, &next_key) == 0) {
+        if (bpf_map_lookup_elem(sizes_fd, &next_key, &size_val) == 0) {
             count_val = 0;
-            bpf_map_lookup_elem(bpf_map__fd(skel->maps.syscall_counts), &next_key, &count_val);
-            
+            bpf_map_lookup_elem(counts_fd, &next_key, &count_val);
+
             if (stat_count < 256) {
                 stats[stat_count].syscall_nr = next_key;
                 strncpy(stats[stat_count].syscall_name, get_syscall_name(next_key), 31);
@@ -756,16 +871,22 @@ int main(int argc, char **argv) {
                 stat_count++;
             }
         }
-        key = next_key;
+        cur_key = next_key;
+        prev_key = &cur_key;
     }
     
     if (stat_count == 0) {
-        printf("\nNo syscall data collected.\n");
-        printf("Try running some file operations in another terminal:\n");
-        printf("  cat /etc/passwd\n");
-        printf("  ls -la\n");
-        printf("  echo 'test' > /tmp/test.txt\n");
-        goto cleanup;
+        printf("\nNo aggregated syscall map data collected.\n");
+        // When we have raw events from the ring buffer we should still honour
+        // --json-out; callers (feature_aggregator.py) depend on the file
+        // existing. Only bail early in the purely-no-data case.
+        if (event_count == 0 && !(opt_json_out && opt_json_out[0])) {
+            printf("Try running some file operations in another terminal:\n");
+            printf("  cat /etc/passwd\n");
+            printf("  ls -la\n");
+            printf("  echo 'test' > /tmp/test.txt\n");
+            goto cleanup;
+        }
     }
     
     // Sort by total size
@@ -836,24 +957,27 @@ int main(int argc, char **argv) {
         }
     }
     
-    // Ask about JSON export
-    printf("\nExport data to JSON? (Y/n): ");
-    fflush(stdout);
-    if (fgets(input, sizeof(input), stdin)) {
-        if (input[0] != 'n' && input[0] != 'N') {
-            printf("Enter filename (or press Enter for auto-generated): ");
-            fflush(stdout);
-            
-            char filename_input[256] = {0};
-            if (fgets(filename_input, sizeof(filename_input), stdin)) {
-                // Remove newline
-                size_t len = strlen(filename_input);
-                if (len > 0 && filename_input[len-1] == '\n') {
-                    filename_input[len-1] = '\0';
+    // JSON export: auto when --json-out is set; prompt only when interactive.
+    if (opt_json_out && opt_json_out[0] != '\0') {
+        export_to_json(stats, stat_count, processes, process_count, opt_json_out);
+    } else if (!opt_non_interactive) {
+        printf("\nExport data to JSON? (Y/n): ");
+        fflush(stdout);
+        if (fgets(input, sizeof(input), stdin)) {
+            if (input[0] != 'n' && input[0] != 'N') {
+                printf("Enter filename (or press Enter for auto-generated): ");
+                fflush(stdout);
+
+                char filename_input[256] = {0};
+                if (fgets(filename_input, sizeof(filename_input), stdin)) {
+                    size_t len = strlen(filename_input);
+                    if (len > 0 && filename_input[len-1] == '\n') {
+                        filename_input[len-1] = '\0';
+                    }
+
+                    export_to_json(stats, stat_count, processes, process_count,
+                                 strlen(filename_input) > 0 ? filename_input : NULL);
                 }
-                
-                export_to_json(stats, stat_count, processes, process_count, 
-                             strlen(filename_input) > 0 ? filename_input : NULL);
             }
         }
     }

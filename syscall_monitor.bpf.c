@@ -6,6 +6,31 @@
 #include <bpf/bpf_core_read.h>
 
 /*
+ * memcpy inside a BPF program is not a libbpf helper; it resolves to a
+ * normal C library call, which clang refuses to emit against the BPF
+ * target. Historically libbpf headers (and older clang versions) were
+ * lenient and allowed the implicit declaration to slip through, but
+ * clang 14+ with the BPF target rejects the implicit prototype:
+ *
+ *   syscall_monitor.bpf.c:159:5: error: call to undeclared library
+ *   function 'memcpy' with type 'void *(void *, const void *, unsigned
+ *   long)'; ISO C99 and later do not support implicit function
+ *   declarations
+ *
+ * This fails the build on Debian trixie (clang 19, kernel 6.16) even
+ * though the code was compiling fine on older toolchains.
+ *
+ * The compiler provides __builtin_memcpy, which clang happily lowers to
+ * the BPF memory moves the verifier already understands. Route every
+ * memcpy() in this translation unit through the builtin via a macro
+ * shim so the BPF source stays readable and future copies do not have
+ * to remember the quirk.
+ */
+#ifndef memcpy
+#define memcpy(dst, src, n) __builtin_memcpy((dst), (src), (n))
+#endif
+
+/*
  * PT_REGS_PARM6 is missing in many libbpf versions because
  * the 6th syscall arg doesn't pass through a standard calling
  * convention register on all archs. Define it per-arch if absent.
@@ -117,6 +142,35 @@ struct {
 // Global flag to control detailed logging
 volatile const bool detailed_logging = true;
 volatile const unsigned int sampling_rate = 1;  // Sample 1 out of every N events (1 = capture all)
+
+// enter/exit join: stash read/write-family enter args by TID so sys_exit can attach the bytes the
+// syscall RETURNED. Without this, enter events carry (fd,count,offset) but ret=-1, and the generic
+// sys_exit carries ret but fd=-1/count=1/offset=0 -- the two are never correlated, so neither
+// requested-vs-returned nor per-fd byte accounting is recoverable. This restores a single joined
+// record {fd, offset, requested count, returned bytes} emitted at completion.
+struct io_ctx {
+    u32 syscall_nr;
+    u32 fd;
+    u64 count;   // requested bytes (or iovcnt for readv/writev)
+    u64 offset;  // absolute offset for pread/pwrite, 0 otherwise
+};
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, MAX_ENTRIES);
+    __type(key, u64);            // bpf_get_current_pid_tgid()
+    __type(value, struct io_ctx);
+} io_inflight SEC(".maps");
+
+static __always_inline void stash_io_enter(u32 syscall_nr, u32 fd, u64 count, u64 offset)
+{
+    u64 tid = bpf_get_current_pid_tgid();
+    struct io_ctx c = {};
+    c.syscall_nr = syscall_nr;
+    c.fd = fd;
+    c.count = count;
+    c.offset = offset;
+    bpf_map_update_elem(&io_inflight, &tid, &c, BPF_ANY);
+}
 
 static __always_inline void update_stats(u32 syscall_nr, u64 size)
 {
@@ -248,7 +302,6 @@ int trace_write_entry(struct pt_regs *ctx)
     return 0;
 }
 
-// open syscall tracepoint
 SEC("kprobe/__x64_sys_open")
 int trace_open_entry(struct pt_regs *ctx)
 {
@@ -587,12 +640,11 @@ int trace_writev_entry(struct pt_regs *ctx)
     return 0;
 }
 
-// fsync syscall tracepoint
-SEC("kprobe/__x64_sys_fsync")
-int trace_fsync_entry(struct pt_regs *ctx)
+SEC("tracepoint/syscalls/sys_enter_fsync")
+int trace_fsync_entry(struct trace_event_raw_sys_enter *ctx)
 {
     u32 syscall_nr = 74; // fsync
-    unsigned int fd = (unsigned int)PT_REGS_PARM1(ctx);
+    unsigned int fd = (unsigned int)ctx->args[0];
 
     update_stats(syscall_nr, 1);
     log_event(syscall_nr, fd, 1, 0, "", 0, "", -1, -1);

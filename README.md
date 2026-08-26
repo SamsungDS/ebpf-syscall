@@ -14,6 +14,19 @@ whoami
 # Verify you can use sudo
 sudo -v
 ```
+
+**Custom kernels need `CONFIG_DEBUG_INFO_BTF=y`.** Every tracer here
+attaches via BTF-typed programs (fentry/tp_btf), so the running kernel
+must provide `/sys/kernel/btf/vmlinux` — and the NVMe monitors also
+need module BTF (`CONFIG_DEBUG_INFO_BTF_MODULES=y`, default y) for
+nvme_core attach points. Stock Debian/Ubuntu/Fedora kernels ship both.
+Self-built kernels frequently lose them: enabling BTF requires
+`pahole` (package `dwarves`) at build time, and `make olddefconfig`
+**silently drops** `DEBUG_INFO_BTF` when pahole is missing; build
+scripts that strip debug info for speed take BTF with it. Keep DWARF
+generation on (`CONFIG_DEBUG_INFO_DWARF_TOOLCHAIN_DEFAULT=y`) and use
+`INSTALL_MOD_STRIP=1` at install — stripping keeps `.BTF` sections, so
+modules stay small without losing attachability.
 ## 2. Clone repository
 ```
 git clone https://github.com/SamsungDS/ebpf-syscall.git
@@ -501,10 +514,10 @@ sudo ./syscall_monitor
 #only syscalls from the specified process will be parsed.
 sudo python3 fix_json.py filename process_name
 
-# Run the syscall_event_fixed.json from previous step through filter_syscall_log.py
-# for additional filtering. This will generate a file named final_replay.json used by 
+# Run the syscall_events_fixed.json from the previous step through filter_syscall_log.py
+# for additional filtering. This will generate a file named final_replay.json used by
 # the replayer.
-python3 filter_syscall_log.py syscall_event_fixed.json final_replay.json
+python3 filter_syscall_log.py syscall_events_fixed.json final_replay.json
 
 #Replay the syscalls from final_replay.json , --serial option for single threaded replay,
 # --paced for replay with original timestamps.
@@ -522,7 +535,7 @@ The JSON input should follow this format:
 {"timestamp_ns": 1234567890, "timestamp_ms": 1234.567, "pid": 1234, "process_name": "test", "syscall_nr": 0, "syscall_name": "read", "fd": 3, "size": 4096, "offset": 0, "filename": "/tmp/test.txt", "io_direction": "read", "ret": 4096, "error_code": 0}
 ```
 
-### Expected Output for replayer 
+### Expected Output for replayer
 ```
 replayer] openat ts=354657598244078: absolute path, dirfd is ignored
 [replayer] openat '/mnt/nvme2n1/bm_offload_data/QuantTrio-Qwen3-Coder-480B-A35B-Instruct-AWQ@8@3@1737aa809f0562c1@half.pt' cap_fd=266 → replay_fd=5

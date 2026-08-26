@@ -1,0 +1,279 @@
+#!/usr/bin/env bpftrace
+/*
+ * LMCache Application I/O Intent Tracer — No BTF, bpftrace 0.21+ compatible
+ *
+ * Usage: sudo bpftrace lmcache_intent_no_btf.bt <PID>
+ */
+
+BEGIN
+{
+    printf("LMCache I/O Intent Tracer started — tracing PID %d\n", $1);
+    printf("Capturing pwrite64/pread64/write/read/writev/readv/mmap\n");
+    printf("Hit Ctrl-C to stop and print summary\n\n");
+
+    @w_total = (uint64)0;
+    @w_calls = (uint64)0;
+    @w_largest = (uint64)0;
+    @w_smallest = (uint64)18446744073709551615;  /* UINT64_MAX */
+    @w_seq = (uint64)0;
+    @w_rnd = (uint64)0;
+
+    @r_total = (uint64)0;
+    @r_calls = (uint64)0;
+    @r_largest = (uint64)0;
+    @r_smallest = (uint64)18446744073709551615;
+    @r_seq = (uint64)0;
+    @r_rnd = (uint64)0;
+
+    @wv_calls = (uint64)0;
+    @rv_calls = (uint64)0;
+    @mm_calls = (uint64)0;
+    @sample = (uint64)0;
+}
+
+/* ─── Track fd → filename via openat ─── */
+tracepoint:syscalls:sys_enter_openat
+/pid == $1/
+{
+    @opening[tid] = str(args.filename);
+}
+
+tracepoint:syscalls:sys_exit_openat
+/pid == $1 && args.ret >= 0/
+{
+    $path = @opening[tid];
+    if ($path != "") {
+        @fd_path[pid, args.ret] = $path;
+
+        if (strcontains($path, "lmcache") ||
+            strcontains($path, "cache_engine") ||
+            strcontains($path, "kv_cache") ||
+            strcontains($path, ".bin")) {
+            @tracked[pid, args.ret] = (uint64)1;
+            printf("OPEN   fd=%d path=%s\n", args.ret, $path);
+        }
+    }
+    delete(@opening[tid]);
+}
+
+/* ─── pwrite64 ─── */
+tracepoint:syscalls:sys_enter_pwrite64
+/pid == $1 && @tracked[pid, args.fd] == 1/
+{
+    $sz = (uint64)args.count;
+    $off = (uint64)args.pos;
+
+    @w_hist = hist($sz);
+    @w_total += $sz;
+    @w_calls += 1;
+    @w_per_fd[args.fd] += $sz;
+
+    if ($sz > @w_largest) { @w_largest = $sz; }
+    if ($sz < @w_smallest) { @w_smallest = $sz; }
+
+    /* Sequential detection */
+    $expected = @w_next_off[args.fd];
+    if ($expected > 0 && $off == $expected) {
+        @w_seq += 1;
+    } else if ($expected > 0) {
+        @w_rnd += 1;
+    }
+    @w_next_off[args.fd] = $off + $sz;
+
+    if (@sample < 200) {
+        printf("PWRITE fd=%d size=%llu offset=%llu file=%s\n",
+               args.fd, $sz, $off, @fd_path[pid, args.fd]);
+        @sample += 1;
+    }
+}
+
+/* ─── pread64 ─── */
+tracepoint:syscalls:sys_enter_pread64
+/pid == $1 && @tracked[pid, args.fd] == 1/
+{
+    $sz = (uint64)args.count;
+    $off = (uint64)args.pos;
+
+    @r_hist = hist($sz);
+    @r_total += $sz;
+    @r_calls += 1;
+    @r_per_fd[args.fd] += $sz;
+
+    if ($sz > @r_largest) { @r_largest = $sz; }
+    if ($sz < @r_smallest) { @r_smallest = $sz; }
+
+    $expected = @r_next_off[args.fd];
+    if ($expected > 0 && $off == $expected) {
+        @r_seq += 1;
+    } else if ($expected > 0) {
+        @r_rnd += 1;
+    }
+    @r_next_off[args.fd] = $off + $sz;
+
+    if (@sample < 200) {
+        printf("PREAD  fd=%d size=%llu offset=%llu file=%s\n",
+               args.fd, $sz, $off, @fd_path[pid, args.fd]);
+        @sample += 1;
+    }
+}
+
+/* ─── write (non-positioned) ─── */
+tracepoint:syscalls:sys_enter_write
+/pid == $1 && @tracked[pid, args.fd] == 1/
+{
+    $sz = (uint64)args.count;
+
+    @w_hist = hist($sz);
+    @w_total += $sz;
+    @w_calls += 1;
+
+    if ($sz > @w_largest) { @w_largest = $sz; }
+
+    if (@sample < 200) {
+        printf("WRITE  fd=%d size=%llu file=%s\n",
+               args.fd, $sz, @fd_path[pid, args.fd]);
+        @sample += 1;
+    }
+}
+
+/* ─── read (non-positioned) ─── */
+tracepoint:syscalls:sys_enter_read
+/pid == $1 && @tracked[pid, args.fd] == 1/
+{
+    $sz = (uint64)args.count;
+
+    @r_hist = hist($sz);
+    @r_total += $sz;
+    @r_calls += 1;
+
+    if ($sz > @r_largest) { @r_largest = $sz; }
+
+    if (@sample < 200) {
+        printf("READ   fd=%d size=%llu file=%s\n",
+               args.fd, $sz, @fd_path[pid, args.fd]);
+        @sample += 1;
+    }
+}
+
+/* ─── writev ─── */
+tracepoint:syscalls:sys_enter_writev
+/pid == $1 && @tracked[pid, args.fd] == 1/
+{
+    @wv_calls += 1;
+    @wv_vlen = hist(args.vlen);
+    printf("WRITEV fd=%d vlen=%llu\n", args.fd, args.vlen);
+}
+
+/* ─── readv ─── */
+tracepoint:syscalls:sys_enter_readv
+/pid == $1 && @tracked[pid, args.fd] == 1/
+{
+    @rv_calls += 1;
+    @rv_vlen = hist(args.vlen);
+    printf("READV  fd=%d vlen=%llu\n", args.fd, args.vlen);
+}
+
+/* ─── mmap ─── */
+tracepoint:syscalls:sys_enter_mmap
+/pid == $1 && args.fd >= 0 && @tracked[pid, args.fd] == 1/
+{
+    @mm_calls += 1;
+    @mm_sizes = hist(args.len);
+    printf("MMAP   fd=%d len=%llu offset=%llu prot=%llu file=%s\n",
+           args.fd, args.len, args.off, args.prot,
+           @fd_path[pid, args.fd]);
+}
+
+/* ─── close ─── */
+tracepoint:syscalls:sys_enter_close
+/pid == $1 && @tracked[pid, args.fd] == 1/
+{
+    printf("CLOSE  fd=%d file=%s w_bytes=%llu r_bytes=%llu\n",
+           args.fd, @fd_path[pid, args.fd],
+           @w_per_fd[args.fd], @r_per_fd[args.fd]);
+
+    delete(@fd_path[pid, args.fd]);
+    delete(@tracked[pid, args.fd]);
+    delete(@w_next_off[args.fd]);
+    delete(@r_next_off[args.fd]);
+    delete(@w_per_fd[args.fd]);
+    delete(@r_per_fd[args.fd]);
+}
+
+/* ─── Periodic status ─── */
+interval:s:15
+{
+    printf("\n--- %llu s elapsed ---\n", elapsed / 1000000000);
+    printf("  Writes: %llu calls, %llu bytes (%.2f GB), max=%llu\n",
+           @w_calls, @w_total, (float)@w_total / 1073741824, @w_largest);
+    printf("  Reads:  %llu calls, %llu bytes (%.2f GB), max=%llu\n",
+           @r_calls, @r_total, (float)@r_total / 1073741824, @r_largest);
+    printf("  Seq W: %llu  Rnd W: %llu  Seq R: %llu  Rnd R: %llu\n",
+           @w_seq, @w_rnd, @r_seq, @r_rnd);
+}
+
+/* ─── Final summary ─── */
+END
+{
+    printf("\n");
+    printf("========================================================\n");
+    printf("   LMCache Application I/O Intent — Final Summary\n");
+    printf("========================================================\n");
+
+    printf("\n-- Write Size Distribution (application intent) --\n");
+    print(@w_hist);
+
+    printf("\n-- Read Size Distribution (application intent) --\n");
+    print(@r_hist);
+
+    printf("\n-- Aggregate --\n");
+    printf("  Write calls:    %llu\n", @w_calls);
+    printf("  Write bytes:    %llu (%.2f GB)\n",
+           @w_total, (float)@w_total / 1073741824);
+    printf("  Write max:      %llu (%.2f MB)\n",
+           @w_largest, (float)@w_largest / 1048576);
+    printf("  Write min:      %llu\n", @w_smallest);
+    printf("  Seq writes:     %llu\n", @w_seq);
+    printf("  Random writes:  %llu\n", @w_rnd);
+
+    printf("\n");
+    printf("  Read calls:     %llu\n", @r_calls);
+    printf("  Read bytes:     %llu (%.2f GB)\n",
+           @r_total, (float)@r_total / 1073741824);
+    printf("  Read max:       %llu (%.2f MB)\n",
+           @r_largest, (float)@r_largest / 1048576);
+    printf("  Read min:       %llu\n", @r_smallest);
+    printf("  Seq reads:      %llu\n", @r_seq);
+    printf("  Random reads:   %llu\n", @r_rnd);
+
+    if (@wv_calls > 0) {
+        printf("\n-- Vectored I/O (writev) --\n");
+        printf("  writev calls: %llu\n", @wv_calls);
+        print(@wv_vlen);
+    }
+    if (@rv_calls > 0) {
+        printf("\n-- Vectored I/O (readv) --\n");
+        printf("  readv calls: %llu\n", @rv_calls);
+        print(@rv_vlen);
+    }
+    if (@mm_calls > 0) {
+        printf("\n-- Memory-Mapped I/O (mmap) --\n");
+        printf("  mmap calls: %llu\n", @mm_calls);
+        print(@mm_sizes);
+    }
+
+    /* Per-fd volume */
+    printf("\n-- Per-FD Write Volume --\n");
+    print(@w_per_fd);
+    printf("\n-- Per-FD Read Volume --\n");
+    print(@r_per_fd);
+
+    /* Cleanup */
+    clear(@opening);
+    clear(@fd_path);
+    clear(@tracked);
+    clear(@w_next_off);
+    clear(@r_next_off);
+    clear(@w_per_fd);
+    clear(@r_per_fd);
+}
