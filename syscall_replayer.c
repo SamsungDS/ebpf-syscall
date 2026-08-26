@@ -238,7 +238,7 @@ struct dispatcher_ctx {
 	 * all per-pid workers pace against the same wall-clock origin and
 	 * cross-process ordering from the capture is preserved.            */
 	uint64_t  capture_start_ns;   /* timestamp_ns of the very first record */
-	uint64_t  replay_start_ns;    /* now_ns() captured at replay t0         */
+	uint64_t *replay_start_ns;    /* shared: now_ns() captured at replay t0 */
 	pthread_mutex_t *start_lock;  /* guards one-time init of the two fields */
 	int      *start_done;         /* 0 until the anchor has been set        */
 	uint32_t  worker_pid;         /* the captured pid this worker replays    */
@@ -463,8 +463,13 @@ void  mmap_map_clear(struct mmap_map *m, uint64_t cap_addr);
 	/* Cast via uint32_t to correctly reinterpret eBPF u32 values     \
 	 * (e.g. AT_FDCWD=4294967196 -> -100) before narrowing to ctype.  \
 	 * Direct (int32_t)double cast for values > INT32_MAX is UB in C.  \
+	 * Converting a NEGATIVE double straight to unsigned long long is \
+	 * also UB, so genuinely negative literals (offset=-1, ret=-1)    \
+	 * must go through a signed int64_t cast instead.                 \
 	 */ \
-	uint64_t _raw = (uint64_t)(unsigned long long)_n->valuedouble; \
+	double _d = _n->valuedouble; \
+	uint64_t _raw = (_d < 0) ? (uint64_t)(int64_t)_d \
+	                         : (uint64_t)(unsigned long long)_d; \
 	if (sizeof(ctype) == 4) \
 	    dst = (ctype)(int32_t)(uint32_t)_raw; \
 	else \
@@ -517,11 +522,11 @@ int callsys_from_json(const char *utf8_json, syscall_opt *opt)
 	opt->timestamp_ns = (uint64_t)ts->valuedouble;
     } else if (cJSON_IsString(ts)) {
 	opt->timestamp_ns = strtoull(ts->valuestring, NULL, 10);
-    } /*else if (ts == NULL) {
+    } else if (ts == NULL) {
 	fprintf(stderr, "Error: Missing or invalid 'timestamp_ns' field\n");
 	cJSON_Delete(json);
 	return -1;
-    } */
+    }
 
     /* Parse all other required fields using standard macros */
     REQUIRE_DOUBLE("timestamp_ms", opt->timestamp_ms);
@@ -890,14 +895,15 @@ static uint64_t parse_hex_addr(const char *s)
 static void parse_mmap_flags(const char *str, int *prot_out, int *flags_out)
 {
     char buf[MAX_FILENAME];
-    strncpy(buf, str, sizeof(buf) - 1);
-    buf[sizeof(buf) - 1] = '\0';
 
     *prot_out  = 0;
     *flags_out = 0;
 
     if (!str || str[0] == '\0')
         return;
+
+    strncpy(buf, str, sizeof(buf) - 1);
+    buf[sizeof(buf) - 1] = '\0';
 
     /*
      * Hex format: "0xPPPPPPPP:0xFFFFFFFF"
@@ -1418,7 +1424,7 @@ static struct replay_worker *worker_pool_get(struct worker_pool *wp, uint32_t pi
     w->ctx.verify           = wp->verify;
     w->ctx.paced            = wp->paced;
     w->ctx.capture_start_ns = wp->capture_start_ns;
-    w->ctx.replay_start_ns  = 0;
+    w->ctx.replay_start_ns  = &wp->replay_start_ns;
     w->ctx.start_lock       = &wp->start_lock;
     w->ctx.start_done       = &wp->start_done;
     w->ctx.worker_pid       = key;
@@ -1491,7 +1497,7 @@ void *dispatcher_thread(void *arg)
             if (!*ctx->start_done) {
                 pthread_mutex_lock(ctx->start_lock);
                 if (!*ctx->start_done) {
-                    ctx->replay_start_ns  = now_ns();
+                    *ctx->replay_start_ns = now_ns();
                     /* capture_start_ns is pre-seeded by main() to the
                      * global minimum timestamp across all records.    */
                     *ctx->start_done = 1;
@@ -1504,7 +1510,7 @@ void *dispatcher_thread(void *arg)
                 ? (op.timestamp_ns - ctx->capture_start_ns) : 0;
 
             uint64_t replay_elapsed_ns =
-                now_ns() - ctx->replay_start_ns;
+                now_ns() - *ctx->replay_start_ns;
 
             /* If we are ahead of the original timeline: sleep.
              * If we are behind (slow disk / long syscall): skip

@@ -139,7 +139,7 @@ static __always_inline void update_stats(u32 syscall_nr, u64 size)
     }
 }
 
-static __always_inline void log_event(u32 syscall_nr, u32 fd, u64 size, u64 offset, char filename[256], int open_flags_hex, char  open_flags_str[128], long ret, long error_code)
+static __always_inline void log_event(u32 syscall_nr, u32 fd, u64 size, s64 offset, char filename[256], int open_flags_hex, char  open_flags_str[128], long ret, long error_code)
 {
     struct syscall_event *event;
 
