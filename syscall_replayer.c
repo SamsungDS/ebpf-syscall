@@ -980,8 +980,10 @@ long dispatch_one(const syscall_opt *opt, struct mmap_map *m)
 	case 0: /* read */
 	    if (replayed_fd >= 0) {
 		buf = calloc(1, opt->size);
-		if (!buf)
-		    return -ENOMEM;
+		if (!buf) {
+		    errno = -ENOMEM;
+		    return -1;
+		}
 		ret = read(replayed_fd, buf, (size_t)opt->size);
 		free(buf); buf = NULL;
 	        }
@@ -989,8 +991,10 @@ long dispatch_one(const syscall_opt *opt, struct mmap_map *m)
 	case 1: /*write*/
 	    if (replayed_fd >= 0) {
 		buf = calloc(1, opt->size);
-		if (!buf)
-		    return -ENOMEM;
+		if (!buf) {
+		    errno = -ENOMEM;
+		    return -1;
+		}
 		ret = write(replayed_fd, buf, (size_t)opt->size);
 		free(buf); buf = NULL;
 	        }
@@ -1071,7 +1075,8 @@ long dispatch_one(const syscall_opt *opt, struct mmap_map *m)
 	        if (replayed_fd >= 0 ){
 		        buf = calloc(1, opt->size);
 		        if (!buf) {
-		             return -ENOMEM;
+		             errno = ENOMEM;
+			     return -1;
 		}
 		ret = pread(replayed_fd, buf, (size_t)opt->size, (off_t)opt->offset);
 		free(buf); buf = NULL;
@@ -1081,7 +1086,8 @@ long dispatch_one(const syscall_opt *opt, struct mmap_map *m)
 	    if (replayed_fd >= 0 ) {
 		buf = calloc(1, opt->size);
 		if (!buf) {
-		    return -ENOMEM;
+		    errno = ENOMEM;
+		    return -1;
 		}
 		ret = pwrite(replayed_fd, buf, (size_t)opt->size, (off_t)opt->offset);
 		free(buf); buf = NULL;
