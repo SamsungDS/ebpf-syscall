@@ -30,11 +30,11 @@ struct syscall_event {
     uint32_t syscall_nr;
     uint32_t fd;
     uint64_t size;
-    uint64_t offset;
+    int64_t offset;
     char comm[MAX_COMM_LEN];
     char filename[256];
     uint32_t open_flags_hex;
-    char open_flags_str[20];
+    char open_flags_str[128];
     enum io_direction ddir;
     long ret;  /* holds the number of bytes transferred */
     long error_code;  /* holds the error code returned by the syscall */
@@ -625,8 +625,8 @@ static void export_to_json(struct syscall_stat *stats, int stat_count,
             fprintf(fp, "      \"syscall_name\": \"%s\",\n", get_syscall_name(e->syscall_nr));
             fprintf(fp, "      \"fd\": %u,\n", e->fd);
             fprintf(fp, "      \"size\": %lu,\n", e->size);
-            fprintf(fp, "      \"offset\": %lu,\n", e->offset);
-            fprintf(fp, "      \"filename\": \"%s\",\n", esc_filename);
+            fprintf(fp, "      \"offset\": %ld,\n", (int64_t)e->offset);
+	    fprintf(fp, "      \"filename\": \"%s\",\n", esc_filename);
             fprintf(fp, "      \"open_flags_hex\": %u,\n", e->open_flags_hex);
             fprintf(fp, "      \"open_flags_str\": \"%s\",\n", esc_flags);
             fprintf(fp, "      \"io_direction\": \"%s\",\n",

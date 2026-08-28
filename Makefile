@@ -20,12 +20,14 @@ else
 endif
 
 # Compiler flags
-CFLAGS     = -g -O2 -Wall -Wextra
+CFLAGS = -g -O2 -Wall -Wextra
+CFLAGS += -I/usr/include/cjson
 BPF_CFLAGS = -g -O2 -target bpf -D__TARGET_ARCH_$(ARCH)
 CLANG      = clang
 
 # Targets
-TARGET  = syscall_monitor
+TARGET = syscall_monitor
+REPLAYER_TARGET = syscall_replayer
 BPF_OBJ = syscall_monitor.bpf.o
 SKEL    = syscall_monitor.skel.h
 
@@ -43,7 +45,7 @@ NVME_SKEL    = nvme_uring_cmd_monitor.skel.h
 
 .PHONY: all clean setup kvio
 
-all: setup $(TARGET) $(MMAP_TARGET) $(IOU_TARGET) $(NVME_TARGET) $(NVMETP_TARGET)
+all: setup $(TARGET) $(MMAP_TARGET) $(IOU_TARGET) $(NVME_TARGET) $(NVMETP_TARGET) $(REPLAYER_TARGET)
 
 setup:
 ifeq ($(LIBBPF_SYSTEM),yes)
@@ -68,6 +70,9 @@ $(SKEL): $(BPF_OBJ)
 
 $(TARGET): syscall_monitor.c $(SKEL)
 	$(CC) $(CFLAGS) $(INCLUDES) syscall_monitor.c $(LIBS_DIR) $(LIBS) -o $@
+
+$(REPLAYER_TARGET): syscall_replayer.c
+	$(CC) $(CFLAGS) syscall_replayer.c -lcjson -o $@
 
 $(MMAP_BPF_OBJ): mmap_readamp.bpf.c vmlinux.h
 	$(CLANG) $(BPF_CFLAGS) $(INCLUDES) -c mmap_readamp.bpf.c -o $@
@@ -156,21 +161,22 @@ install-deps:
 	@echo "Installing dependencies..."
 	@if command -v apt-get >/dev/null 2>&1; then \
 		sudo apt-get update; \
-		sudo apt-get install -y clang llvm libelf-dev libz-dev linux-tools-common linux-tools-generic build-essential git; \
+		sudo apt-get install -y clang llvm libelf-dev libz-dev linux-tools-common linux-tools-generic build-essential git libcjson-dev; \
 	elif command -v yum >/dev/null 2>&1; then \
-		sudo yum install -y clang llvm elfutils-libelf-devel zlib-devel bpftool kernel-devel git make; \
+		sudo yum install -y clang llvm elfutils-libelf-devel zlib-devel bpftool kernel-devel git make cjson-devel; \
 	elif command -v dnf >/dev/null 2>&1; then \
-		sudo dnf install -y clang llvm elfutils-libelf-devel zlib-devel bpftool kernel-devel git make; \
+		sudo dnf install -y clang llvm elfutils-libelf-devel zlib-devel bpftool kernel-devel git make cjson-devel; \
 	else \
 		echo "Please install dependencies manually:"; \
 		echo "- clang, llvm"; \
 		echo "- libelf-dev, zlib-dev"; \
 		echo "- linux-tools (for bpftool)"; \
 		echo "- kernel headers"; \
+		echo "- libcjson-dev"; \
 	fi
 
 clean:
-	rm -f $(TARGET) $(BPF_OBJ) $(SKEL) vmlinux.h
+	rm -f $(TARGET) $(REPLAYER_TARGET) $(BPF_OBJ) $(SKEL) vmlinux.h
 	rm -f $(MMAP_TARGET) $(MMAP_BPF_OBJ) $(MMAP_SKEL)
 	rm -f $(IOU_TARGET) $(IOU_BPF_OBJ) $(IOU_SKEL)
 	rm -f $(NVME_TARGET) $(NVME_BPF_OBJ) $(NVME_SKEL)
@@ -190,6 +196,7 @@ help:
 	@echo "  help         - Show this help message"
 	@echo ""
 	@echo "Usage:"
-	@echo "  make install-deps  # First time setup"
-	@echo "  make all          # Build the project"
-	@echo "  sudo ./syscall_monitor  # Run the program"
+	@echo "  make install-deps      # First time setup"
+	@echo "  make all               # Build both tools"
+	@echo "  sudo ./syscall_monitor # Run the syscall monitor"
+	@echo "  ./syscall_replayer     # Parse JSON syscall logs"

@@ -99,11 +99,11 @@ struct syscall_event {
     u32 syscall_nr;
     u32 fd;
     u64 size;
-    u64 offset;
+    s64 offset;
     char comm[MAX_COMM_LEN];
     char filename[256];
     u32 open_flags_hex;
-    char open_flags_str[20];
+    char open_flags_str[128];
     enum io_direction ddir;
     long ret;  /* holds the number of bytes transferred */
     long error_code;  /* holds the error code returned by the syscall */
@@ -129,6 +129,15 @@ struct {
     __uint(type, BPF_MAP_TYPE_RINGBUF);
     __uint(max_entries, 8 * 1024 * 1024);  // 8MB ring buffer (increased from 256KB)
 } events SEC(".maps");
+
+// struct used to map the timestamps to pid_tgid
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, MAX_ENTRIES);
+    __type(key, u64);     // pid_tgid
+    __type(value, u64);   // timestamp captured at mmap entry
+} mmap_entry_map SEC(".maps");
+
 
 // Global flag to control detailed logging
 volatile const bool detailed_logging = true;
@@ -184,7 +193,7 @@ static __always_inline void update_stats(u32 syscall_nr, u64 size)
     }
 }
 
-static __always_inline void log_event(u32 syscall_nr, u32 fd, u64 size, u64 offset, char filename[256], int open_flags_hex, char  open_flags_str[20], long ret, long error_code)
+static __always_inline void log_event(u32 syscall_nr, u32 fd, u64 size, s64 offset, char filename[256], int open_flags_hex, char  open_flags_str[128], long ret, long error_code)
 {
     struct syscall_event *event;
 
@@ -205,14 +214,38 @@ static __always_inline void log_event(u32 syscall_nr, u32 fd, u64 size, u64 offs
 
     event->timestamp = bpf_ktime_get_ns();
     event->pid = bpf_get_current_pid_tgid() >> 32;
+    u64 pid_tgid = bpf_get_current_pid_tgid();
+    if (syscall_nr == 9) {   /* mmap */
+        if (filename[0] == '\0') {
+            /*
+             * mmap ENTRY — capture fresh timestamp, save it
+             * in map keyed by pid_tgid for exit to reuse
+             */
+            u64 ts = bpf_ktime_get_ns();
+            event->timestamp = ts;
+            bpf_map_update_elem(&mmap_entry_map, &pid_tgid, &ts, BPF_ANY);
+
+        } else {
+            /*
+             * mmap EXIT — reuse the exact timestamp from entry
+             * so both log records are correlated by (pid_tgid, timestamp)
+             */
+            u64 *saved_ts = bpf_map_lookup_elem(&mmap_entry_map, &pid_tgid);
+            event->timestamp = saved_ts ? *saved_ts : bpf_ktime_get_ns();
+            bpf_map_delete_elem(&mmap_entry_map, &pid_tgid);  // cleanup
+        }
+    } else {
+        // all other syscalls — fresh timestamp
+        event->timestamp = bpf_ktime_get_ns();
+    }
     event->syscall_nr = syscall_nr;
     event->fd = fd;
     event->size = size;
     event->offset = offset;
     bpf_get_current_comm(&event->comm, sizeof(event->comm));
-    memcpy(event->filename, filename , sizeof(event->filename));
+    __builtin_memcpy(event->filename, filename , sizeof(event->filename));
     event->open_flags_hex = open_flags_hex;
-    memcpy(event->open_flags_str, open_flags_str, sizeof(event->open_flags_str));
+    __builtin_memcpy(event->open_flags_str, open_flags_str, sizeof(event->open_flags_str));
     if (syscall_nr == 0 || syscall_nr == 17)
         event->ddir = READ;
     else if (syscall_nr == 1 || syscall_nr == 18)
@@ -227,38 +260,50 @@ static __always_inline void log_event(u32 syscall_nr, u32 fd, u64 size, u64 offs
     bpf_ringbuf_submit(event, 0);
 }
 
-// read syscall: sys_enter tracepoint exposes typed args directly.
-// Using kprobe/__x64_sys_read here would attach to the syscall wrapper
-// whose only argument is 'struct pt_regs *regs', so PT_REGS_PARM* would
-// read garbage off the kprobe-time register state instead of the syscall
-// arguments. Tracepoints don't have that problem - they fire with the
-// already-decoded args.
-SEC("tracepoint/syscalls/sys_enter_read")
-int trace_read_entry(struct trace_event_raw_sys_enter *ctx)
+// read syscall tracepoint
+SEC("kprobe/__x64_sys_read")
+int trace_read_entry(struct pt_regs *ctx)
 {
     u32 syscall_nr = 0; // read
-    int fd = (int)ctx->args[0];
-    size_t count = (size_t)ctx->args[2];
+    struct pt_regs inner = {};
+    struct pt_regs *inner_ptr = (struct pt_regs *)PT_REGS_PARM1(ctx);
+    if (bpf_probe_read_kernel(&inner, sizeof(inner), inner_ptr) < 0)
+        return 0;
 
-    stash_io_enter(syscall_nr, fd, count, 0);  // joined + accounted at sys_exit
+    struct pt_regs *p = &inner;
+    unsigned int fd   = (unsigned int)PT_REGS_PARM1(p);  /* rdi ✓ */
+    size_t       size = (size_t)PT_REGS_PARM3(p);        /* rdx ✓ */
+    /* read has no offset — positional read uses file position */
+
+    update_stats(syscall_nr, size);
+    log_event(syscall_nr, fd, size, 0, "", 0, "", -1,-1);
 
     return 0;
 }
 
-SEC("tracepoint/syscalls/sys_enter_write")
-int trace_write_entry(struct trace_event_raw_sys_enter *ctx)
+// write syscall tracepoint
+SEC("kprobe/__x64_sys_write")
+int trace_write_entry(struct pt_regs *ctx)
 {
     u32 syscall_nr = 1; // write
-    int fd = (int)ctx->args[0];
-    size_t count = (size_t)ctx->args[2];
+    struct pt_regs inner = {};
+    struct pt_regs *inner_ptr = (struct pt_regs *)PT_REGS_PARM1(ctx);
+    if (bpf_probe_read_kernel(&inner, sizeof(inner), inner_ptr) < 0)
+        return 0;
 
-    stash_io_enter(syscall_nr, fd, count, 0);  // joined + accounted at sys_exit
+    struct pt_regs *p = &inner;
+    unsigned int fd   = (unsigned int)PT_REGS_PARM1(p);  /* rdi ✓ */
+    size_t       size = (size_t)PT_REGS_PARM3(p);        /* rdx ✓ */
+    /* write has no offset — positional write uses file position */
+
+    update_stats(syscall_nr, size);
+    log_event(syscall_nr, fd, size, 0, "", 0, "", -1, -1);
 
     return 0;
 }
 
-SEC("tracepoint/syscalls/sys_enter_open")
-int trace_open_entry(struct trace_event_raw_sys_enter *ctx)
+SEC("kprobe/__x64_sys_open")
+int trace_open_entry(struct pt_regs *ctx)
 {
     u32 syscall_nr = 2; // open
 
@@ -283,7 +328,7 @@ int trace_openat(struct trace_event_raw_sys_enter *ctx)
         return 0;
     }
 
-    char open_flags_str[80] = {0};
+    char open_flags_str[128] = {0};
 
     int accmode  = open_flags_hex & O_ACCMODE;
 
@@ -349,11 +394,18 @@ int trace_openat(struct trace_event_raw_sys_enter *ctx)
     return 0;
 }
 
-SEC("tracepoint/syscalls/sys_enter_close")
-int trace_close_entry(struct trace_event_raw_sys_enter *ctx)
+// close syscall tracepoint
+SEC("kprobe/__x64_sys_close")
+int trace_close_entry(struct pt_regs *ctx)
 {
     u32 syscall_nr = 3; // close
-    unsigned int fd = (unsigned int)ctx->args[0];
+    struct pt_regs inner = {};
+    struct pt_regs *inner_ptr = (struct pt_regs *)PT_REGS_PARM1(ctx);
+    if (bpf_probe_read_kernel(&inner, sizeof(inner), inner_ptr) < 0)
+        return 0;
+    struct pt_regs *p = &inner;
+
+    unsigned int fd = (unsigned int)PT_REGS_PARM1(p);  /* rdi */
 
     update_stats(syscall_nr, 1);
     log_event(syscall_nr, fd, 1, 0, "", 0, "", -1, -1);
@@ -361,95 +413,229 @@ int trace_close_entry(struct trace_event_raw_sys_enter *ctx)
     return 0;
 }
 
-SEC("tracepoint/syscalls/sys_enter_lseek")
-int trace_lseek_entry(struct trace_event_raw_sys_enter *ctx)
+// lseek syscall tracepoint
+SEC("kprobe/__x64_sys_lseek")
+int trace_lseek_entry(struct pt_regs *ctx)
 {
     u32 syscall_nr = 8; // lseek
-    unsigned int fd = (unsigned int)ctx->args[0];
-    off_t offset = (off_t)ctx->args[1];
-    u64 abs_offset = offset > 0 ? offset : -offset;
+    struct pt_regs inner = {};
+    struct pt_regs *inner_ptr = (struct pt_regs *)PT_REGS_PARM1(ctx);
+    if (bpf_probe_read_kernel(&inner, sizeof(inner), inner_ptr) < 0)
+        return 0;
+
+    struct pt_regs *p = &inner;
+
+    unsigned int fd     = (unsigned int)PT_REGS_PARM1(p);  /* rdi ✓ */
+    s64        offset = (s64)PT_REGS_PARM2(p);         /* rsi ✓ */
+    unsigned int whence = (unsigned int)PT_REGS_PARM3(p);  /* rdx ✓ */
+
+    u64 abs_offset = offset > 0 ? (u64)offset : (u64)-offset;
 
     update_stats(syscall_nr, abs_offset);
-    log_event(syscall_nr, fd, abs_offset, offset, "", 0, "", -1, -1);
+    log_event(syscall_nr, fd, abs_offset, (loff_t)offset, "", whence, "", -1, -1);
 
     return 0;
 }
 
-SEC("tracepoint/syscalls/sys_enter_pread64")
-int trace_pread_entry(struct trace_event_raw_sys_enter *ctx)
+// pread64 syscall tracepoint
+SEC("kprobe/__x64_sys_pread64")
+int trace_pread_entry(struct pt_regs *ctx)
 {
     u32 syscall_nr = 17; // pread64
-    unsigned int fd = (unsigned int)ctx->args[0];
-    size_t count = (size_t)ctx->args[2];
-    loff_t pos = (loff_t)ctx->args[3];
+    struct pt_regs inner = {};
+    struct pt_regs *inner_ptr = (struct pt_regs *)PT_REGS_PARM1(ctx);
+    if (bpf_probe_read_kernel(&inner, sizeof(inner), inner_ptr) < 0)
+        return 0;
 
-    stash_io_enter(syscall_nr, fd, count, pos);  // joined + accounted at sys_exit
+    struct pt_regs *p = &inner;
+
+    unsigned int fd     = (unsigned int)PT_REGS_PARM1(p);  /* rdi ✓ */
+    u64          buf    = (u64)PT_REGS_PARM2(p);           /* rsi — buf ptr, not logged */
+    size_t       size   = (size_t)PT_REGS_PARM3(p);        /* rdx ✓ */
+
+    /* pread64 arg4 = offset uses r10 not rcx — same as mmap arg4 */
+    loff_t offset = (loff_t)inner.r10;
+
+    update_stats(syscall_nr, size);
+    log_event(syscall_nr, fd, size, offset, "", 0, "", -1, -1);
 
     return 0;
 }
 
-SEC("tracepoint/syscalls/sys_enter_pwrite64")
-int trace_pwrite_entry(struct trace_event_raw_sys_enter *ctx)
+// pwrite64 syscall tracepoint
+SEC("kprobe/__x64_sys_pwrite64")
+int trace_pwrite_entry(struct pt_regs *ctx)
 {
     u32 syscall_nr = 18; // pwrite64
-    unsigned int fd = (unsigned int)ctx->args[0];
-    size_t count = (size_t)ctx->args[2];
-    loff_t pos = (loff_t)ctx->args[3];
+    struct pt_regs inner = {};
+    struct pt_regs *inner_ptr = (struct pt_regs *)PT_REGS_PARM1(ctx);
+    if (bpf_probe_read_kernel(&inner, sizeof(inner), inner_ptr) < 0)
+        return 0;
 
-    stash_io_enter(syscall_nr, fd, count, pos);  // joined + accounted at sys_exit
+    struct pt_regs *p = &inner;
+
+    unsigned int fd     = (unsigned int)PT_REGS_PARM1(p);
+    size_t       size   = (size_t)PT_REGS_PARM3(p);
+    loff_t       offset = (loff_t)inner.r10;   /* arg4 = r10 ✓ */
+
+    update_stats(syscall_nr, size);
+    log_event(syscall_nr, fd, size, offset, "", 0, "", -1, -1);
 
     return 0;
 }
 
-// mmap(addr, length, prot, flags, fd, offset)
-SEC("tracepoint/syscalls/sys_enter_mmap")
-int trace_mmap_entry(struct trace_event_raw_sys_enter *ctx)
+// mmap syscall tracepoint
+SEC("kprobe/__x64_sys_mmap")
+int trace_mmap_entry(struct pt_regs *ctx)
 {
-    u32 syscall_nr = 9; // mmap
-    size_t length = (size_t)ctx->args[1];
-    unsigned int fd = (unsigned int)ctx->args[4];
-    loff_t offset = (loff_t)ctx->args[5];
+    u32 syscall_nr = 9; // mmap syscall
+    /*
+     * Safely read the inner pt_regs pointer via bpf_probe_read_kernel.
+     * Direct cast of PT_REGS_PARM1(ctx) gives a scalar the verifier
+     * won't allow dereferencing — read it through the helper instead.
+     */
+    struct pt_regs inner = {};
+    struct pt_regs *inner_ptr = (struct pt_regs *)PT_REGS_PARM1(ctx);
+    if (bpf_probe_read_kernel(&inner, sizeof(inner), inner_ptr) < 0)
+        return 0;
+
+    /* now read args from the local copy — all lvalues, verifier happy */
+    unsigned int fd        = (unsigned int)PT_REGS_PARM5(&inner);
+    size_t       length    = (size_t)PT_REGS_PARM2(&inner);
+    loff_t       offset    = (loff_t)PT_REGS_PARM6(&inner);
+    int          prot      = (int)PT_REGS_PARM3(&inner);
+    int          map_flags = (int)inner.r10;
+    char open_flags_str[128] = {};
+    __u32 pos    = 0;
+    int   need_sep = 0;
+
+     /*
+     * Pack prot and map_flags as "PROT:FLAGS" hex string — tiny, fixed size,
+     * no unrolled loops. Decoded in userspace parse_mmap_flags().
+     * e.g. prot=3, map_flags=2 → "0x00000003:0x00000002"
+     */
+
+    /* emit "0x" + 8 hex digits for prot */
+    const char hex[] = "0123456789abcdef";
+    open_flags_str[pos++] = '0';
+    open_flags_str[pos++] = 'x';
+    #pragma unroll
+    for (int i = 7; i >= 0; i--)
+        open_flags_str[pos++] = hex[((unsigned)prot >> (i * 4)) & 0xF];
+
+    open_flags_str[pos++] = ':';
+
+    /* emit "0x" + 8 hex digits for map_flags */
+    open_flags_str[pos++] = '0';
+    open_flags_str[pos++] = 'x';
+    #pragma unroll
+    for (int i = 7; i >= 0; i--)
+        open_flags_str[pos++] = hex[((unsigned)map_flags >> (i * 4)) & 0xF];
+
+    open_flags_str[pos] = '\0';
+    /* result: "0x00000003:0x00000002" — 21 bytes, fixed, verifier-friendly */
+
+    open_flags_str[pos] = '\0';
 
     update_stats(syscall_nr, length);
-    log_event(syscall_nr, fd, length, offset, "", 0, "", -1, -1);
+    log_event(syscall_nr, fd, length, offset, "", 0, open_flags_str, -1, -1);
 
     return 0;
 }
 
-// munmap(addr, length): no fd, no offset
-SEC("tracepoint/syscalls/sys_enter_munmap")
-int trace_munmap_entry(struct trace_event_raw_sys_enter *ctx)
+/*mmap exit syscall tracepoint */
+SEC("kretprobe/__x64_sys_mmap")
+int trace_mmap_exit(struct pt_regs *ctx)
 {
-    u32 syscall_nr = 11; // munmap
-    size_t length = (size_t)ctx->args[1];
+    u32 syscall_nr = 9; // mmap syscall
+    unsigned long ret_addr = (unsigned long)PT_REGS_RC(ctx);
+
+    char filename[256] = {};
+    if (ret_addr == (unsigned long)-1UL) {
+        filename[0] = '0'; filename[1] = 'x'; filename[2] = '0'; filename[3] = '\0';
+    } else {
+        const char hex[] = "0123456789abcdef";
+        filename[0] = '0';
+        filename[1] = 'x';
+        #pragma unroll
+        for (int i = 0; i < 16; i++)
+            filename[2 + i] = hex[(ret_addr >> ((15 - i) * 4)) & 0xF];
+        filename[18] = '\0';
+    }
+
+    update_stats(syscall_nr, 0);
+    log_event(syscall_nr, 0, 0, 0, filename, 0, "", -1, -1);
+
+    return 0;
+}
+
+//munmap syscall tracepoint
+SEC("kprobe/__x64_sys_munmap")
+int trace_munmap_entry(struct pt_regs *ctx)
+{
+    u32 syscall_nr = 11;
+    /* read only the two registers we need — not full pt_regs */
+    struct pt_regs *inner_ptr = (struct pt_regs *)PT_REGS_PARM1(ctx);
+
+    unsigned long addr   = 0;
+    size_t        length = 0;
+
+    /* read addr (rdi = offset 112) and length (rsi = offset 104) directly */
+    bpf_probe_read_kernel(&addr,   sizeof(addr),   &inner_ptr->di);
+    bpf_probe_read_kernel(&length, sizeof(length),  &inner_ptr->si);
+
+    /* encode addr as hex into filename[] — replayer uses it as cap_addr key */
+    char filename[256] = {};
+    const char hex[] = "0123456789abcdef";
+    filename[0] = '0';
+    filename[1] = 'x';
+    #pragma unroll
+    for (int i = 0; i < 16; i++)
+        filename[2 + i] = hex[(addr >> ((15 - i) * 4)) & 0xF];
+    filename[18] = '\0';
 
     update_stats(syscall_nr, length);
-    log_event(syscall_nr, 0, length, 0, "", 0, "", -1, -1);
+    log_event(syscall_nr, -1, length, 0, filename, 0, "", -1, -1);
 
     return 0;
 }
 
-// readv(fd, iov, iovcnt): record fd and iovcnt as a density signal.
-SEC("tracepoint/syscalls/sys_enter_readv")
-int trace_readv_entry(struct trace_event_raw_sys_enter *ctx)
+// readv syscall tracepoint
+SEC("kprobe/__x64_sys_readv")
+int trace_readv_entry(struct pt_regs *ctx)
 {
-    u32 syscall_nr = 19; // readv
-    unsigned int fd = (unsigned int)ctx->args[0];
-    size_t iovcnt = (size_t)ctx->args[2];
+    u32 syscall_nr = 19;
+    struct pt_regs inner = {};
+    struct pt_regs *inner_ptr = (struct pt_regs *)PT_REGS_PARM1(ctx);
+    if (bpf_probe_read_kernel(&inner, sizeof(inner), inner_ptr) < 0)
+        return 0;
 
-    stash_io_enter(syscall_nr, fd, iovcnt, 0);  // joined + accounted at sys_exit
+    struct pt_regs *p = &inner;
+    unsigned int fd    = (unsigned int)PT_REGS_PARM1(p);  /* rdi */
+    unsigned long count = (unsigned long)PT_REGS_PARM3(p); /* rdx = iovcnt */
+
+    update_stats(syscall_nr, count);
+    log_event(syscall_nr, fd, count, 0, "", 0, "", -1, -1);
 
     return 0;
 }
 
-SEC("tracepoint/syscalls/sys_enter_writev")
-int trace_writev_entry(struct trace_event_raw_sys_enter *ctx)
+// writev syscall tracepoint
+SEC("kprobe/__x64_sys_writev")
+int trace_writev_entry(struct pt_regs *ctx)
 {
     u32 syscall_nr = 20; // writev
-    unsigned int fd = (unsigned int)ctx->args[0];
-    size_t iovcnt = (size_t)ctx->args[2];
+    struct pt_regs inner = {};
+    struct pt_regs *inner_ptr = (struct pt_regs *)PT_REGS_PARM1(ctx);
+    if (bpf_probe_read_kernel(&inner, sizeof(inner), inner_ptr) < 0)
+        return 0;
 
-    stash_io_enter(syscall_nr, fd, iovcnt, 0);  // joined + accounted at sys_exit
+    struct pt_regs *p = &inner;
+    unsigned int fd    = (unsigned int)PT_REGS_PARM1(p);  /* rdi ✓ */
+    unsigned long count = (unsigned long)PT_REGS_PARM3(p); /* rdx = iovcnt ✓ */
+
+    update_stats(syscall_nr, count);
+    log_event(syscall_nr, fd, count, 0, "", 0, "", -1, -1);
 
     return 0;
 }
@@ -471,31 +657,23 @@ SEC("tracepoint/raw_syscalls/sys_exit")
 int trace_sys_exit(struct trace_event_raw_sys_exit *ctx)
 {
     u32 syscall_nr  = ctx->id;   // syscall number
-    long ret = ctx->ret; // return value (bytes transferred, or -errno)
-    long error_code = 0;
-    if (ret < 0 ) {
-	error_code  = -ret;
-    }
+    long ret = ctx->ret; // return value
+    long error_code  = (ret < 0) ? ret : 0;   /* negative errno or 0 */
 
-    // read/write family: join with the stashed enter args and emit ONE complete record carrying the
-    // requested count, the absolute offset, AND the RETURNED bytes (the true transfer). Accounting
-    // uses returned bytes, not the requested count -- that is the layer the analytical model needs.
-    u64 tid = bpf_get_current_pid_tgid();
-    struct io_ctx *c = bpf_map_lookup_elem(&io_inflight, &tid);
-    if (c && c->syscall_nr == syscall_nr) {
-        u64 transferred = (ret > 0) ? (u64)ret : 0;
-        update_stats(syscall_nr, transferred);
-        log_event(syscall_nr, c->fd, c->count, c->offset, "", 0, "", ret, error_code);
-        bpf_map_delete_elem(&io_inflight, &tid);
+    /* filter to tracked syscalls only */
+    if (syscall_nr != 0  && syscall_nr != 1  && syscall_nr != 2  &&
+        syscall_nr != 3  && syscall_nr != 8  && syscall_nr != 9  &&
+        syscall_nr != 11 && syscall_nr != 17 && syscall_nr != 18 &&
+        syscall_nr != 19 && syscall_nr != 20 && syscall_nr != 74 &&
+        syscall_nr != 257)
         return 0;
-    }
 
-    // other syscalls (open/openat/close/lseek/mmap/munmap/fsync): completion-only record
-    if (syscall_nr == 2 || syscall_nr == 257 || syscall_nr == 3 || syscall_nr == 8 ||
-    syscall_nr == 9 || syscall_nr == 11 || syscall_nr == 74) {
-        update_stats(syscall_nr, 1);
-        log_event(syscall_nr, -1, 1, 0,"", 0, "", ret, error_code);
-    }
+    /*
+     * Exit record — fd=-1, size=1, offset=0 signals to the replayer
+     * that this is an exit record and should be skipped.
+     * Contains only ret and error_code — no syscall args.
+     */
+    log_event(syscall_nr, -1, 1, 0, "", 0, "", ret, error_code);
 
     return 0;
 }
