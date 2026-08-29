@@ -1,0 +1,51 @@
+# Build the Sphinx docs and publish them to GitHub Pages at ebpf.kvcache.io.
+#
+# Read the Docs builds the same docs/conf.py from .readthedocs.yaml; this
+# workflow exists so the project also serves from its own domain. The CNAME
+# file is copied into the artifact because a Pages site only answers for a
+# custom domain that the published output claims.
+name: docs
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      # enablement: true switches the Pages source to this workflow, so the
+      # site stops depending on a branch build that publishes Sphinx source.
+      - uses: actions/configure-pages@v5
+        with:
+          enablement: true
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r docs/requirements.txt
+      - run: sphinx-build -b html -W --keep-going docs docs/_build/html
+      - run: cp docs/CNAME docs/_build/html/CNAME
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: docs/_build/html
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-24.04
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
