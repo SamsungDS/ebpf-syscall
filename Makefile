@@ -43,7 +43,7 @@ NVME_TARGET  = nvme_uring_cmd_monitor
 NVME_BPF_OBJ = nvme_uring_cmd_monitor.bpf.o
 NVME_SKEL    = nvme_uring_cmd_monitor.skel.h
 
-.PHONY: all clean setup kvio
+.PHONY: all clean setup kvio kvio-test
 
 all: setup $(TARGET) $(MMAP_TARGET) $(IOU_TARGET) $(NVME_TARGET) $(NVMETP_TARGET) $(REPLAYER_TARGET)
 
@@ -148,6 +148,10 @@ kvio:
 	@ln -sf $(KVIO_DIR)/kvio kvio
 	@echo "kvio built: ./kvio -- try './kvio doctor' then './kvio --help'"
 
+kvio-test:
+	@python3 -m py_compile tools/kvio/*.py
+	@python3 -m unittest -v tests.test_kvio_bench
+
 vmlinux.h:
 	@echo "Generating vmlinux.h from running kernel..."
 	@if [ -n "$(BPFTOOL)" ] && [ -x "$(BPFTOOL)" ]; then \
@@ -192,6 +196,7 @@ help:
 	@echo "  kvio         - Build the kvio tool (vendored Rust engine; needs cargo)"
 	@echo "  install-deps - Install system dependencies"
 	@echo "  setup        - Setup libbpf and check tools"
+	@echo "  kvio-test    - Run kvio unit tests"
 	@echo "  clean        - Clean build artifacts"
 	@echo "  help         - Show this help message"
 	@echo ""

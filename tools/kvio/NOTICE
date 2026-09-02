@@ -1,0 +1,9 @@
+The kvio storage benchmark profiles and their original measurement harness were
+contributed by Davidlohr Bueso and derived from kvspill:
+
+    https://github.com/davidlohr/kvspill
+
+They are incorporated into kvio with David's permission under the repository's
+Apache-2.0 license.  The integration retains the workload intent while adding
+model-derived object sizes, stricter raw-device checks, bounded regions,
+structured artifacts, and restoration of temporary host tuning.

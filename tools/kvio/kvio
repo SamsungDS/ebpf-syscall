@@ -16,6 +16,8 @@ device-exact fio.
     ./kvio perfetto ...  # attribute + convert to a Perfetto trace
     ./kvio iolog ...     # device capture -> fio v3 iolog
     ./kvio compare ...   # grade a replay against its capture
+    ./kvio bench ...     # run sustained kvspill-derived fio workloads
+    ./kvio bench-compare # compare median results from two bench runs
 
 Set KVIO_USE_SYSTEM_LMCACHE=1 to run against an installed LMCache instead of
 the vendored one.
@@ -27,6 +29,11 @@ HERE = os.path.dirname(os.path.realpath(__file__))
 TOP = os.path.dirname(os.path.dirname(HERE))
 VENDOR = os.path.join(HERE, "vendor", "lmcache")
 BUILD = os.path.join(HERE, "build")
+
+# Imports for in-tree subcommands must work both through the generated ./kvio
+# symlink and when this launcher is invoked at tools/kvio/kvio.
+if TOP not in sys.path:
+    sys.path.insert(0, TOP)
 
 # command -> (path-relative-to-TOP, one-line help, needs_engine)
 COMMANDS = {
@@ -71,6 +78,8 @@ def usage(out=sys.stdout):
         tag = " [engine]" if engine else ""
         out.write(f"  {name:<15} {help_line}{tag}\n")
     out.write("  doctor          check the build, python deps, and tracers\n")
+    out.write("  bench           run kvspill-derived storage-tier workloads\n")
+    out.write("  bench-compare   compare medians from two bench logs\n")
     out.write("\n[engine] commands use the vendored LMCache raw_block engine: "
               "run `make kvio` first.\nSee tools/kvio/README.md.\n")
 
@@ -161,6 +170,12 @@ def main():
     cmd, rest = args[0], args[1:]
     if cmd == "doctor":
         return doctor()
+    if cmd == "bench":
+        from tools.kvio.bench import main as bench_main
+        return bench_main(rest)
+    if cmd == "bench-compare":
+        from tools.kvio.compare import main as compare_main
+        return compare_main(rest)
     if cmd not in COMMANDS:
         sys.stderr.write(f"kvio: unknown command '{cmd}'\n\n")
         usage(sys.stderr)
