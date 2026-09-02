@@ -153,6 +153,7 @@
   <a href="#parts">Components</a>
   <a href="#deps">Dependencies</a>
   <a href="#run">How to run</a>
+  <a href="#bench">kvspill benchmarks</a>
   <a href="#fidelity">Fidelity metrics</a>
   <a href="#results">Validated results</a>
 </div></nav>
@@ -410,8 +411,27 @@
     fraction of a percent; matched, it is exact.</div>
 </section>
 
+<section id="bench">
+  <h2><span class="n">07</span>Storage-pressure benchmarks from kvspill</h2>
+  <p><a href="https://github.com/davidlohr/kvspill">Davidlohr Bueso's kvspill</a>
+    adds the other half of the storage question: sustained restore, prefix,
+    interference, and eviction pressure against a real drive. With David's permission, its five fio
+    workload shapes now ship as <code>./kvio bench</code> under this repository's
+    Apache-2.0 license, with structured A/B comparison in
+    <code>./kvio bench-compare</code>.</p>
+  <div class="note info"><b class="tag">complementary, not interchangeable</b>
+    <code>bench</code> measures device headroom and interference under controlled
+    synthetic pressure. Projection and capture/replay establish application and
+    command-stream fidelity. Each built-in is labeled measured or synthetic;
+    <code>--profile</code> accepts future capture-derived sustained workloads with
+    their evidence source. Neither result should be presented as the other.</div>
+  <p>See the dedicated <a href="kvspill.html"><b>kvspill is now kvio bench</b></a>
+    page for why kvspill existed, what was merged, exact commands, raw-device safety,
+    and interpretation limits.</p>
+</section>
+
 <section id="fidelity">
-  <h2><span class="n">07</span>Fidelity metrics</h2>
+  <h2><span class="n">08</span>Fidelity metrics</h2>
   <p>Three complementary scores, joined per object by <code>trace_id</code>. AUC is
     deliberately <em>not</em> used — there is no class label; the geometry is deterministic.</p>
   <div class="grid c3">
@@ -438,7 +458,7 @@
 </section>
 
 <section id="results">
-  <h2><span class="n">08</span>Validated results</h2>
+  <h2><span class="n">09</span>Validated results</h2>
   <p class="muted">On an 8× H100 server with real Samsung Gen5 NVMe (io_uring_cmd passthrough on
     <code>/dev/ng</code>), the projection was validated against a <b>real GPU-driven vLLM +
     LMCache offload</b> — the previously hardware-gated step is now closed.</p>

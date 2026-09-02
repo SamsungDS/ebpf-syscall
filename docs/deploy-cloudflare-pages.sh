@@ -25,6 +25,8 @@ DOMAIN="ebpf.kvcache.io"
 PROJECT="${PAGES_PROJECT:-ebpf-syscall}"
 KVIO_DOMAIN="kvio.kvcache.io"
 KVIO_PROJECT="${KVIO_PAGES_PROJECT:-kvio}"
+KVSPILL_DOMAIN="kvspill.kvcache.io"
+KVSPILL_PROJECT="${KVSPILL_PAGES_PROJECT:-kvspill}"
 
 here="$(cd "$(dirname "$0")/.." && pwd)"
 out="$here/docs/_build/html"
@@ -117,5 +119,40 @@ curl -s -X POST -H "$auth" -H 'Content-Type: application/json' \
 	"$api/zones/$zone_id/dns_records" | jq_ok ||
 	echo "  (record may already exist -- check the dashboard)"
 
-say "done -- https://$DOMAIN and https://$KVIO_DOMAIN"
+# --- kvspill.kvcache.io ---------------------------------------------------
+# Serve the standalone kvspill page at the hostname root. Do not use a
+# redirect: the dedicated hostname should remain useful if the main docs URL
+# layout changes.
+say "publishing the kvspill microsite"
+kvspill_out="$here/docs/_build/kvspill"
+rm -rf "$kvspill_out"; mkdir -p "$kvspill_out"
+cp "$here/docs/kvspill.html" "$kvspill_out/index.html"
+printf '%s\n' "$KVSPILL_DOMAIN" > "$kvspill_out/CNAME"
+
+curl -s -X POST -H "$auth" -H 'Content-Type: application/json' \
+	--data "{\"name\":\"$KVSPILL_PROJECT\",\"production_branch\":\"main\"}" \
+	"$api/accounts/$ACCOUNT_ID/pages/projects" >/dev/null || true
+CLOUDFLARE_ACCOUNT_ID="$ACCOUNT_ID" npx --yes wrangler@latest pages deploy "$kvspill_out" \
+	--project-name="$KVSPILL_PROJECT" --branch=main --commit-dirty=true
+
+say "clearing DNS records that would shadow $KVSPILL_DOMAIN"
+curl -s -H "$auth" "$api/zones/$zone_id/dns_records?name=$KVSPILL_DOMAIN" |
+	python3 -c "import json,sys;[print(r['id']) for r in json.load(sys.stdin).get('result',[])]" |
+	while read -r rec; do
+		echo "  deleting $rec"
+		curl -s -X DELETE -H "$auth" "$api/zones/$zone_id/dns_records/$rec" >/dev/null
+	done
+
+say "attaching $KVSPILL_DOMAIN to $KVSPILL_PROJECT"
+curl -s -X POST -H "$auth" -H 'Content-Type: application/json' \
+	--data "{\"name\":\"$KVSPILL_DOMAIN\"}" \
+	"$api/accounts/$ACCOUNT_ID/pages/projects/$KVSPILL_PROJECT/domains" >/dev/null || true
+kvspill_sub=$(project_subdomain "$KVSPILL_PROJECT")
+say "pointing $KVSPILL_DOMAIN at $kvspill_sub"
+curl -s -X POST -H "$auth" -H 'Content-Type: application/json' \
+	--data "{\"type\":\"CNAME\",\"name\":\"$KVSPILL_DOMAIN\",\"content\":\"$kvspill_sub\",\"proxied\":true}" \
+	"$api/zones/$zone_id/dns_records" | jq_ok ||
+	echo "  (record may already exist -- check the dashboard)"
+
+say "done -- https://$DOMAIN, https://$KVIO_DOMAIN, and https://$KVSPILL_DOMAIN"
 echo "Certificates can take a few minutes on first publish."

@@ -20,6 +20,7 @@ from the repository's ``docs/*.html``.
    :caption: Case studies
 
    kvio
+   kvspill
    kvio-loadpath
    kvio-perfetto
    gnn-readamp
@@ -37,6 +38,7 @@ The standalone dark-themed pages (same content, rich figures) are served
 straight from this build:
 
 - `kvio — GPU-free KV-offload IO projector and replayer </showcase/kvio.html>`__
+- `kvspill is now kvio bench </showcase/kvspill.html>`__
 - `kvio load path — the QD~1 case study </showcase/kvio-loadpath.html>`__
 - `kvio × Perfetto — cross-layer KV-offload introspection </showcase/kvio-perfetto.html>`__
 - `GNN read amplification — see it, replay it without the data </showcase/gnn-readamp.html>`__

@@ -157,6 +157,24 @@ How to run
 
 **alignment** Pass ``--lba-bytes`` equal to the ``raw_block`` ``block_align`` (4096), not the device LBA (512) — the projector rounds command tails to that alignment. Mismatched, the geometry looks off by a fraction of a percent; matched, it is exact.
 
+Storage-pressure benchmarks from kvspill
+-----------------------------------------
+
+Davidlohr Bueso's `kvspill <https://github.com/davidlohr/kvspill>`__ adds the
+other half of the storage question: sustained restore, prefix, interference,
+and eviction pressure against a real drive.  With David's permission, those
+five fio workload shapes now ship as ``./kvio bench`` under this repository's
+Apache-2.0 license, with a structured A/B comparator in
+``./kvio bench-compare``.
+
+This is deliberately separate from trace replay.  ``bench`` measures device
+headroom and interference under controlled synthetic pressure; projection and
+capture/replay establish application and command-stream fidelity.  Each
+built-in is labeled measured or synthetic, and ``--profile`` accepts future
+capture-derived sustained workloads with their evidence source.  See
+`kvspill is now kvio bench <kvspill.html>`__ for provenance, safety rules,
+commands, and interpretation limits.
+
 Fidelity metrics
 ----------------
 

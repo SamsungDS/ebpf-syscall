@@ -15,6 +15,7 @@ libbpf/
 /examples/io_uring/nvme_uring_cmd_rw
 docs/_extra/
 docs/_build/
+.wrangler/
 
 # kvio build artifacts (make kvio)
 /kvio

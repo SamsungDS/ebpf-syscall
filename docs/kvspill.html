@@ -1,0 +1,118 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>kvspill is now kvio bench</title>
+<style>
+:root{--bg:#0b0d12;--surface:#12161f;--border:#273244;--text:#c7d0db;
+--head:#eef4fa;--muted:#8b98a8;--cyan:#22d3ee;--green:#4ade80;--amber:#fbbf24;
+--mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+--sans:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
+*{box-sizing:border-box} body{margin:0;background:var(--bg);color:var(--text);
+font:16px/1.65 var(--sans)} a{color:var(--cyan)} code,pre{font-family:var(--mono)}
+.wrap{max-width:980px;margin:auto;padding:0 24px} header{padding:54px 0 36px;
+border-bottom:1px solid var(--border);background:radial-gradient(800px 340px at 15% 0,
+rgba(34,211,238,.12),transparent 65%)} h1,h2,h3{color:var(--head)} h1{font-size:2.5rem;
+margin:8px 0}.eyebrow{font:12px var(--mono);letter-spacing:.12em;color:var(--cyan)}
+.lead{font-size:1.16rem;color:var(--muted);max-width:76ch} nav{position:sticky;top:0;
+background:rgba(11,13,18,.93);border-bottom:1px solid var(--border);padding:10px 0}
+nav a{margin-right:18px;text-decoration:none;font-size:14px} section{padding:35px 0;
+border-bottom:1px solid var(--border)} .note{padding:14px 17px;border:1px solid var(--border);
+border-left:3px solid var(--amber);border-radius:8px;background:var(--surface)}
+.good{border-left-color:var(--green)} .tbl{overflow-x:auto;border:1px solid var(--border);
+border-radius:9px} table{border-collapse:collapse;width:100%} th,td{padding:10px 13px;
+border-bottom:1px solid var(--border);vertical-align:top;text-align:left} th{color:var(--head);
+background:var(--surface);font:12px var(--mono)} tr:last-child td{border:0} pre{padding:15px;
+overflow:auto;background:var(--surface);border:1px solid var(--border);border-radius:9px;
+color:#dce5ee} footer{padding:30px 0 55px;color:var(--muted)}
+</style>
+</head>
+<body>
+<header><div class="wrap"><div class="eyebrow">KV-CACHE STORAGE BENCHMARKING</div>
+<h1>kvspill is now <code>kvio bench</code></h1>
+<p class="lead">Davidlohr Bueso built kvspill to load-test an SSD with sustained
+fio patterns chosen for KV-cache offload. With his permission, those tests now
+complement kvio's projection, capture, attribution, and replay tools under one
+Apache-2.0 command.</p></div></header>
+<nav><div class="wrap"><a href="#why">Why</a><a href="#merged">Merged</a>
+<a href="#run">Run</a><a href="#choose">Choose a mode</a><a href="#limits">Limits</a></div></nav>
+<main class="wrap">
+<section id="why"><h2>Why kvspill existed</h2>
+<p>kvio started from application intent: calculate KV-object geometry, observe real
+device commands, and replay the stream. kvspill started from the device: keep an SSD
+busy with repeatable fio jobs and measure throughput, latency, CPU cost, and
+interference without a GPU or model server.</p>
+<div class="tbl"><table><thead><tr><th>CASE</th><th>EVIDENCE</th><th>EXAMPLE</th></tr></thead><tbody>
+<tr><td><code>restore</code></td><td>synthetic</td><td>A chat returns after its KV was evicted, so the server reads that KV before resuming it.</td></tr>
+<tr><td><code>restore-calibrated</code></td><td>measured</td><td>LMCache reads one 7 MiB Qwen2.5-1.5B KV chunk on each of four workers.</td></tr>
+<tr><td><code>prefix</code></td><td>synthetic</td><td>Several requests reload KV for a shared system prompt.</td></tr>
+<tr><td><code>qos-sustain-4k</code></td><td>synthetic</td><td>A sustained 4 KiB reader shares the SSD with large restore-like reads.</td></tr>
+<tr><td><code>evict</code></td><td>synthetic</td><td>A full memory tier writes KV chunks to SSD to make room.</td></tr>
+</tbody></table></div></section>
+<section id="merged"><h2>What kvio absorbed</h2>
+<p>The five workload shapes, preconditioning, fio JSON parsing, RESULT lines, and median
+A/B comparison came from kvspill. kvio adds one launcher, evidence labels, external JSON
+profiles, overridable calibrated object sizes, structured artifacts, target-only IRQ
+accounting, capacity-bounded regions, checked failures, hard mount/partition/holder checks,
+and guaranteed restoration of queue and hugepage tuning.</p>
+<div class="note good"><b>Credit:</b> the benchmark source, NOTICE, docs, and integration
+commit retain David's authorship and link to
+<a href="https://github.com/davidlohr/kvspill">davidlohr/kvspill</a>.</div></section>
+<section id="run"><h2>Run it</h2>
+<pre>make kvio-test
+./kvio doctor
+./kvio bench --list-profiles
+
+# WARNING: this preconditions and overwrites the selected raw namespace
+sudo ./kvio bench /dev/nvmeXnY \
+  --yes-really-use-device --size 8GiB --reps 3 \
+  --output-dir results/baseline
+
+sudo ./kvio bench /dev/nvmeXnY \
+  --yes-really-use-device --cases restore-calibrated \
+  --calibrated-block-size 32MiB --size 8GiB \
+  --output-dir results/restore-32m
+
+./kvio bench-compare results/baseline/results.jsonl \
+                     results/candidate/results.jsonl</pre>
+<p>Use <code>--profile FILE</code> to add a sustained workload derived from a future
+capture. The JSON names its evidence as <code>measured</code> or
+<code>synthetic</code>, cites the source, and defines each fio job's operation,
+block size, queue depth, and worker count. The resolved profile is saved in
+<code>run.json</code>.</p>
+<div class="note"><b>Raw-device contract:</b> use only an independently verified empty,
+disposable namespace. The acknowledgement never bypasses mounts, partitions, holders, or
+capacity checks; signatures require a separate switch.</div></section>
+<section id="choose"><h2>One binary, two kinds of truth</h2>
+<div class="tbl"><table><thead><tr><th>NEED</th><th>COMMAND</th><th>BOUNDARY</th></tr></thead><tbody>
+<tr><td>Size an operation</td><td><code>kvio plan</code></td><td>Geometry only</td></tr>
+<tr><td>Exercise LMCache</td><td><code>kvio replay</code></td><td>Real engine, fake bytes</td></tr>
+<tr><td>Attribute commands</td><td><code>kvio validate</code></td><td>Two trace witnesses</td></tr>
+<tr><td>Stress storage</td><td><code>kvio bench</code></td><td>Synthetic, closed-loop</td></tr>
+<tr><td>Compare systems</td><td><code>kvio bench-compare</code></td><td>Median A/B</td></tr>
+</tbody></table></div></section>
+<section id="limits"><h2>Interpretation limits</h2>
+<p><code>kvio bench</code> controls object size, direction, workers, queue depth, and
+sequential/random shape. It does not reproduce serving arrival times, cache policy, object
+lifetime, or an exact captured offset sequence. Capture and replay those when fidelity is
+the question; use the benchmark cases when headroom and interference are the question.</p>
+<div class="note"><b>The QoS case is synthetic:</b>
+<code>qos-sustain-4k</code> does not claim that LMCache issues 4 KiB reads. It asks how
+badly sustained large reads delay one possible latency-sensitive neighbor. David measured
+this fio mix in his storage campaign, but did not derive the mix from a production serving
+trace. Treat it as the first interference profile, not as a universal workload.</div>
+<p>The 7,340,032-byte default is a real calibration point. David traced LMCache 0.5.3
+with vLLM 0.27.1, Qwen2.5-1.5B-Instruct, TP1, bf16, and 256-token chunks. Its size is
+2 (K and V) × 28 layers × 2 KV heads × 128 values × 2 bytes × 256 tokens =
+7,340,032 bytes, exactly 7 MiB. The run used four synchronous disk workers and reported
+108 stores and 200 restores of that size. See the
+<a href="https://github.com/davidlohr/kvspill/blob/66f21115ed7fcbe8c76e15a9446c3143a0bca8e4/profiles/lmcache-qwen2.5-1.5b.md">source profile</a>.
+It is not a universal KV size.</p>
+<div class="note good"><b>Bare-metal validated:</b> before merge, every case, the 32 MiB
+override, comparison, OS-disk refusal, and tuning cleanup ran on a verified-empty Samsung
+PM9A3 in a Latitude <code>m4-metal-medium</code>. Queue and hugepage values matched their
+pre-run state afterward. The reproduce directory records the gates and short-run evidence.</div>
+</section>
+</main><footer><div class="wrap">kvio + kvspill — application truth and storage pressure,
+one command.</div></footer></body></html>
