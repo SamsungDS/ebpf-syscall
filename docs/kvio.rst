@@ -1,5 +1,5 @@
-kvio GPU-free KV-cache-offload storage-IO projector & replayer
-==============================================================
+kvio GPU-free KV-cache-offload storage-IO toolkit
+==================================================
 
 .. note::
 
@@ -8,7 +8,10 @@ kvio GPU-free KV-cache-offload storage-IO projector & replayer
    and via htmlpreview from the repository's ``docs/kvio.html``.
 
 
-Project, issue, and replay the NVMe I/O that LLM KV-cache offload produces — from real model geometry, on real hardware, *without a GPU or a model*. Every device command is attributed back to the KV object that caused it via a cross-layer ``trace_id`` join, and validated byte-for-byte against the projection.
+Project, issue, replay, and benchmark the NVMe I/O that LLM KV-cache offload
+produces — from real model geometry, on real hardware, *without a GPU or a
+model*.  kvio can validate command geometry against a captured application or
+apply sustained KV-like pressure directly to a storage tier.
 
 **engine:** LMCache ``raw_block`` io_uring_cmd passthrough **tracer:** eBPF ``nvme_uring_cmd_monitor`` **needs:** an NVMe char device (``/dev/ngXnY``) **GPU:** not required **validated:** byte-exact on real NVMe **source:** `mcgrof/LMCache @ ``kvio`` <https://github.com/mcgrof/LMCache/tree/kvio>`__
 
@@ -157,23 +160,139 @@ How to run
 
 **alignment** Pass ``--lba-bytes`` equal to the ``raw_block`` ``block_align`` (4096), not the device LBA (512) — the projector rounds command tails to that alignment. Mismatched, the geometry looks off by a fraction of a percent; matched, it is exact.
 
-Storage-pressure benchmarks from kvspill
------------------------------------------
+``kvio bench``: sustained storage pressure
+------------------------------------------
 
-Davidlohr Bueso's `kvspill <https://github.com/davidlohr/kvspill>`__ adds the
-other half of the storage question: sustained restore, prefix, interference,
-and eviction pressure against a real drive.  With David's permission, those
-five fio workload shapes now ship as ``./kvio bench`` under this repository's
-Apache-2.0 license, with a structured A/B comparator in
-``./kvio bench-compare``.
+``kvio bench`` asks how much KV-like I/O a storage tier can sustain, what its
+tail latency is under load, and how large transfers affect another workload on
+the same drive.  It runs fio without requiring a GPU or model server and saves
+the resolved workload, fio output, result rows, hardware details, and kernel
+settings for each run.
 
-This is deliberately separate from trace replay.  ``bench`` measures device
-headroom and interference under controlled synthetic pressure; projection and
-capture/replay establish application and command-stream fidelity.  Each
-built-in is labeled measured or synthetic, and ``--profile`` accepts future
-capture-derived sustained workloads with their evidence source.  See
-`kvspill is now kvio bench <kvspill.html>`__ for provenance, safety rules,
-commands, and interpretation limits.
+This is a different fidelity level from kvio capture and replay.  ``bench``
+runs controlled, closed-loop load for device and kernel A/B comparisons.
+Capture plus iolog replay preserves the arrival times, offsets, and command
+order of an observed workload.  Use ``bench`` for headroom and interference;
+use capture and replay when the exact recorded stream matters.
+
+======================== ========== ===========================================
+Profile                  Evidence   What it represents
+======================== ========== ===========================================
+``restore``              synthetic  Concurrent random reads standing in for
+                                    chats whose KV must return from storage.
+``restore-calibrated``   measured   Four synchronous workers restoring whole
+                                    7 MiB Qwen2.5-1.5B KV objects.
+``prefix``               synthetic  Concurrent sequential reads standing in
+                                    for shared-prefix KV reloads.
+``qos-sustain-4k``       synthetic  Large restore-like reads beside a sustained
+                                    4 KiB reader on the same drive.
+``evict``                synthetic  Writes standing in for KV demotion when the
+                                    memory tier is full.
+======================== ========== ===========================================
+
+Inspect the evidence and exact fio shape without touching a device::
+
+   make kvio-test
+   ./kvio bench --list-profiles
+   ./kvio bench --help
+
+Run the default profiles on an **empty, disposable, unmounted raw namespace**::
+
+   sudo ./kvio bench /dev/nvmeXnY \
+       --yes-really-use-device \
+       --size 8GiB --runtime 20 --ramp-time 3 --reps 3 \
+       --output-dir results/pm9a3-baseline
+
+The benchmark preconditions its test region and the eviction profile writes
+it.  The acknowledgement does not bypass safety checks: kvio refuses mounted
+or undersized targets, partitions, holders, and signatures unless signatures
+receive their own explicit acknowledgement.
+
+To compare a kernel, transfer limit, or queue setting, keep the device, region,
+runtime, and repetition count identical, then compare the result files::
+
+   ./kvio bench-compare results/baseline/results.jsonl \
+                        results/candidate/results.jsonl
+
+The comparison reports median bandwidth, IOPS, whole-I/O p50 and p99 latency,
+fio system CPU, and target-controller interrupts per GiB.
+
+Measured and synthetic profiles
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Only ``restore-calibrated`` is derived from a recorded KV-cache setup.  David
+traced LMCache 0.5.3 with vLLM 0.27.1, Qwen2.5-1.5B-Instruct, TP1, bf16, and
+256-token chunks.  One complete KV object contains K and V for every layer,
+head, value, and token::
+
+   2 (K and V) * 28 layers * 2 KV heads * 128 values per head
+   * 2 bytes (bf16) * 256 tokens = 7,340,032 bytes = 7 MiB
+
+That run used four synchronous disk workers and reported 108 stores and 200
+restores.  The `source profile
+<https://github.com/davidlohr/kvspill/blob/66f21115ed7fcbe8c76e15a9446c3143a0bca8e4/profiles/lmcache-qwen2.5-1.5b.md>`__
+is one calibration point, not a universal object size.  Override it for a
+different model, tensor-parallel rank, dtype, or chunk size::
+
+   sudo ./kvio bench /dev/nvmeXnY \
+       --yes-really-use-device --cases restore-calibrated \
+       --calibrated-block-size 32MiB --size 8GiB \
+       --output-dir results/restore-32m
+
+The remaining built-ins are synthetic stress profiles.  In particular,
+``qos-sustain-4k`` does not claim that LMCache issues 4 KiB reads or that its
+mix came from a production trace.  It measures how a sustained large-read load
+delays one possible latency-sensitive neighbor.  Treat it as an optional
+same-device interference test, not as a universal KV-cache QoS workload.
+
+Add a sustained profile from a capture
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+``--profile FILE`` accepts additional JSON profiles without a Python change.
+Each profile must label its evidence ``measured`` or ``synthetic``, identify
+the source, and define each fio job's operation, block size, queue depth, and
+worker count.  The resolved definition is copied into ``run.json``::
+
+   {
+     "schema_version": 1,
+     "name": "service-a-restore",
+     "description": "Sustained restore shape from service A capture 17",
+     "evidence": {
+       "kind": "measured",
+       "source": "/srv/kvio/captures/service-a-17.jsonl"
+     },
+     "jobs": [{
+       "name": "restore",
+       "rw": "randread",
+       "bs": "32MiB",
+       "iodepth": 1,
+       "numjobs": 4
+     }]
+   }
+
+Run only that external profile by omitting ``--cases``::
+
+   sudo ./kvio bench /dev/nvmeXnY \
+       --yes-really-use-device --profile service-a-restore.json \
+       --size 8GiB --output-dir results/service-a
+
+Lineage
+~~~~~~~
+
+Davidlohr Bueso wrote the standalone `kvspill
+<https://github.com/davidlohr/kvspill>`__ prototype.  Its workload shapes,
+preconditioning, fio result parsing, and median A/B comparison became the
+starting point for ``kvio bench``.  They were merged with his permission and
+credit under this repository's Apache-2.0 license, then integrated with kvio's
+single CLI, evidence labels, external profile format, result artifacts, and
+raw-device safety checks.  There is no separate kvspill command in this tree;
+`kvspill.kvcache.io <https://kvspill.kvcache.io/>`__ records that history.
+
+The integrated benchmark was exercised on a verified-empty Samsung PM9A3 in a
+Latitude ``m4-metal-medium`` node.  All five profiles, the 32 MiB calibrated
+override, comparison, OS-disk refusal, and tuning cleanup completed, and queue
+and hugepage settings matched their pre-run values afterward.  The reproduce
+record is in ``tools/reproduce/kvio-bench/RESULTS.md``.
 
 Fidelity metrics
 ----------------

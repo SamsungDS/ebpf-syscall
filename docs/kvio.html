@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>kvio — GPU-free KV-cache-offload storage-IO projector &amp; replayer</title>
+<title>kvio — GPU-free KV-cache-offload storage-IO toolkit</title>
 <style>
   :root{
     --bg:#0b0d12; --bg2:#0e1117; --surface:#12161f; --surface2:#161b26;
@@ -129,11 +129,11 @@
 <header class="hero">
   <div class="wrap">
     <span class="eyebrow">◆ kvio · storage-IO for LLM KV-cache offload</span>
-    <h1><span class="mono">kvio</span><br>GPU-free KV-cache-offload storage-IO projector &amp; replayer</h1>
-    <p class="sub">Project, issue, and replay the NVMe I/O that LLM KV-cache offload produces —
-      from real model geometry, on real hardware, <em>without a GPU or a model</em>. Every
-      device command is attributed back to the KV object that caused it via a cross-layer
-      <code>trace_id</code> join, and validated byte-for-byte against the projection.</p>
+    <h1><span class="mono">kvio</span><br>GPU-free KV-cache-offload storage-IO toolkit</h1>
+    <p class="sub">Project, issue, replay, and benchmark the NVMe I/O that LLM
+      KV-cache offload produces — from real model geometry, on real hardware,
+      <em>without a GPU or a model</em>. Validate command geometry against a capture
+      or apply sustained KV-like pressure directly to a storage tier.</p>
     <div class="meta">
       <span class="pill"><b>engine:</b> LMCache <code>raw_block</code> — passthrough, POSIX, io_uring</span>
       <span class="pill"><b>join:</b> <code>offset-join</code> — engine-free, backend-decoupled</span>
@@ -153,7 +153,7 @@
   <a href="#parts">Components</a>
   <a href="#deps">Dependencies</a>
   <a href="#run">How to run</a>
-  <a href="#bench">kvspill benchmarks</a>
+  <a href="#bench">Storage benchmarks</a>
   <a href="#fidelity">Fidelity metrics</a>
   <a href="#results">Validated results</a>
 </div></nav>
@@ -412,22 +412,100 @@
 </section>
 
 <section id="bench">
-  <h2><span class="n">07</span>Storage-pressure benchmarks from kvspill</h2>
-  <p><a href="https://github.com/davidlohr/kvspill">Davidlohr Bueso's kvspill</a>
-    adds the other half of the storage question: sustained restore, prefix,
-    interference, and eviction pressure against a real drive. With David's permission, its five fio
-    workload shapes now ship as <code>./kvio bench</code> under this repository's
-    Apache-2.0 license, with structured A/B comparison in
-    <code>./kvio bench-compare</code>.</p>
+  <h2><span class="n">07</span><code>kvio bench</code>: sustained storage pressure</h2>
+  <p><code>kvio bench</code> asks how much KV-like I/O a storage tier can sustain,
+    what its tail latency is under load, and how large transfers affect another
+    workload on the same drive. It runs fio without a GPU or model server and saves
+    the resolved workload, fio output, result rows, hardware details, and kernel
+    settings for each run.</p>
   <div class="note info"><b class="tag">complementary, not interchangeable</b>
-    <code>bench</code> measures device headroom and interference under controlled
-    synthetic pressure. Projection and capture/replay establish application and
-    command-stream fidelity. Each built-in is labeled measured or synthetic;
-    <code>--profile</code> accepts future capture-derived sustained workloads with
-    their evidence source. Neither result should be presented as the other.</div>
-  <p>See the dedicated <a href="kvspill.html"><b>kvspill is now kvio bench</b></a>
-    page for why kvspill existed, what was merged, exact commands, raw-device safety,
-    and interpretation limits.</p>
+    Use <code>bench</code> for controlled device and kernel A/B comparisons. Use
+    capture plus iolog replay when observed arrival times, offsets, and command order
+    must be preserved. Neither result should be presented as the other.</div>
+
+  <div class="tbl"><table>
+    <thead><tr><th>Profile</th><th>Evidence</th><th>What it represents</th></tr></thead>
+    <tbody>
+      <tr><td><code>restore</code></td><td>synthetic</td><td>Concurrent random reads standing in for chats whose KV must return from storage.</td></tr>
+      <tr><td><code>restore-calibrated</code></td><td>measured</td><td>Four synchronous workers restoring whole 7 MiB Qwen2.5-1.5B KV objects.</td></tr>
+      <tr><td><code>prefix</code></td><td>synthetic</td><td>Concurrent sequential reads standing in for shared-prefix KV reloads.</td></tr>
+      <tr><td><code>qos-sustain-4k</code></td><td>synthetic</td><td>Large restore-like reads beside a sustained 4 KiB reader on the same drive.</td></tr>
+      <tr><td><code>evict</code></td><td>synthetic</td><td>Writes standing in for KV demotion when the memory tier is full.</td></tr>
+    </tbody>
+  </table></div>
+
+  <h3>Run and compare</h3>
+  <pre><div class="bar"><span class="dot"></span><span class="dot"></span><span class="dot"></span>&nbsp; ebpf-syscall</div><code><span class="k">make</span> kvio-test
+<span class="k">./kvio</span> bench <span class="v">--list-profiles</span>
+
+<span class="c"># WARNING: preconditions and overwrites the selected raw namespace</span>
+<span class="k">sudo ./kvio</span> bench <span class="p">/dev/nvmeXnY</span> \
+  <span class="v">--yes-really-use-device --size</span> <span class="s">8GiB</span> \
+  <span class="v">--runtime</span> <span class="s">20</span> <span class="v">--ramp-time</span> <span class="s">3</span> <span class="v">--reps</span> <span class="s">3</span> \
+  <span class="v">--output-dir</span> <span class="p">results/baseline</span>
+
+<span class="k">./kvio</span> bench-compare <span class="p">results/baseline/results.jsonl</span> \
+                     <span class="p">results/candidate/results.jsonl</span></code></pre>
+  <div class="note warn"><b class="tag">raw-device contract</b> Use only a verified-empty,
+    disposable, unmounted raw namespace. The acknowledgement does not bypass safety
+    checks: kvio refuses mounted or undersized targets, partitions, holders, and
+    signatures unless signatures receive their own explicit acknowledgement.</div>
+  <p>The comparison reports median bandwidth, IOPS, whole-I/O p50 and p99 latency,
+    fio system CPU, and target-controller interrupts per GiB. Keep the device,
+    region, runtime, and repetition count identical across an A/B test.</p>
+
+  <h3>Know which profiles are measured</h3>
+  <p>Only <code>restore-calibrated</code> is derived from a recorded KV-cache setup.
+    David traced LMCache 0.5.3 with vLLM 0.27.1, Qwen2.5-1.5B-Instruct, TP1,
+    bf16, and 256-token chunks. One whole object is:</p>
+  <pre><code>2 (K and V) × 28 layers × 2 KV heads × 128 values per head
+× 2 bytes (bf16) × 256 tokens = 7,340,032 bytes = 7 MiB</code></pre>
+  <p>The run used four synchronous disk workers and reported 108 stores and 200
+    restores. This <a href="https://github.com/davidlohr/kvspill/blob/66f21115ed7fcbe8c76e15a9446c3143a0bca8e4/profiles/lmcache-qwen2.5-1.5b.md">source profile</a>
+    is one calibration point, not a universal object size. Use
+    <code>--calibrated-block-size</code> for another model, tensor-parallel rank,
+    dtype, or chunk size.</p>
+  <div class="note warn"><b class="tag">synthetic QoS</b>
+    <code>qos-sustain-4k</code> does not claim that LMCache issues 4 KiB reads or
+    that its mix came from a production trace. It measures how sustained large
+    reads delay one possible latency-sensitive neighbor. Treat it as an optional
+    same-device interference test, not a universal KV-cache QoS workload.</div>
+
+  <h3>Add a sustained profile from a capture</h3>
+  <p><code>--profile FILE</code> adds a workload without changing Python. Each JSON
+    profile must label its evidence <code>measured</code> or <code>synthetic</code>,
+    identify the source, and define each fio job's operation, block size, queue
+    depth, and worker count. The resolved profile is copied into
+    <code>run.json</code>.</p>
+  <pre><code>{
+  "schema_version": 1,
+  "name": "service-a-restore",
+  "description": "Sustained restore shape from service A capture 17",
+  "evidence": {
+    "kind": "measured",
+    "source": "/srv/kvio/captures/service-a-17.jsonl"
+  },
+  "jobs": [{
+    "name": "restore", "rw": "randread", "bs": "32MiB",
+    "iodepth": 1, "numjobs": 4
+  }]
+}</code></pre>
+
+  <h3>Lineage</h3>
+  <p>Davidlohr Bueso wrote the standalone
+    <a href="https://github.com/davidlohr/kvspill">kvspill prototype</a>. Its
+    workload shapes, preconditioning, fio result parsing, and median A/B
+    comparison became the starting point for <code>kvio bench</code>. They were
+    merged with his permission and credit under this repository's Apache-2.0
+    license, then integrated with kvio's CLI, evidence labels, external profile
+    format, result artifacts, and raw-device safety checks. There is no separate
+    kvspill command in this tree; <a href="https://kvspill.kvcache.io/">the old
+    hostname records that history</a>.</p>
+  <div class="note win"><b class="tag">bare-metal validated</b> The integrated
+    benchmark ran on a verified-empty Samsung PM9A3 in a Latitude
+    <code>m4-metal-medium</code>. All five profiles, the 32 MiB calibrated
+    override, comparison, OS-disk refusal, and tuning cleanup completed. Queue
+    and hugepage settings matched their pre-run values afterward.</div>
 </section>
 
 <section id="fidelity">

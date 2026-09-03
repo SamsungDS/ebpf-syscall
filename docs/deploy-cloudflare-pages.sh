@@ -120,9 +120,8 @@ curl -s -X POST -H "$auth" -H 'Content-Type: application/json' \
 	echo "  (record may already exist -- check the dashboard)"
 
 # --- kvspill.kvcache.io ---------------------------------------------------
-# Serve the standalone kvspill page at the hostname root. Do not use a
-# redirect: the dedicated hostname should remain useful if the main docs URL
-# layout changes.
+# Keep the old project name as a lineage page. Current commands and usage live
+# in the kvio microsite; this hostname only records where kvio bench came from.
 say "publishing the kvspill microsite"
 kvspill_out="$here/docs/_build/kvspill"
 rm -rf "$kvspill_out"; mkdir -p "$kvspill_out"

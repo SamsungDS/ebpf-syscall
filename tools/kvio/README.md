@@ -1,7 +1,8 @@
-# kvio — KV-cache storage IO: project, drive, record, attribute, replay
+# kvio — KV-cache storage IO: project, record, replay, benchmark
 
 `kvio` is a user tool of this tree, built like the tracers are. It answers, end
-to end, "what storage IO does a KV cache issue, and can I reproduce it?":
+to end, "what storage IO does a KV cache issue, can I reproduce it, and can the
+storage tier sustain it?":
 
 - **project** the NVMe command stream a *GPU model × KV-cache config* would
   issue — GPU-free, no model, no serving stack (`kvio plan`);
@@ -14,7 +15,9 @@ to end, "what storage IO does a KV cache issue, and can I reproduce it?":
   offset-join: device offset + time window, zero engine cookies
   (`kvio perfetto`);
 - **replay** the exact command stream through fio and grade it
-  (`kvio iolog`, `kvio compare`).
+  (`kvio iolog`, `kvio compare`);
+- **benchmark** sustained restore, prefix, interference, and eviction pressure
+  for storage and kernel A/B tests (`kvio bench`, `kvio bench-compare`).
 
 ## Build and run
 
@@ -52,6 +55,41 @@ wants the /dev/ngXnY char device. The
 semantic JSONL comes from the tool itself: the engine's public
 `entry_offset()` tells it where each object landed, so no engine tracing
 hook is needed — the offset-join's zero-engine-change promise, kept.)
+
+## Benchmark sustained storage pressure
+
+`kvio bench` runs controlled fio load against a raw namespace. It complements
+capture and replay: use the benchmark to compare sustained headroom and
+same-device interference; use an iolog replay when observed timing, offsets,
+and command order must be preserved.
+
+```
+./kvio bench --list-profiles
+sudo ./kvio bench /dev/nvmeXnY \
+  --yes-really-use-device --size 8GiB --reps 3 \
+  --output-dir results/baseline
+./kvio bench-compare results/baseline/results.jsonl \
+                     results/candidate/results.jsonl
+```
+
+The command preconditions its test region and includes a write workload. Use
+only a verified-empty, disposable, unmounted namespace. It refuses mounts,
+partitions, holders, undersized targets, and disk signatures unless signatures
+receive a separate acknowledgement.
+
+Every built-in is labeled `measured` or `synthetic`. Only
+`restore-calibrated` comes from a recorded KV-cache setup; its 7 MiB object size
+is specific to Qwen2.5-1.5B-Instruct at TP1, bf16, and 256-token chunks. The
+other built-ins are controlled stress shapes, not captured production traffic.
+Use `--profile FILE` to add another sustained workload with its evidence source,
+or use capture plus iolog replay for an exact recorded stream.
+
+Davidlohr Bueso's standalone
+[`kvspill`](https://github.com/davidlohr/kvspill) prototype supplied the initial
+workload shapes, preconditioning, result parsing, and A/B comparison. They now
+live only in the `kvio bench` interface, with his authorship retained. The
+[kvspill hostname](https://kvspill.kvcache.io/) records that lineage; current
+usage belongs here and on [kvio.kvcache.io](https://kvio.kvcache.io/#bench).
 
 ## Why the LMCache engine is vendored here (the standalone decision)
 

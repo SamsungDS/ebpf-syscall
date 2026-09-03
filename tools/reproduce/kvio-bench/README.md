@@ -40,7 +40,7 @@ under test, then compare:
 ```
 
 Do not interpret this closed-loop fio test as a serving-trace replay. See
-`docs/kvspill.rst` for the fidelity boundary.
+`docs/kvio.rst` for the fidelity boundary and current benchmark usage.
 
 The built-in `qos-sustain-4k` case is a synthetic interference test, not a
 captured LMCache workload. Use `--profile FILE` to load a sustained workload
