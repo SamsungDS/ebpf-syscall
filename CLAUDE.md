@@ -55,7 +55,8 @@ attach via BTF (`fentry`/`tp_btf`), so the running kernel needs
   path). Device commands *with* a semantic join key.
 - `nvme_tp_monitor` — driver-level NVMe commands via the nvme
   tracepoints (`--disk`, `--jsonl`): every `read`/`write` the device
-  sees, with `slba`/`bytes`/`ts` and completion `lat_ns`. This is the
+  sees, with stable `seq`, capture-time `lba_bytes`,
+  `slba`/`bytes`/`ts`, and completion `lat_ns`. This is the
   ground truth for O_DIRECT / block-layer IO that carries no `user_data`
   (plain `pread`, fio, a GNN feature store). Same JSONL schema the replay
   tools consume.
@@ -84,12 +85,12 @@ uploads). `pip install perfetto`.
 3. **Visualize**: drag the `.pftrace` onto ui.perfetto.dev; or render a
    static A/B PNG straight from the capture (see the reproduce recipes).
 4. **Replay** (device layer): `examples/replay/mk_dev_iolog.py` turns an
-   `nvme_tp_monitor` capture into a fio v3 iolog — op/offset/length/time
-   and nothing else — and `fio --read_iolog --direct=1` reissues the
-   exact command stream. `compare_streams.py` grades replay vs capture at
-   the NVMe layer (the layer that matters: a *perfect* file-level log can
-   still produce an 8× different device stream — see
-   `examples/replay/README.md`).
+   `nvme_tp_monitor` capture into a fio v3 iolog and certificate. The
+   static claim is exact translation of ordered operation/offset/length
+   requests, with timestamps quantized from ns to fio's µs. It is not a
+   claim that fio, Linux, or the controller executes the same device
+   stream. Re-record the fio run and use `compare_streams.py`, which
+   reports operation, offset, length, tuple-order, and timing separately.
 
 ### Why the replay path is the privacy story
 
@@ -105,11 +106,13 @@ replayed from a data-free iolog at +0.0% command inflation.
 ## The kvio tool (`make kvio` → `./kvio`)
 
 `tools/kvio/` is the user-facing KV-cache-IO tool: one `./kvio` entry
-point over the whole loop — `plan` (GPU-free projection),
+point over the whole loop — `plan` (GPU-free projection), `trace`
+(compile real agent requests into an evidence-labeled cache plan),
 `workload`/`sweep` (drive a device with **LMCache's real raw_block
 engine**, vendored in-tree), `record` (the `nvme_tp_monitor` tracer),
 `perfetto` (offset-join attribution),
-`iolog`/`compare` (device-exact fio replay), and `bench`/`bench-compare`
+`iolog`/`compare` (certified fio translation plus runtime comparison), and
+`bench`/`bench-compare`
 (repeatable sustained storage pressure and A/B comparison). Davidlohr
 Bueso's kvspill prototype is the lineage of the benchmark commands, not
 a separate current tool; keep usage in the kvio documentation and
@@ -120,6 +123,15 @@ surface (runtime import closure + Rust crate) from a pinned upstream ref
 and fails loudly on an upstream API break; `vendor/lmcache/` is
 machine-managed — never hand-edit it. Rationale and measured churn:
 `tools/kvio/README.md`.
+
+Agent traces are not device traces. LMCache agent traces contain prompt
+text and require a pinned tokenizer before chunk reuse can be derived.
+TraceLab removes prompt text but retains observed prefix/cache token
+accounting, so its session-relative chunk identity is explicitly modeled.
+Keep request timing and session boundaries, pin the dataset artifact, label
+the output `trace-derived`, and never turn one source into a universal
+`agent` benchmark. `docs/kvio.rst` records the current source revisions and
+the OpenCode, Aider/RepoAgent, TraceLab, and TauBench contribution lanes.
 
 ## Reproduce recipes
 

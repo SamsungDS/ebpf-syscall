@@ -153,6 +153,8 @@
   <a href="#parts">Components</a>
   <a href="#deps">Dependencies</a>
   <a href="#run">How to run</a>
+  <a href="#agent-traces">Agent traces</a>
+  <a href="#fio-export">fio export</a>
   <a href="#bench">Storage benchmarks</a>
   <a href="#fidelity">Fidelity metrics</a>
   <a href="#results">Validated results</a>
@@ -313,6 +315,13 @@
       <tr><td>cuFile / GDS</td><td>offset-join</td><td><span style="color:#c90">projected</span> — same shape, pending a GPU-direct-capable box</td></tr>
     </tbody>
   </table></div>
+  <p>TensorMesh's
+    <a href="https://www.tensormesh.ai/blog-posts/blog-non-prefix-prompt-caching-ai-agents">agent-caching
+    study</a> is the useful signpost to the LMCache corpus; the trace repository is the artifact
+    kvio pins. Do not confuse it with TensorMesh's older
+    <a href="https://www.tensormesh.ai/blog-posts/tensormesh-benchmark">benchmark generator</a>,
+    which makes synthetic repeated-text prompts under a closed-loop scheduler. That is useful
+    stress, not a measured agent workload.</p>
   <div class="note win"><b class="tag">one command isn't always one object</b> The Linux block
     layer merges adjacent I/O, so a single NVMe command can span the tail of one object and the
     head of the next — this happens whenever objects are smaller than the device's maximum command
@@ -322,10 +331,10 @@
     Proven on real hardware: 192 merged 128&nbsp;KiB commands, each spanning four 32&nbsp;KiB
     objects, split correctly.</div>
   <div class="note info"><b class="tag">other AI workloads</b> When a workload has no clean object
-    abstraction the way a KV cache does, the same capture still drives a <strong>device-exact fio
-    replay</strong> (<code>fio --read_iolog --direct=1</code> from the driver trace): the command
-    stream is reproduced faithfully at the device layer even where per-object attribution isn't
-    available.</div>
+    abstraction the way a KV cache does, the same capture can produce a
+    <strong>stream-certified fio replay</strong>. kvio proves that the fio artifact preserves the
+    requested operation, offset, length, and order. Re-record the replay before claiming that fio,
+    Linux, and the controller reproduced the same device stream.</div>
 </section>
 
 <section id="parts">
@@ -411,8 +420,80 @@
     fraction of a percent; matched, it is exact.</div>
 </section>
 
+<section id="agent-traces">
+  <h2><span class="n">07</span>Compile real agent traffic</h2>
+  <p><code>kvio trace</code> replaces a guessed request hit rate with evidence from real agent
+    trajectories. It preserves request order, relative timestamps, and hashed session identity,
+    and writes every inference into the plan. <code>kvio workload --agent-plan</code> then issues
+    the logical chunk loads, stores, and evictions through LMCache's real <code>raw_block</code>
+    engine. The result is <strong>trace-derived</strong>, not captured storage I/O; use
+    <code>kvio record</code> for the latter.</p>
+  <div class="tbl"><table>
+    <thead><tr><th>Source</th><th>Evidence retained</th><th>What kvio can derive</th></tr></thead>
+    <tbody>
+      <tr><td><a href="https://github.com/LMCache/lmcache-agent-trace">LMCache agent traces</a></td>
+        <td>Prompt text, timestamp, source session/model</td>
+        <td>Exact token chunks with a pinned tokenizer; prefix-chain or shifted exact-chunk reuse</td></tr>
+      <tr><td><a href="https://github.com/uw-syfi/TraceLab">TraceLab</a></td>
+        <td>357,161 sanitized Claude/Codex rounds; timing and observed token/cache splits</td>
+        <td>Observed prefix demand with modeled session-relative chunk identity; prompt text is intentionally absent</td></tr>
+    </tbody>
+  </table></div>
+  <pre><div class="bar"><span class="dot"></span><span class="dot"></span><span class="dot"></span>&nbsp; pinned OpenCode example</div><code><span class="k">git</span> clone https://github.com/LMCache/lmcache-agent-trace
+<span class="k">git</span> -C lmcache-agent-trace checkout <span class="s">780bcc2979715150d8b9fd4737e026e625444cc9</span>
+<span class="k">./kvio</span> trace lmcache-agent-trace/opencode/gpt-5-mini-task1.jsonl \
+  <span class="v">--out</span> <span class="p">opencode.json</span> <span class="v">--format</span> lmcache-agent \
+  <span class="v">--tokenizer</span> tiktoken:gpt-5-mini \
+  <span class="v">--tokenizer-revision</span> tiktoken-0.12.0 \
+  <span class="v">--policy</span> prefix <span class="v">--chunk-tokens</span> 256 \
+  <span class="v">--source-revision</span> 780bcc2979715150d8b9fd4737e026e625444cc9
+
+<span class="k">sudo ./kvio</span> workload <span class="v">--agent-plan</span> <span class="p">opencode.json</span> \
+  <span class="v">--model</span> Qwen/Qwen2.5-Coder-32B-Instruct <span class="v">--chunk-tokens</span> 256 \
+  <span class="v">--device</span> <span class="p">/dev/ngXnY</span> <span class="v">--engine</span> uring_cmd \
+  <span class="v">--sem-out</span> <span class="p">opencode-sem.jsonl</span></code></pre>
+  <div class="note info"><b class="tag">real does not mean universal</b> The LMCache files are
+    captured benchmark/application runs, not a representative production-traffic sample. Use
+    OpenCode or MiniSWE for append-heavy prefix growth, Aider or RepoAgent for shifted repository
+    context, TraceLab split by Claude and Codex for everyday coding-agent accounting, and TauBench
+    for a non-coding domain. Keep each pinned and separately labeled.</div>
+  <div class="note warn"><b class="tag">policy boundary</b>
+    <code>--policy substring</code> recognizes identical complete token chunks after a shift. It is
+    a useful fixed-chunk model, not a claim that kvio implements CacheBlend. Incomplete tail chunks
+    are ignored because their content identity changes when the prompt grows.</div>
+</section>
+
+<section id="fio-export">
+  <h2><span class="n">08</span>Export a certified fio replay</h2>
+  <p>New <code>nvme_tp_monitor</code> captures discover the selected namespace's logical LBA size
+    from sysfs and record it with a stable command sequence. Without <code>--disk</code>, the
+    monitor requires an explicit <code>--lba-size</code> because one value cannot describe several
+    namespaces. <code>kvio iolog</code> rejects incomplete captures, drops, and unsupported commands,
+    converts nanoseconds to fio v3 microseconds, then independently reparses its output and checks
+    the ordered <code>(operation, offset, length)</code> stream.</p>
+  <pre><div class="bar"><span class="dot"></span><span class="dot"></span><span class="dot"></span>&nbsp; standard fio interchange</div><code><span class="k">sudo ./kvio</span> record <span class="v">--disk</span> nvme0n1 \
+  <span class="v">--jsonl</span> <span class="p">capture.jsonl</span> <span class="v">--dur</span> 60
+<span class="k">./kvio</span> iolog capture.jsonl /dev/source \
+  <span class="v">--bundle-dir</span> <span class="p">qwen-agent-replay</span>
+<span class="k">cd</span> qwen-agent-replay &amp;&amp; <span class="k">sha256sum</span> -c SHA256SUMS
+<span class="k">KVIO_TARGET</span>=/dev/nvmeXnY <span class="k">fio</span> replay-block.fio</code></pre>
+  <p>The bundle contains the fio v3 iolog, normal-block and NVMe-passthrough job files, normalized
+    workload JSON, checksums, and a translation certificate. The certificate bounds timestamp
+    quantization below one microsecond and checks the finite translation. It does not prove equal
+    bandwidth, latency, CPU use, queue behavior, or device commands. Re-record and run
+    <code>kvio compare</code> for runtime operation, offset, length, tuple-order, and timing facts.</p>
+  <div class="note info"><b class="tag">fio inspiration</b> This export path is inspired by the
+    pending fio <a href="https://github.com/mcgrof/fio/tree/iolog-device-record"><code>iolog-device-record</code>
+    branch</a>. It adds device-level recording and offset-join sharding. Its faithful single-stream
+    and deliberately relaxed object-sharded modes consume the same fio v3 format.</div>
+  <p>The sensible formal-methods follow-up is a small pure Rust IR with checked arithmetic,
+    property tests, and bounded Kani proofs for alignment, MDTS splitting, timestamp conversion,
+    and parser/emitter round trips. The defensible claim is machine-checked workload translation,
+    never formal performance equivalence between kvio and fio.</p>
+</section>
+
 <section id="bench">
-  <h2><span class="n">07</span><code>kvio bench</code>: sustained storage pressure</h2>
+  <h2><span class="n">09</span><code>kvio bench</code>: sustained storage pressure</h2>
   <p><code>kvio bench</code> asks how much KV-like I/O a storage tier can sustain,
     what its tail latency is under load, and how large transfers affect another
     workload on the same drive. It runs fio without a GPU or model server and saves
@@ -420,8 +501,9 @@
     settings for each run.</p>
   <div class="note info"><b class="tag">complementary, not interchangeable</b>
     Use <code>bench</code> for controlled device and kernel A/B comparisons. Use
-    capture plus iolog replay when observed arrival times, offsets, and command order
-    must be preserved. Neither result should be presented as the other.</div>
+    capture plus a certified iolog request stream when observed arrival times, offsets, and command
+    order must be preserved. Re-record the replay before claiming device equality. Neither result
+    should be presented as the other.</div>
 
   <div class="tbl"><table>
     <thead><tr><th>Profile</th><th>Evidence</th><th>What it represents</th></tr></thead>
@@ -509,7 +591,7 @@
 </section>
 
 <section id="fidelity">
-  <h2><span class="n">08</span>Fidelity metrics</h2>
+  <h2><span class="n">10</span>Fidelity metrics</h2>
   <p>Three complementary scores, joined per object by <code>trace_id</code>. AUC is
     deliberately <em>not</em> used — there is no class label; the geometry is deterministic.</p>
   <div class="grid c3">
@@ -536,7 +618,7 @@
 </section>
 
 <section id="results">
-  <h2><span class="n">09</span>Validated results</h2>
+  <h2><span class="n">11</span>Validated results</h2>
   <p class="muted">On an 8× H100 server with real Samsung Gen5 NVMe (io_uring_cmd passthrough on
     <code>/dev/ng</code>), the projection was validated against a <b>real GPU-driven vLLM +
     LMCache offload</b> — the previously hardware-gated step is now closed.</p>

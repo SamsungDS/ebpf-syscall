@@ -160,6 +160,123 @@ How to run
 
 **alignment** Pass ``--lba-bytes`` equal to the ``raw_block`` ``block_align`` (4096), not the device LBA (512) — the projector rounds command tails to that alignment. Mismatched, the geometry looks off by a fraction of a percent; matched, it is exact.
 
+Compile real agent traffic
+--------------------------
+
+``kvio trace`` turns application-level agent requests into a logical KV-cache
+plan.  ``kvio workload --agent-plan`` then runs that plan through the real
+``raw_block`` engine.  The plan keeps request order, relative timestamps, and
+hashed session identity, and labels every inference it makes.  It is
+**trace-derived**, not measured device I/O; record the execution with
+``kvio record`` to learn what the NVMe device actually received.
+
+Two public datasets expose different evidence:
+
+* `LMCache agent traces <https://github.com/LMCache/lmcache-agent-trace>`__
+  retain complete prompt text.  kvio requires a pinned tokenizer, splits the
+  resulting token IDs into complete chunks, and hashes either the prefix chain
+  or each chunk's content.  Loads therefore come from content actually reused
+  by later prompts, rather than a random ``--hit-rate``.
+* `TraceLab <https://github.com/uw-syfi/TraceLab>`__ publishes 357,161
+  sanitized Claude/Codex rounds from 43 developers under CC BY 4.0.  It removes
+  prompt text for privacy but retains input, prefix, cache-creation, and
+  cache-read token accounting.  kvio uses the observed prefix count and assigns
+  session-relative logical chunk positions.  Those positions are a model, not
+  recovered content hashes.
+
+TensorMesh's `agent-caching study
+<https://www.tensormesh.ai/blog-posts/blog-non-prefix-prompt-caching-ai-agents>`__
+is the useful signpost to the LMCache corpus; the trace repository is the
+artifact kvio pins.  Do not confuse it with TensorMesh's older
+`benchmark generator <https://www.tensormesh.ai/blog-posts/tensormesh-benchmark>`__,
+which makes synthetic repeated-text prompts under a closed-loop scheduler.
+That generator is useful stress, not a measured agent workload.
+
+The LMCache repository is Apache-2.0, but its traces are benchmark/application
+captures rather than a production-traffic sample.  Pin the exact repository
+commit and tokenizer in every plan.  For example, this OpenCode trajectory is
+append-heavy and exercises ordinary prefix reuse::
+
+   git clone https://github.com/LMCache/lmcache-agent-trace
+   git -C lmcache-agent-trace checkout 780bcc2979715150d8b9fd4737e026e625444cc9
+   ./kvio trace lmcache-agent-trace/opencode/gpt-5-mini-task1.jsonl \
+       --out opencode-prefix.json --format lmcache-agent \
+       --tokenizer tiktoken:gpt-5-mini \
+       --tokenizer-revision tiktoken-0.12.0 \
+       --policy prefix --chunk-tokens 256 \
+       --source-url https://github.com/LMCache/lmcache-agent-trace \
+       --source-revision 780bcc2979715150d8b9fd4737e026e625444cc9 \
+       --source-license Apache-2.0
+
+   sudo ./kvio workload --agent-plan opencode-prefix.json \
+       --model Qwen/Qwen2.5-Coder-32B-Instruct --dtype bfloat16 \
+       --chunk-tokens 256 --device /dev/ngXnY --engine uring_cmd \
+       --sem-out opencode-sem.jsonl
+
+Use ``--policy substring`` on Aider or RepoAgent traces to test exact complete
+chunks that recur after content shifts.  This is a fixed-chunk content-reuse
+model; it must not be described as a byte-for-byte implementation of
+CacheBlend.  ``--capacity-chunks`` adds explicit LRU eviction.  Incomplete tail
+chunks are ignored because their identity changes when a prompt grows.
+
+For TraceLab, download and verify the pinned ``v0.0.1`` release artifact before
+compiling a bounded sample::
+
+   curl -L --fail -o syfi_coding_trace.jsonl.gz \
+       https://github.com/uw-syfi/TraceLab/releases/download/v0.0.1/syfi_coding_trace.jsonl.gz
+   echo "9d265eae69a31cae203848bea936f018148eed7ca8bf56050c5abe96da0b4e6b  syfi_coding_trace.jsonl.gz" | sha256sum -c -
+   ./kvio trace syfi_coding_trace.jsonl.gz --format tracelab \
+       --provider claude --max-requests 200 --out tracelab-claude.json \
+       --source-url https://github.com/uw-syfi/TraceLab/releases/tag/v0.0.1 \
+       --source-revision v0.0.1 --source-license CC-BY-4.0
+
+These sources support four useful contribution lanes: OpenCode/MiniSWE for
+append-only prefix growth, Aider/RepoAgent for shifted repository context,
+TraceLab split by Claude and Codex for real day-to-day coding-agent cache
+accounting, and TauBench for a non-coding agent domain.  Add each as a pinned,
+separately labeled workload; do not average them into one supposed universal
+"agent" profile.
+
+Export and certify fio replays
+------------------------------
+
+Storage engineers can consume a captured stream without learning kvio's
+engine.  New ``nvme_tp_monitor`` captures discover the selected namespace's
+logical LBA size from sysfs and record it with a stable command sequence.
+Without ``--disk``, the monitor requires an explicit ``--lba-size`` because a
+single value cannot describe several namespaces.  ``kvio iolog`` rejects incomplete captures, dropped
+events, and unsupported commands by default, converts monotonic nanoseconds to
+fio v3 microseconds, reparses its own output, and can emit a portable bundle::
+
+   sudo ./kvio record --disk nvme0n1 \
+       --jsonl capture.jsonl --dur 60
+   ./kvio iolog capture.jsonl /dev/source \
+       --bundle-dir qwen-agent-replay
+   cd qwen-agent-replay
+   sha256sum -c SHA256SUMS
+   KVIO_TARGET=/dev/nvmeXnY fio replay-block.fio
+
+The bundle contains ``commands.iolog``, normal-block and ``io_uring_cmd`` fio
+job files, a normalized workload, checksums, and ``certificate.json``.  The
+certificate proves a finite translation property: reparsing the iolog returns
+the same ordered ``(operation, offset, length)`` stream, with less than one
+microsecond of timestamp quantization.  It does **not** prove that fio, Linux,
+the NVMe driver, or firmware leaves that requested stream unchanged.  Re-record
+the replay and use ``kvio compare``; it now reports operation, offset, length,
+and full tuple equality separately, plus timing error.
+
+This export path is inspired by the pending fio `iolog-device-record branch
+<https://github.com/mcgrof/fio/tree/iolog-device-record>`__.  That branch adds
+device-level fio recording and offset-join sharding.  Its single-stream mode
+keeps global order; object-sharded replay deliberately trades cross-object
+ordering for parallelism while retaining each object's order.  kvio's bundles
+are ordinary fio v3 iologs and interoperate with that work.
+
+The next formal-methods step is a small pure Rust IR for checked alignment,
+MDTS splitting, timestamp conversion, and parser/emitter round trips, with
+property tests and bounded Kani proofs.  The claim should stay narrow:
+workload translation can be machine-checked; performance equivalence cannot.
+
 ``kvio bench``: sustained storage pressure
 ------------------------------------------
 
@@ -171,9 +288,11 @@ settings for each run.
 
 This is a different fidelity level from kvio capture and replay.  ``bench``
 runs controlled, closed-loop load for device and kernel A/B comparisons.
-Capture plus iolog replay preserves the arrival times, offsets, and command
-order of an observed workload.  Use ``bench`` for headroom and interference;
-use capture and replay when the exact recorded stream matters.
+Capture plus iolog export preserves the requested arrival times, offsets, and
+command order of an observed workload, subject to fio's microsecond timestamp
+quantization.  Re-record the replay before claiming that the device received
+the same stream.  Use ``bench`` for headroom and interference; use capture and
+certified export when the recorded request stream matters.
 
 ======================== ========== ===========================================
 Profile                  Evidence   What it represents

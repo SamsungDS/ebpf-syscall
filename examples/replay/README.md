@@ -1,8 +1,8 @@
 # Device-stream replay and object attribution
 
-Tools for turning a device-level capture into an exact hardware replay,
-and for grading any replay against its capture at the layer that
-matters — the NVMe command stream.
+Tools for turning a device-level capture into a certified fio request stream,
+and for grading what a replay actually issued at the layer that matters — the
+NVMe command stream.
 
 ## The problem these tools exist for
 
@@ -46,21 +46,35 @@ device commands.
 - **`mk_dev_iolog.py`** — capture → replay. Converts an
   `nvme_tp_monitor` JSONL capture into a fio version-3 iolog: one
   entry per captured NVMe command, with its byte offset, length, and
-  relative timestamp. `fio --read_iolog=<out> --direct=1` against the
-  raw namespace then reissues exactly the captured stream.
+  relative timestamp. It requires capture-time LBA metadata, rejects drops and
+  unknown operations, uses fio's microsecond timestamp unit, and reparses the
+  result to certify ordered operation/offset/length preservation.
 - **`compare_streams.py`** — the referee. Takes N tp-monitor JSONLs
   (a capture plus any number of replays) and prints the comparison:
-  command counts and inflation percentages, bytes, size distribution,
-  and completion latency percentiles from the in-kernel pairing. It
-  replaces eyeballing two blkparse texts against each other.
+  exact operation, offset, length, and tuple sequences; issue-timing error;
+  command counts, bytes, size distribution; and completion latency percentiles.
+  It replaces eyeballing two blkparse texts against each other.
 - **`demo_replay_ab.sh`** — the experiment above, end to end, on a
   disposable machine with an empty NVMe namespace (it mkfs's the
   target; it refuses devices carrying a filesystem signature).
 
-Known gap, stated where it counts: in our runs fio replayed the
-device iolog flat-out instead of pacing by the v3 timestamps, so
-command-*stream* fidelity (count, sizes, offsets: 0.0% deviation) is
-validated while command-*timing* reproduction is not yet.
+The old exporter divided monotonic nanoseconds by 1,000,000 even though fio v3
+timestamps are microseconds. It compressed every gap by 1,000× and made a paced
+replay look flat-out. The exporter now divides by 1,000 and bounds translation
+quantization below one microsecond. Timing still needs a new hardware re-record:
+fio's sleep granularity and submission engine are runtime behavior, not a
+property of the file translation.
+
+`--bundle-dir` writes `commands.iolog`, block and `io_uring_cmd` job files,
+normalized workload JSON, a certificate, and checksums. The certificate proves
+the translation, not fio/kernel/controller conformance or performance equality.
+Always re-record a replay before making an exact device-stream claim.
+
+This work is inspired by the pending fio
+[`iolog-device-record`](https://github.com/mcgrof/fio/tree/iolog-device-record)
+branch. It consumes the same v3 format and adds device-level recording plus
+offset-join sharding. Its single-stream mode keeps global order; its parallel
+mode deliberately relaxes cross-object order while retaining per-object order.
 
 ## Object attribution: the offset-join
 

@@ -9,13 +9,15 @@ storage tier sustain it?":
 - **drive** a real device with that IO using **LMCache's actual raw_block
   engine** — the real thing, vendored and built in this tree, not a mimic
   (`kvio workload`, `kvio sweep`);
+- **compile real agent traces** into chunk-level cache plans with explicit
+  evidence and assumptions (`kvio trace`, then `kvio workload --agent-plan`);
 - **record** what the device really received (`kvio record`, the
   `nvme_tp_monitor` eBPF tracer);
 - **attribute** each device command to the KV object that caused it — the
   offset-join: device offset + time window, zero engine cookies
   (`kvio perfetto`);
-- **replay** the exact command stream through fio and grade it
-  (`kvio iolog`, `kvio compare`);
+- **export** the exact requested command stream to fio and grade the
+  re-recorded device result (`kvio iolog`, `kvio compare`);
 - **benchmark** sustained restore, prefix, interference, and eviction pressure
   for storage and kernel A/B tests (`kvio bench`, `kvio bench-compare`).
 
@@ -44,8 +46,9 @@ sudo ./kvio workload --model meta-llama/Llama-3.2-1B-Instruct --tp 1 \
      --num-requests 200 --sem-out sem.jsonl                # drive it for real
 ./kvio perfetto --join-by-offset --ebpf dev.jsonl --sem sem.jsonl \
      --out kv.pftrace                                      # attribute
-./kvio iolog dev.jsonl nvme0n1 > dev.iolog                 # device-exact replay
-fio --read_iolog=dev.iolog --direct=1 ... && ./kvio compare ...    # grade it
+./kvio iolog dev.jsonl /dev/source --bundle-dir replay     # certified fio export
+KVIO_TARGET=/dev/nvmeXnY fio replay/replay-block.fio       # issue the requests
+./kvio compare run:dev.jsonl:replay.jsonl                  # grade device result
 ```
 
 (Flags above are real — see each subcommand's `--help`; `kvio plan` uses
@@ -55,6 +58,47 @@ wants the /dev/ngXnY char device. The
 semantic JSONL comes from the tool itself: the engine's public
 `entry_offset()` tells it where each object landed, so no engine tracing
 hook is needed — the offset-join's zero-engine-change promise, kept.)
+
+## Compile captured agent requests
+
+`kvio trace` closes the gap between a synthetic hit-rate and a real agent
+trajectory. LMCache agent traces contain prompts, so kvio uses a pinned
+tokenizer and content hashes to derive prefix or shifted-chunk reuse. TraceLab
+removes prompts for privacy, so kvio consumes its observed token/cache split
+and records that logical chunk identity is modeled. Both preserve timestamps
+and sessions in the plan; neither is mislabeled as captured device IO.
+
+```
+./kvio trace lmcache-agent-trace/opencode/gpt-5-mini-task1.jsonl \
+  --out opencode.json --format lmcache-agent \
+  --tokenizer tiktoken:gpt-5-mini \
+  --tokenizer-revision tiktoken-0.12.0 \
+  --source-revision 780bcc2979715150d8b9fd4737e026e625444cc9
+sudo ./kvio workload --agent-plan opencode.json \
+  --model Qwen/Qwen2.5-Coder-32B-Instruct --chunk-tokens 256 \
+  --device /dev/ngXnY --engine uring_cmd --sem-out sem.jsonl
+```
+
+The plan uses complete chunks only. `--policy prefix` models ordinary
+prefix-key lookup, `--policy substring` recognizes exact complete chunks after
+a shift, and `--capacity-chunks` enables LRU eviction. The latter is a simple
+content-reuse policy, not a claim that kvio implements CacheBlend.
+
+## fio interchange and the exact claim
+
+`kvio iolog` converts a measured NVMe capture to fio v3 microsecond timestamps,
+preserves equal-timestamp order, requires the capture-time LBA size, and rejects
+drops or unsupported commands. `--bundle-dir` emits the iolog, block and
+NVMe-passthrough job files, normalized IR, checksums, and a translation
+certificate. The certificate establishes that reparsing the fio artifact gives
+the same ordered operation/offset/length sequence. It does not establish that
+fio, Linux, or the controller executes that request stream unchanged, and it
+does not claim equal performance. Re-record the fio run and use `kvio compare`
+for those runtime facts.
+
+This export path is inspired by and interoperates with the pending fio
+[`iolog-device-record`](https://github.com/mcgrof/fio/tree/iolog-device-record)
+branch, including its single-stream and object-sharded replay modes.
 
 ## Benchmark sustained storage pressure
 
@@ -82,7 +126,8 @@ Every built-in is labeled `measured` or `synthetic`. Only
 is specific to Qwen2.5-1.5B-Instruct at TP1, bf16, and 256-token chunks. The
 other built-ins are controlled stress shapes, not captured production traffic.
 Use `--profile FILE` to add another sustained workload with its evidence source,
-or use capture plus iolog replay for an exact recorded stream.
+or use capture plus iolog replay for a certified requested stream, then
+re-record it before claiming device-level equality.
 
 Davidlohr Bueso's standalone
 [`kvspill`](https://github.com/davidlohr/kvspill) prototype supplied the initial

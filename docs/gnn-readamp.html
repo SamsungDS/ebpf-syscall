@@ -112,7 +112,7 @@
     <span class="pill">drive <b>Samsung 9100 PRO</b> Gen5</span>
     <span class="pill">tracer <b>nvme_tp_monitor</b></span>
     <span class="pill">RA <b>431×</b> → <b>8.6×</b></span>
-    <span class="pill">replay fidelity <b>+0.0%</b></span>
+    <span class="pill">replay command count <b>+0.0%</b></span>
   </div>
 </div></header>
 
@@ -213,8 +213,9 @@
     values, no node ids, no graph, no keys.</p>
   <p>So a third party can run their <strong>confidential</strong> GNN — real financial-fraud data,
     private customer graph — capture it with these tracers, and hand back a trace or an iolog that we
-    replay and visualize to reproduce the exact device read pattern <strong>without ever seeing their
-    data</strong>. <code>mk_dev_iolog.py</code> turns the capture into a fio v3 iolog:</p>
+    replay and visualize <strong>without ever seeing their data</strong>.
+    <code>mk_dev_iolog.py</code> turns the capture into a fio v3 request stream and certifies its
+    ordered operation, offset, and length translation:</p>
   <pre><div class="bar"><span class="dot"></span>nbr.iolog — 240,698 lines, and nothing but IO shape</div><code>fio version 3 iolog
 0 /dev/nvme0n1 add
 0 /dev/nvme0n1 open
@@ -223,7 +224,8 @@
 0 /dev/nvme0n1 read 3451445919744 4096
 <span class="c">... 240,695 more reads: offset + length + time only ...</span></code></pre>
   <p>Replayed read-only with <code>fio --read_iolog --direct=1</code> and refereed against the
-    original capture by <code>compare_streams.py</code>, the reproduction is exact:</p>
+    original capture by the old <code>compare_streams.py</code>, the measured command count, bytes,
+    and size histogram were exact:</p>
   <div class="tbl"><table>
     <thead><tr><th></th><th>commands</th><th>bytes</th><th>size mix</th></tr></thead>
     <tbody>
@@ -238,12 +240,14 @@
     plays the role of the confidential graph here so the whole pipeline is reproducible. The privacy
     property is a property of the <em>method</em> — the capture and iolog carry only shape — not of
     this particular dataset.</div>
-  <div class="note warn"><b class="tag">honest gap</b> Command-stream fidelity (count, sizes, offsets)
-    is what is validated at <b>+0.0%</b>. fio's replay of v3 <em>timestamps</em> is not yet pinned, so
-    treat the replay as the workload's command stream at the rig's speed, not its original pacing. And
-    fidelity must be judged at the device layer: a <em>perfect</em> file-level operation log can still
-    produce an 8× different device stream through the page cache — see the
-    <a href="https://github.com/SamsungDS/ebpf-syscall/blob/ebpf-fixes/examples/replay/README.md">replay
+  <div class="note warn"><b class="tag">honest gap</b> The historical <b>+0.0%</b> result covers
+    command count, total bytes, and size distribution; the old referee did not compare ordered
+    offsets. It also used an exporter that divided nanoseconds into milliseconds even though fio v3
+    expects microseconds, compressing timing 1,000×. Both tools are fixed, but this run must be
+    repeated before claiming tuple-order or timing fidelity. Fidelity must be judged at the device
+    layer: a <em>perfect</em> file-level log can still produce an 8× different device stream through
+    the page cache — see the
+    <a href="https://github.com/SamsungDS/ebpf-syscall/blob/main/examples/replay/README.md">replay
     README</a>.</div>
 </section>
 

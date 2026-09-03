@@ -10,7 +10,7 @@ A GNN reads 431× more off the SSD than it needs — watch it, then replay it wi
 
 Read amplification of a real financial-fraud graph neural network, captured at the NVMe device layer with eBPF, laid out A/B against the architectural fix, and reproduced from a fio iolog that carries no application data at all. Same tracing stack as the kvio KV-offload work — one layer down, on plain block IO.
 
-dataset **DGraphFin** · 3.7M nodes drive **Samsung 9100 PRO** Gen5 tracer **nvme_tp_monitor** RA **431×** → **8.6×** replay fidelity **+0.0%**
+dataset **DGraphFin** · 3.7M nodes drive **Samsung 9100 PRO** Gen5 tracer **nvme_tp_monitor** RA **431×** → **8.6×** replay command count **+0.0%**
 
 
 The gap between two witnesses
@@ -81,7 +81,7 @@ Capture a confidential workload, share only the shape
 
 This is why the capture matters beyond a pretty chart. A device capture — and the fio iolog made from it — carries only IO *shape*: operation, offset, length, timing. No feature values, no node ids, no graph, no keys.
 
-So a third party can run their **confidential** GNN — real financial-fraud data, private customer graph — capture it with these tracers, and hand back a trace or an iolog that we replay and visualize to reproduce the exact device read pattern **without ever seeing their data**. ``mk_dev_iolog.py`` turns the capture into a fio v3 iolog:
+So a third party can run their **confidential** GNN — real financial-fraud data, private customer graph — capture it with these tracers, and hand back a trace or an iolog that we replay and visualize **without ever seeing their data**. ``mk_dev_iolog.py`` turns the capture into a fio v3 request stream and certifies its ordered operation, offset, and length translation:
 
 ::
 
@@ -93,7 +93,7 @@ So a third party can run their **confidential** GNN — real financial-fraud dat
    0 /dev/nvme0n1 read 3451445919744 4096
    ... 240,695 more reads: offset + length + time only ...
 
-Replayed read-only with ``fio --read_iolog --direct=1`` and refereed against the original capture by ``compare_streams.py``, the reproduction is exact:
+Replayed read-only with ``fio --read_iolog --direct=1`` and refereed against the original capture by the old ``compare_streams.py``, the measured command count, bytes, and size histogram were exact:
 
 ================= ======== ======= ===========================
 \                 commands bytes   size mix
@@ -107,7 +107,15 @@ replay from iolog 240,702  1140 MB 4K:208138 8K:28198 12K:3749
 
 **public stand-in** DGraphFin is a *public* dataset; it plays the role of the confidential graph here so the whole pipeline is reproducible. The privacy property is a property of the *method* — the capture and iolog carry only shape — not of this particular dataset.
 
-**honest gap** Command-stream fidelity (count, sizes, offsets) is what is validated at **+0.0%**. fio's replay of v3 *timestamps* is not yet pinned, so treat the replay as the workload's command stream at the rig's speed, not its original pacing. And fidelity must be judged at the device layer: a *perfect* file-level operation log can still produce an 8× different device stream through the page cache — see the `replay README <https://github.com/SamsungDS/ebpf-syscall/blob/ebpf-fixes/examples/replay/README.md>`__.
+**honest gap** The historical **+0.0%** result covers command count, total bytes,
+and size distribution; the old referee did not compare ordered offsets.  It
+also used an exporter that divided nanoseconds into milliseconds even though
+fio v3 expects microseconds, compressing timing 1,000×.  Both tools are now
+fixed, but this historical run must be repeated before claiming tuple-order or
+timing fidelity.  Fidelity must be judged at the device layer: a *perfect*
+file-level operation log can still produce an 8× different device stream
+through the page cache — see the `replay README
+<https://github.com/SamsungDS/ebpf-syscall/blob/main/examples/replay/README.md>`__.
 
 Reproduce it
 ------------
