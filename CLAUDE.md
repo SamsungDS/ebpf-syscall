@@ -132,9 +132,27 @@ from scratch. Do not wedge a new effort into an existing recipe dir.
 - **Lead with the plain-English purpose**; explain in prose what changed
   and *why*. No plan codenames (E6/E7/P4/"Phase N") in commits, comments,
   or docs — say what the thing does.
+- Write for a maintainer who knows this repository but has never heard
+  of the proposed feature. A feature commit's first paragraph must
+  define what it does, identify the existing gap, distinguish it from
+  the current path, and explain why the repository should accept it.
+- Give a concrete operation or scenario when the feature or workload
+  name is not self-explanatory. Use plain language and define necessary
+  acronyms at first use.
+- Derive exact object sizes, block sizes, queue depths, rates, and other
+  constants, or cite the source and configuration that produced them.
+  Never leave a magic value for the reviewer to reverse-engineer.
+- Label benchmark workloads as measured, trace-derived, calibrated, or
+  synthetic. Do not describe a guessed microbenchmark as real or
+  representative. Explain why the workload matters, name the exact
+  boundary of its evidence, and say how later measured cases can extend
+  it.
 - Imperative mood; small atomic commits.
+- Wrap the subject and body at 72 columns.
 - Performance claims must be backed by measured data in the commit, with
   the hardware named.
-- Trailer: `Co-Authored-By: Claude <...>` + `Signed-off-by:`. Do **not**
-  add `Claude-Session` trailers.
+- When an AI agent materially authors a change, add the repository's normal
+  `Co-Authored-By:` trailer naming that agent, immediately before the human
+  `Signed-off-by:`. Name only the agent that actually did the work. Do not add
+  session IDs or substitute a different agent or model.
 - Never `git push`; the maintainer pushes.
