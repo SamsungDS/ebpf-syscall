@@ -74,13 +74,14 @@ class SemanticTrace:
             "mdts_bytes": mdts_bytes,
         }) + "\n")
 
-    def emit(self, op, encoded_key, nbytes, slot_offset, ts_start):
+    def emit(self, op, encoded_key, nbytes, slot_offset, ts_start, **context):
         rec = {
             "trace_id": self._next_id, "op": op, "key": encoded_key,
             "object_id": encoded_key, "part": "kv", "bytes": int(nbytes),
             "slot_offset": int(slot_offset), "ts": time.monotonic(),
             "ts_start": ts_start, "pid": self._pid, "instance": self._instance,
         }
+        rec.update(context)
         self._next_id += 1
         self._f.write(self._json.dumps(rec) + "\n")
 

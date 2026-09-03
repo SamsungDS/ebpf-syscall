@@ -11,6 +11,7 @@ device-exact fio.
     make kvio            # build the vendored Rust engine (needs cargo)
     ./kvio doctor        # check the build, python deps, tracers
     ./kvio plan ...      # GPU-free projection of a model's KV NVMe stream
+    ./kvio trace ...     # compile an agent trace into a cache-operation plan
     ./kvio workload ...  # drive the real engine with a serving-shaped workload
     ./kvio record ...    # capture the device command stream (nvme_tp_monitor)
     ./kvio perfetto ...  # attribute + convert to a Perfetto trace
@@ -40,6 +41,8 @@ COMMANDS = {
     # projection / planning (no device, no engine build needed)
     "plan":         ("examples/lmcache/kvio_plan.py",
                      "GPU-free projection of a model x config's KV NVMe IO stream", False),
+    "trace":        ("tools/kvio/agent_trace.py",
+                     "compile real agent requests into an evidence-labeled KV plan", False),
     # engine-driving (vendored RawBlockCore + built Rust module)
     "workload":     ("tools/kvio/workload.py",
                      "drive the real raw_block engine with a serving-shaped request mix", True),
