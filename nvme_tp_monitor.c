@@ -15,6 +15,8 @@
 #include <unistd.h>
 #include <errno.h>
 #include <time.h>
+#include <ctype.h>
+#include <limits.h>
 #include <bpf/libbpf.h>
 #include "nvme_tp_monitor.skel.h"
 
@@ -46,8 +48,36 @@ struct tp_cmp_event {
 static volatile sig_atomic_t stop;
 static void on_sig(int s) { (void)s; stop = 1; }
 static FILE *out;
-static unsigned lba_size = 512;
+static unsigned lba_size;
 static const char *disk_filter;
+static const char *lba_source;
+static unsigned long long command_seq;
+
+static int discover_lba_size(const char *disk, unsigned *size)
+{
+	char path[256];
+	FILE *file;
+
+	for (const char *p = disk; *p; p++) {
+		if (!isalnum((unsigned char)*p))
+			return -EINVAL;
+	}
+	if (snprintf(path, sizeof(path),
+		     "/sys/class/block/%s/queue/logical_block_size", disk) >=
+	    (int)sizeof(path))
+		return -ENAMETOOLONG;
+	file = fopen(path, "r");
+	if (!file)
+		return -errno;
+	if (fscanf(file, "%u", size) != 1) {
+		fclose(file);
+		return -EINVAL;
+	}
+	fclose(file);
+	if (!*size || (*size & (*size - 1)))
+		return -EINVAL;
+	return 0;
+}
 
 static const char *nvme_op(unsigned char op)
 {
@@ -73,9 +103,10 @@ static int handle_event(void *ctx, void *data, size_t sz)
 		unsigned long long nlb = (unsigned long long)e->nlb_zero + 1;
 		fprintf(out,
 			"{\"event_type\":\"nvme_cmd\",\"disk\":\"%s\",\"nsid\":%u,"
+			"\"seq\":%llu,"
 			"\"nvme_opcode\":%u,\"op_name\":\"%s\",\"slba\":%llu,\"nlb\":%llu,"
 			"\"bytes\":%llu,\"data_len\":%llu,\"hwq\":%u,\"cid\":%d,\"ts\":%llu}\n",
-			e->disk, e->nsid, e->nvme_opcode, nvme_op(e->nvme_opcode),
+			e->disk, e->nsid, command_seq++, e->nvme_opcode, nvme_op(e->nvme_opcode),
 			e->slba, nlb, nlb * lba_size, nlb * lba_size, e->hwq, e->cid,
 			e->ts);
 	} else if (ev_type == EV_CMP && sz >= sizeof(struct tp_cmp_event)) {
@@ -111,12 +142,46 @@ int main(int argc, char **argv)
 	for (int i = 1; i < argc; i++) {
 		if (!strcmp(argv[i], "--dur") && i+1 < argc) dur = atoi(argv[++i]);
 		else if (!strcmp(argv[i], "--jsonl") && i+1 < argc) jsonl = argv[++i];
-		else if (!strcmp(argv[i], "--lba-size") && i+1 < argc) lba_size = (unsigned)atoi(argv[++i]);
+		else if (!strcmp(argv[i], "--lba-size") && i+1 < argc) {
+			char *end;
+			unsigned long parsed;
+
+			errno = 0;
+			parsed = strtoul(argv[++i], &end, 0);
+			if (errno || *end || !parsed || parsed > UINT_MAX ||
+			    (parsed & (parsed - 1))) {
+				fprintf(stderr,
+					"--lba-size must be a positive power of two\n");
+				return 2;
+			}
+			lba_size = (unsigned)parsed;
+			lba_source = "argument";
+		}
 		else if (!strcmp(argv[i], "--disk") && i+1 < argc) disk_filter = argv[++i];
 		else if (!strcmp(argv[i], "--help")) {
-			fprintf(stderr, "usage: %s [--dur S] [--jsonl PATH] [--lba-size N] [--disk nvme1n1]\n", argv[0]);
+			fprintf(stderr,
+				"usage: %s [--dur S] [--jsonl PATH] "
+				"[--lba-size N] [--disk nvme1n1]\n"
+				"       --disk discovers the LBA size from sysfs; "
+				"otherwise --lba-size is required\n", argv[0]);
 			return 0;
 		} else { fprintf(stderr, "unknown arg %s\n", argv[i]); return 2; }
+	}
+	if (!lba_size) {
+		int error;
+
+		if (!disk_filter) {
+			fprintf(stderr,
+				"specify --disk to discover its LBA size, or pass --lba-size\n");
+			return 2;
+		}
+		error = discover_lba_size(disk_filter, &lba_size);
+		if (error) {
+			fprintf(stderr, "cannot discover LBA size for %s: %s\n",
+				disk_filter, strerror(-error));
+			return 2;
+		}
+		lba_source = "sysfs";
 	}
 
 	out = stdout;
@@ -141,6 +206,18 @@ int main(int argc, char **argv)
 	fprintf(stderr, "nvme_tp_monitor: attached (lba=%u, disk=%s)\n",
 		lba_size, disk_filter ? disk_filter : "all");
 
+	if (disk_filter)
+		fprintf(out,
+			"{\"event_type\":\"capture_meta\","
+			"\"emitter\":\"nvme_tp_monitor\",\"lba_bytes\":%u,"
+			"\"lba_source\":\"%s\",\"disk_filter\":true}\n",
+			lba_size, lba_source);
+	else
+		fprintf(out,
+			"{\"event_type\":\"capture_meta\","
+			"\"emitter\":\"nvme_tp_monitor\",\"lba_bytes\":%u,"
+			"\"lba_source\":\"%s\",\"disk_filter\":false}\n",
+			lba_size, lba_source);
 	emit_anchor();
 	time_t t0 = time(NULL), last_anchor = t0;
 	while (!stop) {

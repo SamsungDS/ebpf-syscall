@@ -414,9 +414,9 @@ class Capture:
                 self.occ_of[id(c)] = j
 
         # --- lba-size inference (header classification sanity) ---------
-        # The capture-time --lba-size is not recorded in the JSONL; a wrong
-        # value silently classifies every store command as payload.  Test
-        # the flag value plus the common candidates and keep the best.
+        # Legacy captures do not record their capture-time --lba-size. A
+        # wrong value silently classifies every store command as payload.
+        # Test the flag value plus the common candidates and keep the best.
         # KV joins have no slot_offset/slba geometry: skip the sampling.
         self.lba_bytes = args.lba_bytes
         cand = []
@@ -942,7 +942,7 @@ def main():
                     help="keep absolute CLOCK_MONOTONIC timestamps "
                          "(same-boot arms only)")
     ap.add_argument("--lba-bytes", type=int, default=4096,
-                    help="capture-time --lba-size of the tracer (auto-inferred "
+                    help="capture-time LBA size for legacy traces (auto-inferred "
                          "from store headers when the flag value matches none)")
     ap.add_argument("--nominal-dur-ns", type=int, default=NOMINAL_DUR_NS)
     ap.add_argument("--time-range", metavar="START_S,END_S",

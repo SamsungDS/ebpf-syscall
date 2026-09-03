@@ -5,8 +5,8 @@
 One entry point for the kvio toolkit in this tree. Engine-driving commands run
 against the REAL LMCache raw_block engine, vendored and built in-tree
 (`make kvio`) -- no LMCache install needed. Recording uses this tree's eBPF
-tracers; attribution is the offset-join (no engine cookies); replay is
-device-exact fio.
+tracers; attribution is the offset-join (no engine cookies); fio export is
+translation-certified and device behavior is checked by re-recording.
 
     make kvio            # build the vendored Rust engine (needs cargo)
     ./kvio doctor        # check the build, python deps, tracers
@@ -15,7 +15,7 @@ device-exact fio.
     ./kvio workload ...  # drive the real engine with a serving-shaped workload
     ./kvio record ...    # capture the device command stream (nvme_tp_monitor)
     ./kvio perfetto ...  # attribute + convert to a Perfetto trace
-    ./kvio iolog ...     # device capture -> fio v3 iolog
+    ./kvio iolog ...     # device capture -> certified fio v3 replay bundle
     ./kvio compare ...   # grade a replay against its capture
     ./kvio bench ...     # run sustained kvspill-derived fio workloads
     ./kvio bench-compare # compare median results from two bench runs
@@ -62,7 +62,7 @@ COMMANDS = {
     "sem2manifest": ("examples/lmcache/kvio_sem2manifest.py",
                      "semantic JSONL -> replay manifest", False),
     "iolog":        ("examples/replay/mk_dev_iolog.py",
-                     "device capture -> fio v3 iolog (op/offset/length/time)", False),
+                     "device capture -> certified fio v3 replay bundle", False),
     "compare":      ("examples/replay/compare_streams.py",
                      "grade a fio replay against its capture at the NVMe layer", False),
     # proofs / probes (engine)

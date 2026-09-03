@@ -150,7 +150,7 @@ kvio:
 
 kvio-test:
 	@python3 -m py_compile tools/kvio/*.py
-	@python3 -m unittest -v tests.test_kvio_bench
+	@python3 -m unittest discover -s tests -p 'test_kvio*.py' -v
 
 vmlinux.h:
 	@echo "Generating vmlinux.h from running kernel..."
