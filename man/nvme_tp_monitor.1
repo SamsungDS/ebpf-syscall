@@ -1,0 +1,67 @@
+.\" SPDX-License-Identifier: Apache-2.0
+.TH NVME_TP_MONITOR 1 "September 2026" "ebpf-syscall" "User Commands"
+.SH NAME
+nvme_tp_monitor \- capture NVMe driver commands and completion latency
+.SH SYNOPSIS
+.B nvme_tp_monitor
+.RB [ \-\-dur " SECONDS" ]
+.RB [ \-\-jsonl " PATH" ]
+.RB [ \-\-disk " NVME_NAMESPACE" ]
+.RB [ \-\-lba-size " BYTES" ]
+.SH DESCRIPTION
+.B nvme_tp_monitor
+attaches to Linux NVMe command and completion tracepoints.  It records the
+ordered operation, namespace, LBA, byte length, monotonic issue time, hardware
+queue, command ID, completion status, and completion latency.  A final drop
+record lets consumers detect capture loss.
+.PP
+This is the device witness used by
+.BR "kvio record" .
+It sees commands from every submission API that reaches the selected NVMe
+driver, including IO not issued by kvio.
+.SH OPTIONS
+.TP
+.BI \-\-dur " seconds"
+Stop after the given duration.  Otherwise stop with SIGINT or SIGTERM.
+.TP
+.BI \-\-jsonl " path"
+Write newline-delimited JSON to the path instead of standard output.
+.TP
+.BI \-\-disk " namespace"
+Capture only the named block namespace, for example
+.BR nvme1n1 .
+The monitor discovers its logical block size from sysfs.  Filtering is
+required for an unambiguous portable replay capture.
+.TP
+.BI \-\-lba-size " bytes"
+Supply a positive power-of-two logical block size.  This is required when
+.B \-\-disk
+is omitted because several observed namespaces can have different geometry.
+.SH OUTPUT AND PRIVACY
+Command records contain IO metadata, not payload bytes, file names, KV object
+keys, graph nodes, prompts, or tensors.  Completion records contain status,
+latency, queue, command ID, and time.
+.PP
+Payload-free does not mean anonymous.  Exact LBAs reveal locality and device
+range, timing reveals request cadence, and disk identity or an unusual shape
+can identify a system or workload.  Minimize and review captures before
+sharing them.
+.SH FIDELITY
+Require a final
+.B dropped: 0
+record for an exact-stream claim.  Use
+.B kvio iolog
+to export the requested stream, then capture the fio replay with this monitor
+and use
+.B kvio compare
+to check ordered operations, byte offsets and lengths, issue timing, and
+completion-latency distributions.
+.PP
+Completion records do not carry disk identity.  Consumers pair them using
+hardware queue, command ID, and time ordering or use their latency
+distribution.  Current kvio comparison does not establish a one-to-one latency
+pair between an original command and its replay.
+.SH SEE ALSO
+.BR kvio (1),
+.BR nvme_uring_cmd_monitor (1),
+.BR iouring_monitor (1)

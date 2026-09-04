@@ -1,0 +1,50 @@
+.\" SPDX-License-Identifier: Apache-2.0
+.TH SYSCALL_REPLAYER 1 "September 2026" "ebpf-syscall" "User Commands"
+.SH NAME
+syscall_replayer \- replay IO-related system calls from a JSON capture
+.SH SYNOPSIS
+.B syscall_replayer
+.RI [ JSON_FILE ]
+.RB [ \-\-paced ]
+.RB [ \-\-serial | \-\-per-process ]
+.SH DESCRIPTION
+.B syscall_replayer
+reads detailed JSON made by
+.BR syscall_monitor (1)
+and recreates supported open, mapping, read, write, synchronization, and close
+operations.  It maintains captured-to-replay descriptor mappings and verifies
+operation results where supported.
+.PP
+The default input is
+.IR final_replay.json .
+The default execution mode assigns a worker to each captured process so
+independent producers can issue IO concurrently.
+.SH OPTIONS
+.TP
+.B \-\-paced
+Delay operations relative to a shared monotonic start so their issue times
+follow the captured timestamps.  Without this option, workers run as quickly
+as dependencies allow.
+.TP
+.B \-\-per-process
+Use one replay worker per captured process.  This is the default.
+.TP
+.B \-\-serial
+Use the legacy single-worker path.  This changes concurrency and is useful for
+controlled comparisons, not for preserving a concurrent workload.
+.SH FIDELITY
+This tool reproduces application-facing calls.  It cannot guarantee the same
+device command stream because the page cache, readahead, writeback, filesystem,
+block layer, and scheduler can transform those calls.  When device fidelity is
+the claim, capture with
+.BR nvme_tp_monitor (1),
+export with
+.BR "kvio iolog" ,
+and re-record the replay.
+.SH SAFETY
+Replay can create, overwrite, map, and modify files named in the capture.  Run
+only after reviewing the JSON and redirecting paths to disposable storage.
+.SH SEE ALSO
+.BR syscall_monitor (1),
+.BR kvio (1),
+.BR nvme_tp_monitor (1)

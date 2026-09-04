@@ -52,7 +52,8 @@ NVME_BPF_OBJ = nvme_uring_cmd_monitor.bpf.o
 NVME_SKEL    = nvme_uring_cmd_monitor.skel.h
 
 .PHONY: all clean setup kvio kvio-ir kvio-ir-test kvio-ir-kani kvio-test \
-	install install-tools install-kvio install-kvio-man install-man
+	install install-tools install-kvio install-kvio-man install-man \
+	install-tool-man
 
 all: setup $(TARGET) $(MMAP_TARGET) $(IOU_TARGET) $(NVME_TARGET) $(NVMETP_TARGET) $(REPLAYER_TARGET)
 
@@ -151,6 +152,7 @@ INSTALL_PROGRAMS = $(TARGET) $(REPLAYER_TARGET) $(MMAP_TARGET) \
 	$(IOU_TARGET) $(NVME_TARGET) $(NVMETP_TARGET)
 KVIO_INSTALL_ROOT = $(libexecdir)/ebpf-syscall
 MANPAGES = $(wildcard man/*.1)
+TOOL_MANPAGES = $(filter-out man/kvio.1,$(MANPAGES))
 
 kvio: kvio-ir
 	@command -v cargo >/dev/null 2>&1 || { \
@@ -195,7 +197,7 @@ kvio-test: kvio-ir kvio-ir-test
 
 # kvio resolves its helpers relative to its launcher. Keep that source-like
 # layout under libexec and expose only the launcher through bindir.
-install: install-tools install-kvio install-man
+install: install-tools install-kvio install-tool-man
 
 install-tools:
 	@for program in $(INSTALL_PROGRAMS); do \
@@ -286,10 +288,12 @@ install-kvio-man:
 			"$(DESTDIR)$(mandir)/man1/kvio.1"; \
 	fi
 
-install-man:
-	@if test -n "$(MANPAGES)"; then \
+install-man: install-kvio-man install-tool-man
+
+install-tool-man:
+	@if test -n "$(TOOL_MANPAGES)"; then \
 		$(INSTALL) -d "$(DESTDIR)$(mandir)/man1"; \
-		for page in $(MANPAGES); do \
+		for page in $(TOOL_MANPAGES); do \
 			$(INSTALL) -m 644 "$$page" \
 				"$(DESTDIR)$(mandir)/man1/$$(basename "$$page")"; \
 		done; \

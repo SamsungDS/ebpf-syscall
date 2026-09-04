@@ -1,0 +1,37 @@
+.\" SPDX-License-Identifier: Apache-2.0
+.TH MMAP_READAMP 1 "September 2026" "ebpf-syscall" "User Commands"
+.SH NAME
+mmap_readamp \- measure file and block IO read amplification with eBPF
+.SH SYNOPSIS
+.B mmap_readamp
+.RB [ \-\-pid " PID" ]
+.RB [ \-\-dur " SECONDS" ]
+.SH DESCRIPTION
+.B mmap_readamp
+compares several witnesses of an IO workload: file-backed demand faults,
+page-cache insertions, read and write syscall intent, iomap direct IO, and
+physical block requests.  It prints per-file and per-device counts, byte
+totals, request-size histograms, and IO-unit amplification.
+.PP
+The useful-byte denominator is workload-specific and must be supplied by the
+application or another trace.  A fault-byte count is not automatically equal
+to useful application data.
+.SH OPTIONS
+.TP
+.BI \-\-pid " PID"
+Restrict process-scoped probes to one thread-group ID.  A value of zero or an
+omitted option observes all processes where the probe supports it.
+.TP
+.BI \-\-dur " seconds"
+Stop after the given duration.  Otherwise stop with SIGINT or SIGTERM.
+.SH OUTPUT
+Page-cache insertion is a pre-filesystem-submission observation, not proof of
+device completion.  O_DIRECT bypasses the page cache.  Block request records
+show physical device IO but no longer carry a file inode.  Use the separate
+witnesses together when making a read-amplification claim.
+.SH REQUIREMENTS
+Requires root privileges, BTF for the running kernel, and kernel functions
+compatible with the generated eBPF skeleton.
+.SH SEE ALSO
+.BR kvio (1),
+.BR nvme_tp_monitor (1)

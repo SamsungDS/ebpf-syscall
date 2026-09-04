@@ -1,0 +1,293 @@
+.\" SPDX-License-Identifier: Apache-2.0
+.TH KVIO 1 "September 2026" "ebpf-syscall" "User Commands"
+.SH NAME
+kvio \- project, issue, capture, replay, and benchmark KV-cache storage IO
+.SH SYNOPSIS
+.B kvio
+.I command
+.RI [ options ]
+.SH DESCRIPTION
+.B kvio
+answers four different questions about a storage-backed KV cache:
+what IO a model configuration should produce, what IO a real workload asks
+for, what commands reached the NVMe device, and whether a storage tier can
+sustain controlled pressure.
+These are different claims and use different commands.
+.PP
+Commands that issue KV IO use LMCache's real raw-block engine.  Commands that
+capture device IO use Linux NVMe tracepoints.  A fio bundle preserves a
+captured requested stream, while
+.B kvio bench
+runs a controlled workload and does not claim to replay a capture.
+.SH COMMANDS
+.TP
+.B plan
+Project command sizes and counts from model and cache geometry.  This needs no
+GPU, application trace, or storage device.  It predicts neither reuse nor
+application timing.
+.TP
+.B trace
+Compile timestamped agent requests into a chunk-level cache plan.  Promptful
+LMCache traces can derive content identity with a pinned tokenizer.  Promptless
+TraceLab records retain observed token and cache accounting but must model
+logical chunk identity.
+.TP
+.B workload
+Issue stores and loads through LMCache's real raw-block engine.  It accepts a
+model configuration or a plan made by
+.BR "kvio trace" .
+This command may write to its target.
+.TP
+.B sweep
+Exercise the real engine over a parameter sweep.
+.TP
+.B replay
+Materialize projected KV IO against a real device.  This is distinct from fio
+replay of an observed device capture.
+.TP
+.B validate
+Compare a model projection with an engine recording.
+.TP
+.B record
+Run
+.BR nvme_tp_monitor (1)
+to capture commands at the NVMe driver.  Select one namespace with
+.B \-\-disk
+when making a replayable capture.
+.TP
+.B perfetto
+Join semantic object records to device commands and write a Perfetto trace.
+The offset join uses an object's disjoint byte range and operation time window;
+it does not require an engine cookie.
+.TP
+.B report
+Compute SQL metrics from a converted trace.
+.TP
+.B sem2manifest
+Convert semantic JSONL records into a replay manifest.
+.TP
+.B iolog
+Translate an NVMe JSONL capture into a fio version-3 request stream.  With
+.B \-\-bundle-dir
+it also writes normalized commands, block and NVMe-passthrough job files, a
+translation certificate, and checksums.
+.TP
+.B fio-certify
+Use the independent Rust validator to check that a bundle still describes the
+captured operations, offsets, lengths, order, and rounded timestamps.
+.TP
+.B compare
+Compare an original device capture with one or more replay captures.  This is
+the runtime referee; it checks what fio, Linux, and the NVMe driver actually
+issued.
+.TP
+.B bench
+Run evidence-labeled, sustained fio workloads derived from kvspill.  These
+measure restore pressure, small-read interference, eviction pressure, and
+storage headroom.  Except for profiles labeled measured, they are controlled
+stress shapes rather than recorded production workloads.  The target is
+destructive unless protected by the command's safety checks.
+.TP
+.B bench-compare
+Compare medians from repeated benchmark result logs.
+.TP
+.B doctor
+Check the installed engine modules, Python dependencies, Rust validator,
+tracer, and fio.
+.SH WORKFLOWS
+To preserve an observed device-request stream, run:
+.PP
+.RS
+.nf
+kvio record -> kvio iolog -> kvio fio-certify
+            -> run fio while recording -> kvio compare
+.fi
+.RE
+.PP
+Static certification proves that the files describe the intended finite
+stream.  Only the second capture establishes what the runtime issued.
+.PP
+To derive IO from real agent requests, run
+.B kvio trace
+and then
+.BR "kvio workload" ,
+with
+.B kvio record
+alongside the workload.
+.PP
+Use
+.B kvio bench
+for controlled sustained pressure.  Do not describe its output as replay
+fidelity.
+.SH TRACE MINIMIZATION AND PRIVACY
+.B nvme_tp_monitor
+does not read application payloads.  Its capture contains device and namespace
+identity, operation, LBA, length, issue time, queue and command identifiers,
+and completion latency.  It contains no prompt, tensor, feature value, graph,
+or file content.
+.PP
+.B kvio iolog
+further reduces a replay artifact to operation, exact byte offset, length, and
+relative time, plus certificate metadata.  A caller may use a placeholder
+filename such as
+.I /dev/source
+and select the real target with
+.B KVIO_TARGET
+at replay time.
+.PP
+This is payload-free and data-minimized; it is not a proof of anonymity.
+Offsets reveal locality and address range, timings reveal request cadence, and
+device size or an unusual access pattern can identify a workload.  Do not
+publish a raw
+.BR nvme_uring_cmd_monitor (1)
+capture made with
+.B \-\-kv
+without review: that mode records each 16-byte object key as
+.BR key_hex .
+kvio does not yet provide a general sanitizer that remaps offsets and time
+while stating the fidelity lost by that transform.  This work is tracked in
+.IR tools/kvio/TODO.md .
+.SH DGRAPHFIN EXAMPLE
+The DGraphFin case study demonstrates how a payload-free device trace can show
+the benefit of an architectural change.  DGraphFin is a public
+financial-fraud graph with 3.7 million nodes and 17 floating-point features,
+or 68 useful bytes, per node.  It stands in for a private graph so the full
+experiment can be reproduced.
+.PP
+The naive NeighborLoader arm samples scattered neighbors and reads the pages
+that contain them.  The page-aware arm reads a page as a unit and consumes
+multiple feature vectors from it.  The published 12-second measurements on
+the same data and SSD report:
+.PP
+.RS
+.TS
+tab(|);
+l r r r.
+arm|useful bytes|device bytes|commands
+NeighborLoader|2.65 MB|1140 MB|240,698
+page-aware|58.3 MB|502 MB|61,498
+.TE
+.RE
+.PP
+Device bytes divided by useful feature bytes fell from 431 to 8.6, roughly a
+50-fold reduction in that read-amplification metric.  Device traffic itself
+fell by about 2.3 times, and command count by about 3.9 times.  Keeping these
+numbers separate matters because the page-aware arm also makes more useful
+progress.
+.PP
+The application emitted useful-byte markers and the tracer recorded device
+commands on the same monotonic clock.  The visualization therefore shows the
+gap between application intent and device mechanism without storing feature
+values or graph contents.  Exact offsets and timing remain potentially
+sensitive metadata.
+.SH FIDELITY
+.SS Requested stream
+.B kvio iolog
+rejects an incomplete capture, reported drops, unsupported operations,
+duplicate sequence values, missing or conflicting LBA geometry, unaligned
+ranges, and arithmetic overflow.  It sorts commands by monotonic timestamp
+and stable sequence, emits relative fio microseconds, reparses the result, and
+certifies the ordered operation, offset, and length stream.  Timestamp
+quantization is less than one microsecond.
+.PP
+.B kvio fio-certify
+independently checks the normalized stream, fio iolog, certificate, hashes,
+sequence, alignment, range arithmetic, timestamp rounding, and canonical fio
+encoding.  This can catch a replay whose syntax is legal but whose target
+offset changed.
+.SS Executed stream
+Run fio while making a second drop-free device capture, then use
+.BR "kvio compare" .
+Exact device-stream equality requires the same ordered operation, byte offset,
+and byte length tuples.  Equal command counts or size histograms alone do not
+establish equality.
+.SS Time and latency
+Issue timing is covered at two levels.  The bundle retains relative issue
+times at fio's microsecond resolution.  After replay,
+.B kvio compare
+rebases each capture to its first command and reports issue-time error at the
+50th and 99th percentiles and the maximum.
+.PP
+.BR nvme_tp_monitor (1)
+also records command completion latency.
+.B kvio compare
+reports completion-latency distributions for the original and replay
+captures.  It does not yet pair every original command with its replayed
+completion.  It also does not measure application end-to-end latency, model
+latency, time to first token, or time per output token.
+.PP
+Fio pacing, submission engines, Linux scheduling, and the controller can
+change timing even when the input file is exact.  Re-recording is therefore
+required for a runtime timing claim.
+.SS Historical DGraphFin replay
+The old DGraphFin replay matched rounded command count, total bytes, and the
+request-size distribution.  Its old referee did not compare ordered offsets,
+and its exporter compressed time by 1,000 because it treated fio
+microseconds as milliseconds.  The tools are fixed; the hardware run must be
+repeated before claiming ordered-offset or paced-timing fidelity for that
+historical result.
+.SH EXAMPLES
+Build and install the suite:
+.PP
+.RS
+.nf
+make all
+make kvio
+sudo make install
+kvio doctor
+.fi
+.RE
+.PP
+Project a KV stream without a GPU:
+.PP
+.RS
+.nf
+kvio plan --model Llama-3.1-8B --chunk-tokens 256 --op store
+.fi
+.RE
+.PP
+Make and check a portable replay bundle:
+.PP
+.RS
+.nf
+sudo kvio record --disk nvme1n1 --dur 60 --jsonl source.jsonl &
+source_monitor=$!
+# Run the source workload after the monitor reports that it attached.
+wait "$source_monitor"
+kvio iolog source.jsonl /dev/source --bundle-dir replay
+kvio fio-certify replay
+.fi
+.RE
+.PP
+Run fio only against a verified disposable target, record that run, and
+compare it:
+.PP
+.RS
+.nf
+sudo kvio record --disk nvme2n1 --dur 60 --jsonl replay.jsonl &
+replay_monitor=$!
+sleep 1
+sudo KVIO_TARGET=/dev/nvme2n1 fio replay/replay-block.fio
+wait "$replay_monitor"
+kvio compare original:source.jsonl:replay.jsonl
+.fi
+.RE
+.SH FILES
+.TP
+.I tools/kvio/README.md
+Full command workflows, model geometry, engine design, and benchmark profiles.
+.TP
+.I examples/replay/README.md
+Device-level replay rationale, fio translation, and runtime fidelity method.
+.TP
+.I docs/gnn-readamp.rst
+DGraphFin read-amplification case study and reproduction links.
+.TP
+.I tools/kvio/TODO.md
+Open privacy, fidelity, pacing, concurrency, and packaging work.
+.SH SEE ALSO
+.BR fio (1),
+.BR nvme_tp_monitor (1),
+.BR nvme_uring_cmd_monitor (1),
+.BR iouring_monitor (1),
+.BR mmap_readamp (1)

@@ -1,0 +1,51 @@
+.\" SPDX-License-Identifier: Apache-2.0
+.TH SYSCALL_MONITOR 1 "September 2026" "ebpf-syscall" "User Commands"
+.SH NAME
+syscall_monitor \- capture and summarize filesystem-related system calls
+.SH SYNOPSIS
+.B syscall_monitor
+.RI [ options ]
+.SH DESCRIPTION
+.B syscall_monitor
+uses eBPF tracepoints to observe filesystem and IO system calls.  It can keep
+aggregate statistics or retain detailed events and export the result as JSON
+for later inspection or replay.
+.PP
+The program normally offers interactive choices.  Use
+.B \-\-duration
+and
+.B \-\-no-prompt
+for an unattended capture.
+.SH OPTIONS
+.TP
+.BI \-\-max-events " number"
+Limit retained detailed events.  The default is 1,000,000.  The program
+reports events discarded after the buffer reaches this limit.
+.TP
+.BI \-\-duration " seconds"
+Stop after the given time instead of waiting for interactive termination.
+.TP
+.B \-\-detailed
+Enable per-event ring-buffer logging.
+.TP
+.B \-\-no-detailed
+Disable per-event logging and retain aggregate information only.
+.TP
+.BI \-\-json-out " path"
+Write JSON to the given path and do not prompt for an export destination.
+.TP
+.BI \-\-label " name"
+Store a workload label in the JSON metadata.
+.TP
+.B \-\-no-prompt
+Skip all interactive prompts and use command-line defaults.
+.TP
+.BR \-h , " \-\-help"
+Show usage.
+.SH PRIVACY
+Detailed output can contain process names, file names, descriptors, offsets,
+sizes, and timing.  It does not copy file payloads, but this metadata can still
+identify users, files, and access patterns.  Review it before sharing.
+.SH SEE ALSO
+.BR syscall_replayer (1),
+.BR kvio (1)

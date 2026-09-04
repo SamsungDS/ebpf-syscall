@@ -1,0 +1,60 @@
+.\" SPDX-License-Identifier: Apache-2.0
+.TH NVME_URING_CMD_MONITOR 1 "September 2026" "ebpf-syscall" "User Commands"
+.SH NAME
+nvme_uring_cmd_monitor \- trace io_uring NVMe passthrough commands
+.SH SYNOPSIS
+.B nvme_uring_cmd_monitor
+.RB [ \-\-pid " PID" ]
+.RB [ \-\-dur " SECONDS" ]
+.RB [ \-\-jsonl " PATH" ]
+.RB [ \-\-lba-size " BYTES" ]
+.RB [ \-\-kv ]
+.RB [ \-\-quiesced ]
+.RB [ \-\-no-cq-overflow ]
+.SH DESCRIPTION
+.B nvme_uring_cmd_monitor
+observes NVMe uring-command submissions and completions.  Normal namespace
+mode decodes logical block addresses and lengths.  NVMe Key-Value mode decodes
+store, retrieve, delete, and exist commands.  Output includes request identity,
+timestamps, completion status and latency, and a final loss-accounting record.
+.SH OPTIONS
+.TP
+.BI \-\-pid " PID"
+Restrict process-scoped producers to one thread-group ID.
+.TP
+.BI \-\-dur " seconds"
+Stop after the given duration.
+.TP
+.BI \-\-jsonl " path"
+Write newline-delimited JSON to the path.
+.TP
+.BI \-\-lba-size " bytes"
+Set the namespace logical block size used to decode normal block commands.
+.TP
+.B \-\-kv
+Decode NVMe Key-Value commands instead of normal LBA commands.  This records
+the 16-byte object key in the
+.B key_hex
+field.
+.TP
+.B \-\-quiesced
+Assert that PID-scoped producers are stopped before the monitor is signaled,
+allowing completion and loss accounting to drain under that operating rule.
+.TP
+.B \-\-no-cq-overflow
+Disable system-wide completion-queue overflow probes.
+.SH PRIVACY
+This tool does not copy value payloads, but
+.B \-\-kv
+does copy object keys.  Process name, PID, TID, user_data, queue, command ID,
+offsets or keys, sizes, and timing can all be sensitive.  Do not call a raw KV
+capture anonymous and do not publish one without a field-by-field review.
+.SH FIDELITY
+Check the final drop and correlation records before treating a capture as
+complete.  This monitor covers the io_uring NVMe passthrough path; use
+.BR nvme_tp_monitor (1)
+for namespace-wide driver tracepoints independent of the submitting API.
+.SH SEE ALSO
+.BR kvio (1),
+.BR iouring_monitor (1),
+.BR nvme_tp_monitor (1)

@@ -1,0 +1,36 @@
+.\" SPDX-License-Identifier: Apache-2.0
+.TH IOURING_MONITOR 1 "September 2026" "ebpf-syscall" "User Commands"
+.SH NAME
+iouring_monitor \- record io_uring submissions and completions with eBPF
+.SH SYNOPSIS
+.B iouring_monitor
+.RB [ \-\-pid " PID" ]
+.RB [ \-\-dur " SECONDS" ]
+.RB [ \-\-jsonl " PATH" ]
+.SH DESCRIPTION
+.B iouring_monitor
+attaches to io_uring tracepoints and records submission and completion events.
+It can restrict process-scoped events to one process and writes a final drop
+record so consumers can reject an incomplete capture.
+.SH OPTIONS
+.TP
+.BI \-\-pid " PID"
+Restrict the capture to one thread-group ID.
+.TP
+.BI \-\-dur " seconds"
+Stop after the given duration.  Otherwise stop with SIGINT or SIGTERM.
+.TP
+.BI \-\-jsonl " path"
+Write newline-delimited JSON to the path instead of standard output.
+.SH FIDELITY
+This observes io_uring, not the NVMe device.  Filesystems and the block layer
+can split, merge, cache, or reorder requests below this point.  Use
+.BR nvme_tp_monitor (1)
+when the device command stream is the required witness.
+.SH PRIVACY
+The trace contains process and request metadata.  It does not copy IO payloads,
+but identifiers, lengths, and timing can still reveal workload structure.
+.SH SEE ALSO
+.BR kvio (1),
+.BR nvme_uring_cmd_monitor (1),
+.BR nvme_tp_monitor (1)
