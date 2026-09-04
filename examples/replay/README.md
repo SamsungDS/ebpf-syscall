@@ -70,6 +70,20 @@ normalized workload JSON, a certificate, and checksums. The certificate proves
 the translation, not fio/kernel/controller conformance or performance equality.
 Always re-record a replay before making an exact device-stream claim.
 
+There are three different timing claims. The iolog preserves relative command
+issue times at fio's microsecond resolution. `compare_streams.py` rebases the
+two captures to their first commands and reports issue-time error at p50, p99,
+and max. It also reports each capture's completion-latency distribution from
+`nvme_cmp` records. It does not pair each original completion with a replay
+completion, and none of these measurements is application end-to-end latency.
+
+The device capture is payload-free, not necessarily anonymous. Exact offsets,
+timing, namespace identity, and an unusual request shape can fingerprint a
+workload. `nvme_uring_cmd_monitor --kv` is a separate path that records
+`key_hex`; never publish that output as an anonymized trace without additional
+review. Planned sanitization transforms and their fidelity tradeoffs are in
+`../../tools/kvio/TODO.md`.
+
 `make kvio-ir` builds an independent Rust validator. Run
 `./kvio fio-certify BUNDLE` to check the normalized workload hash, iolog hash,
 command count, sequence, timestamp rounding, alignment, and the exact fio

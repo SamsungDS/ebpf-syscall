@@ -1,4 +1,4 @@
-# GNN read-amplification: capture, visualize, and privacy-preserving replay
+# GNN read-amplification: capture, visualize, and payload-free replay
 
 This reproduces the read-amplification A/B in the
 [value showcase](../../../docs/gnn-readamp.html): a GNN reading node
@@ -9,9 +9,9 @@ The workload is the public **DGraphFin** financial-fraud graph
 (3.7M nodes, 17 features/node) served through knlp's force-SSD feature
 store (`make defconfig-gnn-dgraphfin-force-ssd`). DGraphFin is a public
 dataset — it stands in here for the *confidential* graph a third party
-would actually run. The point of the pipeline is that everything we
-publish (the capture, the iolog, the trace) carries only IO shape —
-offsets, lengths, timing — never a single feature value.
+would actually run. The device capture, iolog, and visualization carry IO
+shape — offsets, lengths, timing — without carrying feature values. This
+minimizes the data, but exact IO metadata is not automatically anonymous.
 
 ## The one idea
 
@@ -42,9 +42,9 @@ NVME_TP=/path/to/nvme_tp_monitor ./cap_ssd.sh page     natural 12 /tmp/page
 ```
 
 Each run writes `<prefix>.jsonl` (device commands) and `<prefix>.phase.txt`
-(intent markers). O_DIRECT guarantees every logical read reaches the
-device, so the eBPF capture is exact — it matched the driver's own read
-count to the command (240,698 vs 240,698 reads; 100%).
+(intent markers). O_DIRECT bypasses the page cache, and the independent eBPF
+and store counters agreed at 240,698 reads in the naive arm. That agreement is
+the evidence for this run; O_DIRECT alone is not a general completeness proof.
 
 Measured (12 s each):
 
@@ -55,8 +55,10 @@ Measured (12 s each):
 
 `RA_signal` = device bytes / useful feature bytes. `RA_fetch` = device
 bytes / minimal pages needed (the store's own `ra_physical`). Same data,
-same SSD; one architectural change to the *access pattern* cuts device
-traffic ~50× for the identical GNN signal.
+same SSD; one architectural change to the *access pattern* reduces
+`RA_signal` about 50×, device bytes about 2.3×, and commands about 3.9×.
+The page-aware arm also consumes more useful feature bytes, so these ratios
+must not be presented as the same result.
 
 ## 2. Visualize the A/B on Perfetto
 
@@ -72,7 +74,7 @@ a process group; the *useful MB* counter sits far under the *device MB*
 counter and the gap is the amplification. `plot_readamp.py` renders the
 same data as a static A/B PNG.
 
-## 3. Privacy-preserving replay (the payoff)
+## 3. Payload-free replay
 
 The capture becomes a fio v3 iolog that carries only op/offset/length/time:
 
@@ -82,28 +84,43 @@ python3 - "$(grep PHASE_START /tmp/nbr.phase.txt | grep -oE 'mono_ns=[0-9]+' | c
          "$(grep PHASE_END   /tmp/nbr.phase.txt | grep -oE 'mono_ns=[0-9]+' | cut -d= -f2)" <<'PY'
 import json,sys
 S,E=int(sys.argv[1]),int(sys.argv[2])
-out=open("/tmp/nbr_reads.jsonl","w")
-for ln in open("/tmp/nbr.jsonl"):
-    r=json.loads(ln)
-    if r.get("event_type")=="nvme_cmd" and r.get("op_name")=="read" and S<=int(r["ts"])<=E:
-        out.write(ln)
+records=[json.loads(ln) for ln in open("/tmp/nbr.jsonl")]
+meta=[r for r in records if r.get("event_type")=="capture_meta"]
+drops=[r for r in records if r.get("event_type")=="drops"]
+if not meta or not drops:
+    raise SystemExit("source capture lacks metadata or final drop accounting")
+with open("/tmp/nbr_reads.jsonl","w") as out:
+    out.write(json.dumps(meta[-1])+"\n")
+    for r in records:
+        if (r.get("event_type")=="nvme_cmd" and
+            r.get("op_name")=="read" and S<=int(r["ts"])<=E):
+            out.write(json.dumps(r)+"\n")
+    out.write(json.dumps(drops[-1])+"\n")
 PY
-python3 ../../../examples/replay/mk_dev_iolog.py /tmp/nbr_reads.jsonl /dev/nvme0n1 > nbr.iolog
+python3 ../../../examples/replay/mk_dev_iolog.py \
+  /tmp/nbr_reads.jsonl /dev/source --bundle-dir nbr-replay
+../../../kvio fio-certify nbr-replay
 
 # replay it read-only; capture the replay; grade the two streams
-sudo nvme_tp_monitor --disk nvme0n1 --lba-size 512 --jsonl /tmp/replay.jsonl &
-sudo fio --name=replay --filename=/dev/nvme0n1 --readonly --direct=1 \
-         --ioengine=psync --read_iolog=nbr.iolog
+sudo nvme_tp_monitor --disk nvme0n1 --dur 60 --jsonl /tmp/replay.jsonl &
+monitor_pid=$!
+sleep 1
+sudo KVIO_TARGET=/dev/nvme0n1 fio nbr-replay/replay-block.fio
+wait "$monitor_pid"
+../../../kvio compare dgraphfin:/tmp/nbr_reads.jsonl:/tmp/replay.jsonl
 ```
 
-The iolog holds 240,698 lines of `<ms> /dev/nvme0n1 read <offset> <len>`
-and nothing else — no features, no node ids, no graph. Replaying it
-reproduced the capture at **+0.0% commands, +0.0% bytes, identical size
-mix, 100% of commands at identical offset+size**. That is the whole
-value: a third party runs a confidential GNN, hands you this iolog, and
-you reproduce and visualize its exact device read pattern without ever
-seeing their data. (Command-stream fidelity is validated; fio's v3
-timestamp pacing is not — see `../../../examples/replay/README.md`.)
+The iolog action lines use fio v3 microseconds and contain operation, exact
+byte offset, and byte length. They contain no features, node IDs, or graph
+contents. The historical replay matched rounded command count, total bytes,
+and request-size counts. It did **not** validate ordered offsets, and its old
+exporter compressed timing by 1,000. Repeat the hardware run with the fixed
+bundle and `kvio compare` before claiming ordered-stream or timing fidelity.
+
+Exact offsets and timing still reveal access patterns. Treat this artifact as
+payload-free and data-minimized, not proven anonymous. The sanitization and
+fidelity work left open is listed in `../../kvio/TODO.md`; the precise replay
+guarantees are in `../../../examples/replay/README.md` and `kvio(1)`.
 
 ## Files
 

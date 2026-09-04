@@ -119,6 +119,21 @@ Dependencies
 
 **device safety** The passthrough target is written to. Always confirm the namespace is empty and unmounted (``lsblk``, ``nvme list``) — the OS disk's ``/dev/ng`` is off-limits, and which namespace is empty differs per box.
 
+Build and install
+-----------------
+
+Build the eBPF tools and the vendored LMCache engine, then install the complete
+runtime and its manuals::
+
+   make all
+   make kvio
+   sudo make install
+   man kvio
+
+The install target honors ``prefix``, ``bindir``, ``libexecdir``, ``mandir``,
+and ``DESTDIR``.  It keeps kvio's helper scripts and native modules together
+under libexec and installs the user entry points under bindir.
+
 How to run
 ----------
 
@@ -219,6 +234,32 @@ The exact-replay path is ``record`` → ``iolog`` → ``fio-certify`` → run fi
 while recording again → ``compare``.  The agent path begins one level above
 that: ``trace`` → ``workload``, with ``record`` running alongside it.  ``bench``
 and ``bench-compare`` are a separate controlled-load path.
+
+Privacy and fidelity boundary
+-----------------------------
+
+``kvio record`` captures request metadata without capturing payload bytes,
+prompts, tensors, feature values, graph contents, or KV keys. ``kvio iolog``
+reduces that metadata to operation, exact byte offset, length, and relative
+time. This is **payload-free and data-minimized, not automatically anonymous**:
+offsets reveal locality and address range, timing reveals cadence, and a
+distinctive pattern can identify a workload. The separate
+``nvme_uring_cmd_monitor --kv`` path records ``key_hex`` and needs an
+additional privacy review before publication.
+
+Fidelity has a file gate and a runtime gate. ``kvio iolog`` plus the
+independent Rust ``kvio fio-certify`` check the finite requested stream. A
+second ``kvio record`` capture plus ``kvio compare`` checks the ordered
+operation, offset, and length tuples actually issued by fio and Linux. It also
+reports rebased issue-time error and completion-latency distributions. It does
+not yet pair original and replay completions one by one, and it does not
+measure application end-to-end latency.
+
+The `DGraphFin case study <gnn-readamp.html>`__ shows how the same method
+reveals an architectural reduction in read amplification while omitting graph
+and feature contents. Exact offsets and timing remain sensitive metadata. Open
+sanitization, corrected hardware replay, pacing, concurrency, and latency work
+is tracked in ``tools/kvio/TODO.md`` and summarized in ``kvio(1)``.
 
 Compile real agent traffic
 --------------------------

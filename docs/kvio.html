@@ -391,6 +391,15 @@
   <div class="note warn"><b class="tag">device safety</b> The passthrough target is written to.
     Always confirm the namespace is empty and unmounted (<code>lsblk</code>, <code>nvme list</code>) —
     the OS disk's <code>/dev/ng</code> is off-limits, and which namespace is empty differs per box.</div>
+  <h3>Build and install</h3>
+  <pre><div class="bar"><span class="dot"></span><span class="dot"></span><span class="dot"></span>&nbsp; installed command and manuals</div><code><span class="k">make</span> all
+<span class="k">make</span> kvio
+<span class="k">sudo make</span> install
+<span class="k">man</span> kvio</code></pre>
+  <p>The install target honors <code>prefix</code>, <code>bindir</code>,
+    <code>libexecdir</code>, <code>mandir</code>, and <code>DESTDIR</code>. It keeps kvio's
+    helper scripts and native modules together under libexec and installs the user entry points
+    under bindir.</p>
 </section>
 
 <section id="run">
@@ -485,6 +494,25 @@
     begins one level above that: <code>trace</code> → <code>workload</code>, with
     <code>record</code> running alongside it. <code>bench</code> and
     <code>bench-compare</code> are a separate controlled-load path.</p>
+  <h3>Privacy and fidelity boundary</h3>
+  <p><code>kvio record</code> captures request metadata without capturing payload bytes, prompts,
+    tensors, feature values, graph contents, or KV keys. <code>kvio iolog</code> reduces that to
+    operation, exact byte offset, length, and relative time. This is <strong>payload-free and
+    data-minimized, not automatically anonymous</strong>: offsets reveal locality and address
+    range, timing reveals cadence, and a distinctive pattern can identify a workload. The separate
+    <code>nvme_uring_cmd_monitor --kv</code> path records <code>key_hex</code> and needs an
+    additional privacy review before publication.</p>
+  <p>Fidelity has a file gate and a runtime gate. <code>kvio iolog</code> plus the independent Rust
+    <code>kvio fio-certify</code> check the finite requested stream. A second
+    <code>kvio record</code> capture plus <code>kvio compare</code> checks the ordered operation,
+    offset, and length tuples actually issued by fio and Linux. It reports rebased issue-time error
+    and completion-latency distributions, but does not yet pair original and replay completions one
+    by one or measure application end-to-end latency.</p>
+  <div class="note info"><b class="tag">worked example and open work</b> The
+    <a href="gnn-readamp.html">DGraphFin case study</a> shows an architectural reduction in read
+    amplification without retaining graph or feature contents. Exact offsets and timing remain
+    sensitive metadata. Sanitization, corrected hardware replay, pacing, concurrency, and latency
+    work is tracked in <code>tools/kvio/TODO.md</code> and summarized in <code>kvio(1)</code>.</div>
 </section>
 
 <section id="fio-export">

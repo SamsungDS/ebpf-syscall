@@ -29,7 +29,15 @@ make kvio-ir    # the independent Rust fio-bundle verifier
 make kvio       # the engine: builds the vendored Rust crate -> ./kvio appears
 ./kvio doctor   # verifies the build, python deps, tracers
 ./kvio --help   # the command list
+
+# optional system installation after both builds succeed
+sudo make install
+man kvio
 ```
+
+The install honors `prefix`, `bindir`, `libexecdir`, `mandir`, and `DESTDIR`.
+It installs the supported tracers and replay tools as well as `kvio`. The
+optional NVMe smoke generators remain development tests and are not installed.
 
 `make kvio` needs **cargo** (https://rustup.rs) and python3. The engine-driving
 commands also need the Python deps listed in `vendor/lmcache/PROVENANCE.md`
@@ -83,6 +91,31 @@ The exact-replay path is therefore `record` → `iolog` → `fio-certify` → ru
 fio while recording again → `compare`. The agent path begins one level above
 that: `trace` → `workload`, with `record` running alongside it. `bench` and
 `bench-compare` are a separate controlled-load path.
+
+## Privacy and fidelity boundary
+
+`kvio record` uses `nvme_tp_monitor`, which records device-request metadata
+without recording payload bytes, prompts, tensors, feature values, graph
+contents, or KV keys. `kvio iolog` reduces that to operation, exact byte
+offset, length, and relative time. This is payload-free and data-minimized,
+not automatically anonymous: offsets expose locality and address range, timing
+exposes cadence, and a distinctive pattern can identify a workload. The
+separate `nvme_uring_cmd_monitor --kv` path records `key_hex` and requires an
+additional privacy review before sharing.
+
+Fidelity has two gates. `kvio iolog` and the independent Rust
+`kvio fio-certify` check the finite requested stream before execution. Run fio
+under a second `kvio record` capture and use `kvio compare` to check the
+ordered operation/offset/length tuples actually issued by the runtime. The
+comparison also reports rebased issue-time errors and completion-latency
+distributions. It does not yet pair original and replay completions one by one,
+and it does not measure application end-to-end latency.
+
+The DGraphFin example in `../../docs/gnn-readamp.rst` shows the method: a
+page-aware GNN access pattern reduced `RA_signal` from 431× to 8.6× without the
+published trace carrying graph or feature contents. The remaining sanitizer,
+hardware replay, pacing, concurrency, and latency work is tracked explicitly
+in [`TODO.md`](TODO.md). The installed `kvio(1)` manual summarizes all three.
 
 ## Compile captured agent requests
 

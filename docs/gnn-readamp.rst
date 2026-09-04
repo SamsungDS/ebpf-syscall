@@ -38,7 +38,7 @@ Lay the two on one timeline and the read amplification is not a statistic — it
 The A/B: naive access vs the architectural fix
 ----------------------------------------------
 
-The same features, the same SSD, the same 3.7M-node graph. The only thing that changes is the *access pattern*. **NeighborLoader** samples neighbors and reads each one's page individually. **Page-Aware** batching — a knlp engineering fix — reads pages whole and uses every node on them. That one change cuts device traffic ~50× for the identical GNN signal, and it generalizes to any GNN (or KV cache) that offloads to storage.
+The same features, the same SSD, the same 3.7M-node graph. The only thing that changes is the *access pattern*. **NeighborLoader** samples neighbors and reads each one's page individually. **Page-Aware** batching — a knlp engineering fix — reads pages whole and uses every node on them. That change reduces ``RA_signal`` about 50×, device bytes about 2.3×, and command count about 3.9×. Keep those numbers separate because the page-aware arm also consumes more useful feature bytes. The method generalizes to workloads that offload small useful records inside larger storage units; it does not claim that every GNN or KV cache has this request shape.
 
 .. figure:: img/gnn-readamp-ab.png
    :alt: A/B read amplification of NeighborLoader vs Page-Aware, captured with eBPF
@@ -76,16 +76,17 @@ Drag ``gnn_readamp_dgraphfin_ab.pftrace.gz`` onto `ui.perfetto.dev <https://ui.p
 
 The *useful* curve sitting far below *device* is the amplification. The two device curves coinciding is the honesty check: the eBPF witness and the application's self-report agree, so the huge number is not an artifact of either one.
 
-Capture a confidential workload, share only the shape
------------------------------------------------------
+Capture a confidential workload without capturing payloads
+-----------------------------------------------------------
 
-This is why the capture matters beyond a pretty chart. A device capture — and the fio iolog made from it — carries only IO *shape*: operation, offset, length, timing. No feature values, no node ids, no graph, no keys.
+This is why the capture matters beyond a pretty chart. This device capture — and the fio iolog made from it — carries only IO *shape*: operation, offset, length, timing. No feature values, node ids, graph contents, or keys are recorded by this path.
 
-So a third party can run their **confidential** GNN — real financial-fraud data, private customer graph — capture it with these tracers, and hand back a trace or an iolog that we replay and visualize **without ever seeing their data**. ``mk_dev_iolog.py`` turns the capture into a fio v3 request stream and certifies its ordered operation, offset, and length translation:
+So a third party can run a **confidential** GNN — real financial-fraud data, private customer graph — and use these artifacts to reproduce its device-request shape without disclosing payload bytes. ``mk_dev_iolog.py`` turns the capture into a fio v3 request stream and certifies its ordered operation, offset, and length translation:
 
 ::
 
-   nbr.iolog — 240,698 lines, and nothing but IO shapefio version 3 iolog
+   nbr.iolog — 240,698 lines, and nothing but IO shape
+   fio version 3 iolog
    0 /dev/nvme0n1 add
    0 /dev/nvme0n1 open
    0 /dev/nvme0n1 read 3451445895168 4096
@@ -93,26 +94,30 @@ So a third party can run their **confidential** GNN — real financial-fraud dat
    0 /dev/nvme0n1 read 3451445919744 4096
    ... 240,695 more reads: offset + length + time only ...
 
-Replayed read-only with ``fio --read_iolog --direct=1`` and refereed against the original capture by the old ``compare_streams.py``, the measured command count, bytes, and size histogram were exact:
+Replayed read-only with ``fio --read_iolog --direct=1`` and refereed against the original capture by the old ``compare_streams.py``, the historical run had the following aggregate agreement:
 
 ================= ======== ======= ===========================
-\                 commands bytes   size mix
+run               commands bytes   size mix
 ================= ======== ======= ===========================
 original capture  240,698  1140 MB 4K:208136 8K:28196 12K:3749
 replay from iolog 240,702  1140 MB 4K:208138 8K:28198 12K:3749
-**inflation**     +0.0%    +0.0%   identical
+rounded delta     +0.0%    +0.0%   nearly identical counts
 ================= ======== ======= ===========================
 
-**100% of the original commands reproduced at identical offset and size**, from an artifact that contains none of the data.
+This aggregate result did not establish identical ordered offsets. It shows why a payload-free request-shape artifact is useful, and why the fixed pipeline now checks more than counts and histograms.
 
-**public stand-in** DGraphFin is a *public* dataset; it plays the role of the confidential graph here so the whole pipeline is reproducible. The privacy property is a property of the *method* — the capture and iolog carry only shape — not of this particular dataset.
+**public stand-in** DGraphFin is a *public* dataset; it plays the role of the confidential graph here so the whole pipeline is reproducible. Payload omission is a property of this capture method, not of this particular dataset.
+
+**privacy boundary** Payload-free does not mean anonymous. Exact offsets reveal locality and address range; timing reveals request cadence; device identity and an unusual access pattern can fingerprint a workload. ``nvme_uring_cmd_monitor --kv`` is a different capture path and records ``key_hex``. Review and minimize every artifact before sharing it. A configurable sanitizer remains open work in ``tools/kvio/TODO.md``.
 
 **honest gap** The historical **+0.0%** result covers command count, total bytes,
 and size distribution; the old referee did not compare ordered offsets.  It
 also used an exporter that divided nanoseconds into milliseconds even though
 fio v3 expects microseconds, compressing timing 1,000×.  Both tools are now
 fixed, but this historical run must be repeated before claiming tuple-order or
-timing fidelity.  Fidelity must be judged at the device layer: a *perfect*
+timing fidelity. The new comparison reports rebased issue-time error and
+completion-latency distributions; it does not yet pair each original command's
+latency with its replay. Fidelity must be judged at the device layer: a *perfect*
 file-level operation log can still produce an 8× different device stream
 through the page cache — see the `replay README
 <https://github.com/SamsungDS/ebpf-syscall/blob/main/examples/replay/README.md>`__.
@@ -134,10 +139,15 @@ Full recipe in ``tools/reproduce/gnn-readamp/``. The shape of it:
      --arm "Page-Aware (knlp fix):/tmp/page.jsonl:/tmp/page.phase.txt" \
      -o gnn_readamp_ab.pftrace
 
-   # 3. data-free replay + fidelity referee
-   python3 examples/replay/mk_dev_iolog.py /tmp/nbr_reads.jsonl /dev/nvme0n1 > nbr.iolog
-   sudo fio --name=replay --filename=/dev/nvme0n1 --readonly --direct=1 \
-            --ioengine=psync --read_iolog=nbr.iolog
+   # 3. payload-free replay bundle + independent static check
+   ./kvio iolog /tmp/nbr_reads.jsonl /dev/source --bundle-dir nbr-replay
+   ./kvio fio-certify nbr-replay
+
+   # 4. run read-only, capture again, and grade runtime fidelity
+   sudo ./kvio record --disk nvme0n1 --dur 60 --jsonl /tmp/replay.jsonl &
+   sleep 1
+   sudo KVIO_TARGET=/dev/nvme0n1 fio nbr-replay/replay-block.fio
+   ./kvio compare dgraphfin:/tmp/nbr_reads.jsonl:/tmp/replay.jsonl
 
 Where the pieces live
 ---------------------
@@ -147,4 +157,4 @@ Two trees, one boundary. The **tools and this value showcase live in ebpf-syscal
 - **ebpf-syscall** — the tracer (``nvme_tp_monitor``), the converter (``examples/replay/readamp2perfetto.py``), the replay tools (``mk_dev_iolog.py``, ``compare_streams.py``), the reproduce recipe (``tools/reproduce/gnn-readamp/``), and this page.
 - **kvio-perfetto-gallery** — the draggable ``traces/gnn_readamp_dgraphfin_ab.pftrace.gz`` plus its figure and machine-readable report. A demo artifact; it links back here for the story.
 
-GNN read amplification — capture, visualize, and privacy-preserving replay tools: ``nvme_tp_monitor`` · ``readamp2perfetto.py`` · ``mk_dev_iolog.py``
+GNN read amplification — capture, visualize, and payload-free replay tools: ``nvme_tp_monitor`` · ``readamp2perfetto.py`` · ``mk_dev_iolog.py``
