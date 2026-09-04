@@ -70,6 +70,20 @@ normalized workload JSON, a certificate, and checksums. The certificate proves
 the translation, not fio/kernel/controller conformance or performance equality.
 Always re-record a replay before making an exact device-stream claim.
 
+`make kvio-ir` builds an independent Rust validator. Run
+`./kvio fio-certify BUNDLE` to check the normalized workload hash, iolog hash,
+command count, sequence, timestamp rounding, alignment, and the exact fio
+parse/emit result. Add `--region-bytes` or `--max-transfer-bytes` when those
+limits are known. This validates the requested finite stream; it does not
+validate what fio or the device executed.
+
+Suppose the capture says to read 4096 bytes at byte offset 4096. The matching
+iolog action is `read 4096 4096`. An action of `read 8192 4096` is also valid
+fio syntax, but it reads the next 4096-byte block instead. It is therefore an
+invalid translation of that capture even though fio can execute it. The Rust
+validator compares the operation, offset, and length and rejects the changed
+target before replay.
+
 This work is inspired by the pending fio
 [`iolog-device-record`](https://github.com/mcgrof/fio/tree/iolog-device-record)
 branch. It consumes the same v3 format and adds device-level recording plus

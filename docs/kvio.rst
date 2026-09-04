@@ -160,6 +160,66 @@ How to run
 
 **alignment** Pass ``--lba-bytes`` equal to the ``raw_block`` ``block_align`` (4096), not the device LBA (512) — the projector rounds command tails to that alignment. Mismatched, the geometry looks off by a fraction of a percent; matched, it is exact.
 
+Which command answers which question?
+-------------------------------------
+
+The commands form two different workflows.  Capture and replay preserve an
+observed request stream.  Benchmarking applies controlled sustained pressure;
+it does not recreate a capture.
+
+.. list-table::
+   :header-rows: 1
+
+   * - Command
+     - Input
+     - Result
+     - Device access
+   * - ``kvio plan``
+     - Model and cache geometry
+     - Predict command sizes and counts; no application timing or reuse
+     - No
+   * - ``kvio trace``
+     - An application-level agent trace
+     - Compile observed requests into a cache load/store plan
+     - No
+   * - ``kvio workload``
+     - Model settings or an agent plan
+     - Issue cache loads and stores through LMCache's real storage engine
+     - Yes; may write
+   * - ``kvio record``
+     - A selected NVMe namespace
+     - Observe the commands that actually reach the NVMe driver
+     - Read-only observation
+   * - ``kvio perfetto``
+     - Semantic records plus a device capture
+     - Attribute device commands to cache objects and make a timeline
+     - No
+   * - ``kvio iolog``
+     - A device capture
+     - Export the captured requested stream as a fio replay bundle
+     - No
+   * - ``kvio fio-certify``
+     - A fio replay bundle
+     - Check that the bundle still describes the captured requested stream
+     - No
+   * - ``kvio compare``
+     - Original and replay device captures
+     - Report what fio and the storage stack actually preserved
+     - No
+   * - ``kvio bench``
+     - An evidence-labeled stress profile
+     - Run sustained pressure without claiming capture fidelity
+     - Yes, including writes
+   * - ``kvio bench-compare``
+     - Results from repeated benchmark runs
+     - Compare the median results of two configurations
+     - No
+
+The exact-replay path is ``record`` → ``iolog`` → ``fio-certify`` → run fio
+while recording again → ``compare``.  The agent path begins one level above
+that: ``trace`` → ``workload``, with ``record`` running alongside it.  ``bench``
+and ``bench-compare`` are a separate controlled-load path.
+
 Compile real agent traffic
 --------------------------
 
@@ -272,10 +332,40 @@ keeps global order; object-sharded replay deliberately trades cross-object
 ordering for parallelism while retaining each object's order.  kvio's bundles
 are ordinary fio v3 iologs and interoperate with that work.
 
-The next formal-methods step is a small pure Rust IR for checked alignment,
-MDTS splitting, timestamp conversion, and parser/emitter round trips, with
-property tests and bounded Kani proofs.  The claim should stay narrow:
-workload translation can be machine-checked; performance equivalence cannot.
+The ``kvio-ir`` Rust crate implements checked alignment, transfer splitting,
+timestamp conversion, and fio parser/emitter round trips without device I/O.
+Build it and independently validate the three bundle artifacts::
+
+   make kvio-ir
+   ./kvio fio-certify qwen-agent-replay
+
+The validator checks ``workload.json``, ``commands.iolog``, and
+``certificate.json`` against each other.  Pass ``--region-bytes`` or
+``--max-transfer-bytes`` to check a known device bound or transfer limit.  This
+is exhaustive validation of one finite bundle, not a proof of fio or device
+runtime behavior.
+
+For example, suppose the capture says to read 4096 bytes starting at byte
+offset 4096.  Offsets start at zero, so this is the second 4096-byte block.  Its
+fio action must be::
+
+   0 /dev/source read 4096 4096
+
+The line ``0 /dev/source read 8192 4096`` is also valid fio syntax and is still
+4096-byte aligned, but it reads the third block.  It is therefore an invalid
+translation of that capture: the replay targets a different device region,
+changes the spatial access pattern, and can map to a different KV-cache object.
+``kvio fio-certify`` rejects the mismatch before fio runs.
+
+``make kvio-ir-test`` runs ordinary and property tests.  The crate includes
+bounded Kani harnesses for timestamp rounding, logical-block multiplication,
+alignment overflow, and gap-free transfer splitting.  Run them with
+``make kvio-ir-kani``.  Their presence alone is not a completed Kani proof; the
+target must finish successfully before making that claim.  Even then, the
+claim stays narrow: workload translation can be machine-checked; performance
+equivalence cannot.  Rust string formatting and parsing are covered by
+generated round-trip tests and the exhaustive check of each bundle, not by
+Kani.
 
 ``kvio bench``: sustained storage pressure
 ------------------------------------------
