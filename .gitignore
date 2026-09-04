@@ -21,5 +21,6 @@ docs/_build/
 /kvio
 tools/kvio/build/
 tools/kvio/vendor/lmcache/rust/raw_block/target/
+tools/kvio/rust/kvio-ir/target/
 __pycache__/
 tools/kvio/vendor/lmcache/lmcache/lmcache_native*.so
