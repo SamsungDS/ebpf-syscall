@@ -16,6 +16,7 @@ translation-certified and device behavior is checked by re-recording.
     ./kvio record ...    # capture the device command stream (nvme_tp_monitor)
     ./kvio perfetto ...  # attribute + convert to a Perfetto trace
     ./kvio iolog ...     # device capture -> certified fio v3 replay bundle
+    ./kvio fio-certify   # independently validate a bundle in Rust
     ./kvio compare ...   # grade a replay against its capture
     ./kvio bench ...     # run sustained kvspill-derived fio workloads
     ./kvio bench-compare # compare median results from two bench runs
@@ -63,6 +64,8 @@ COMMANDS = {
                      "semantic JSONL -> replay manifest", False),
     "iolog":        ("examples/replay/mk_dev_iolog.py",
                      "device capture -> certified fio v3 replay bundle", False),
+    "fio-certify":  ("tools/kvio/build/kvio-ir",
+                     "validate a fio replay bundle with the Rust IR", False),
     "compare":      ("examples/replay/compare_streams.py",
                      "grade a fio replay against its capture at the NVMe layer", False),
     # proofs / probes (engine)
@@ -117,6 +120,9 @@ def doctor():
     check("Rust engine built (lmcache_rust_raw_block_io.so)",
           os.path.isfile(os.path.join(BUILD, "lmcache_rust_raw_block_io.so")),
           "run `make kvio` (needs cargo; build on a real box)")
+    check("Rust fio verifier built (kvio-ir)",
+          os.path.isfile(os.path.join(BUILD, "kvio-ir")),
+          "run `make kvio-ir`")
 
     # python deps from PROVENANCE: first fenced block = required, second =
     # optional (try-guarded upstream; absence tolerated -- warn only)
@@ -193,6 +199,16 @@ def main():
             os.execv(target, [target] + rest)
         except OSError as e:
             sys.stderr.write(f"kvio record: cannot exec {rel}: {e}\n")
+            return 1
+    if cmd == "fio-certify":
+        if not os.path.isfile(target):
+            sys.stderr.write("kvio fio-certify: verifier not built -- "
+                             "run `make kvio-ir`\n")
+            return 1
+        try:
+            os.execv(target, [target, "certify"] + rest)
+        except OSError as e:
+            sys.stderr.write(f"kvio fio-certify: cannot exec {rel}: {e}\n")
             return 1
     if not os.path.isfile(target):
         sys.stderr.write(f"kvio {cmd}: missing {rel}\n")

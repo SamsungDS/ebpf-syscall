@@ -237,6 +237,7 @@ def write_bundle(directory: str, iolog: str,
             "The block job may be merged or split again by Linux. The uring-cmd job\n"
             "targets NVMe passthrough. Re-record either run before claiming that the\n"
             "device received the same stream. Performance equivalence is not claimed.\n"
+            "Run `kvio fio-certify .` for an independent Rust validation.\n"
         ),
     }
     for name, content in artifacts.items():

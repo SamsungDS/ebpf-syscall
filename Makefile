@@ -43,7 +43,7 @@ NVME_TARGET  = nvme_uring_cmd_monitor
 NVME_BPF_OBJ = nvme_uring_cmd_monitor.bpf.o
 NVME_SKEL    = nvme_uring_cmd_monitor.skel.h
 
-.PHONY: all clean setup kvio kvio-test
+.PHONY: all clean setup kvio kvio-ir kvio-ir-test kvio-ir-kani kvio-test
 
 all: setup $(TARGET) $(MMAP_TARGET) $(IOU_TARGET) $(NVME_TARGET) $(NVMETP_TARGET) $(REPLAYER_TARGET)
 
@@ -132,8 +132,10 @@ nvme_kv_smoke: nvme_kv_smoke.c
 KVIO_DIR   = tools/kvio
 KVIO_CRATE = $(KVIO_DIR)/vendor/lmcache/rust/raw_block
 KVIO_SO    = $(KVIO_DIR)/build/lmcache_rust_raw_block_io.so
+KVIO_IR_CRATE = $(KVIO_DIR)/rust/kvio-ir
+KVIO_IR_BIN   = $(KVIO_DIR)/build/kvio-ir
 
-kvio:
+kvio: kvio-ir
 	@command -v cargo >/dev/null 2>&1 || { \
 		echo "ERROR: cargo not found -- kvio's engine is a Rust pyo3 module."; \
 		echo "Install rust (https://rustup.rs) and re-run 'make kvio'."; \
@@ -148,7 +150,29 @@ kvio:
 	@ln -sf $(KVIO_DIR)/kvio kvio
 	@echo "kvio built: ./kvio -- try './kvio doctor' then './kvio --help'"
 
-kvio-test:
+kvio-ir:
+	@command -v cargo >/dev/null 2>&1 || { \
+		echo "ERROR: cargo not found -- kvio-ir is a Rust crate."; \
+		exit 1; }
+	cargo build --release --locked --manifest-path $(KVIO_IR_CRATE)/Cargo.toml
+	@mkdir -p $(KVIO_DIR)/build
+	cp $(KVIO_IR_CRATE)/target/release/kvio-ir $(KVIO_IR_BIN)
+	@ln -sf $(KVIO_DIR)/kvio kvio
+	@echo "kvio fio verifier built: $(KVIO_IR_BIN)"
+
+kvio-ir-test:
+	cargo fmt --check --manifest-path $(KVIO_IR_CRATE)/Cargo.toml
+	cargo clippy --locked --all-targets --manifest-path $(KVIO_IR_CRATE)/Cargo.toml -- -D warnings
+	cargo test --locked --manifest-path $(KVIO_IR_CRATE)/Cargo.toml
+
+kvio-ir-kani:
+	@command -v cargo-kani >/dev/null 2>&1 || { \
+		echo "ERROR: cargo-kani not found; install and set it up first."; \
+		echo "See https://model-checking.github.io/kani/install-guide.html"; \
+		exit 1; }
+	cargo kani --output-format=terse --manifest-path $(KVIO_IR_CRATE)/Cargo.toml
+
+kvio-test: kvio-ir kvio-ir-test
 	@python3 -m py_compile tools/kvio/*.py
 	@python3 -m unittest discover -s tests -p 'test_kvio*.py' -v
 
@@ -186,7 +210,7 @@ clean:
 	rm -f $(NVME_TARGET) $(NVME_BPF_OBJ) $(NVME_SKEL)
 	rm -f $(NVMETP_TARGET) $(NVMETP_BPF_OBJ) $(NVMETP_SKEL) nvme_uring_cmd_smoke nvme_kv_smoke
 	rm -f kvio
-	rm -rf $(KVIO_DIR)/build $(KVIO_CRATE)/target
+	rm -rf $(KVIO_DIR)/build $(KVIO_CRATE)/target $(KVIO_IR_CRATE)/target
 	rm -f $(KVIO_DIR)/vendor/lmcache/lmcache/lmcache_native*.so
 	rm -rf $(LIBBPF_DIR)
 
@@ -194,6 +218,9 @@ help:
 	@echo "Available targets:"
 	@echo "  all          - Build the complete project"
 	@echo "  kvio         - Build the kvio tool (vendored Rust engine; needs cargo)"
+	@echo "  kvio-ir      - Build the Rust fio translation verifier"
+	@echo "  kvio-ir-test - Format, lint, and test the Rust verifier"
+	@echo "  kvio-ir-kani - Run bounded Kani proofs for the Rust verifier"
 	@echo "  install-deps - Install system dependencies"
 	@echo "  setup        - Setup libbpf and check tools"
 	@echo "  kvio-test    - Run kvio unit tests"

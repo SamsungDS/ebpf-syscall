@@ -17,6 +17,7 @@ COMPARE_PATH = ROOT / "examples" / "replay" / "compare_streams.py"
 COMPARE_SPEC = importlib.util.spec_from_file_location("compare_streams", COMPARE_PATH)
 COMPARE = importlib.util.module_from_spec(COMPARE_SPEC)
 COMPARE_SPEC.loader.exec_module(COMPARE)
+VERIFIER = ROOT / "tools" / "kvio" / "build" / "kvio-ir"
 
 
 def write_capture(path, rows, *, lba=4096, drops=0):
@@ -129,6 +130,42 @@ class IologTest(unittest.TestCase):
                 "cmd_type=nvme\n",
                 (bundle / "replay-uring-cmd.fio").read_text(encoding="utf-8"),
             )
+
+    @unittest.skipUnless(VERIFIER.is_file(), "build verifier with make kvio-ir")
+    def test_rust_verifier_checks_python_bundle(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            capture = root / "capture.jsonl"
+            write_capture(capture, [
+                {"event_type": "nvme_cmd", "seq": 0, "ts": 1_000_000_000,
+                 "op_name": "read", "slba": 0, "bytes": 4096},
+            ])
+            rows, metadata = MODULE.load_capture(str(capture))
+            iolog = MODULE.emit_iolog(rows, "/dev/source")
+            certificate, normalized = MODULE.translation_certificate(
+                rows, iolog, str(capture), metadata)
+            bundle = root / "bundle"
+            MODULE.write_bundle(str(bundle), iolog, certificate, normalized)
+            result = subprocess.run(
+                [str(VERIFIER), "certify", str(bundle)],
+                text=True, capture_output=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            rust_certificate = json.loads(result.stdout)
+            self.assertTrue(rust_certificate[
+                "operation_offset_length_sequence_equal"])
+            self.assertTrue(rust_certificate["source_capture_complete"])
+            self.assertFalse(rust_certificate[
+                "performance_equivalence_claimed"])
+            iolog_path = bundle / "commands.iolog"
+            iolog_path.write_text(
+                iolog_path.read_text(encoding="utf-8").replace(
+                    "read 0 4096", "read 4096 4096"),
+                encoding="utf-8")
+            tampered = subprocess.run(
+                [str(VERIFIER), "certify", str(bundle)],
+                text=True, capture_output=True)
+            self.assertNotEqual(tampered.returncode, 0)
+            self.assertIn("iolog hash disagrees", tampered.stderr)
 
 
 if __name__ == "__main__":
