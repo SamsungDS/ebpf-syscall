@@ -1,6 +1,14 @@
 CC = gcc
 ARCH = $(shell uname -m | sed 's/x86_64/x86/' | sed 's/aarch64/arm64/')
 
+prefix      ?= /usr/local
+exec_prefix ?= $(prefix)
+bindir      ?= $(exec_prefix)/bin
+libexecdir  ?= $(exec_prefix)/libexec
+datarootdir ?= $(prefix)/share
+mandir      ?= $(datarootdir)/man
+INSTALL     ?= install
+
 # Use system libbpf if available (libbpf-dev >= 1.0), else fall back to
 # building from source in ./libbpf/
 LIBBPF_SYSTEM := $(shell pkg-config --exists libbpf 2>/dev/null && echo yes || echo no)
@@ -43,7 +51,8 @@ NVME_TARGET  = nvme_uring_cmd_monitor
 NVME_BPF_OBJ = nvme_uring_cmd_monitor.bpf.o
 NVME_SKEL    = nvme_uring_cmd_monitor.skel.h
 
-.PHONY: all clean setup kvio kvio-ir kvio-ir-test kvio-ir-kani kvio-test
+.PHONY: all clean setup kvio kvio-ir kvio-ir-test kvio-ir-kani kvio-test \
+	install install-tools install-kvio install-kvio-man install-man
 
 all: setup $(TARGET) $(MMAP_TARGET) $(IOU_TARGET) $(NVME_TARGET) $(NVMETP_TARGET) $(REPLAYER_TARGET)
 
@@ -134,6 +143,14 @@ KVIO_CRATE = $(KVIO_DIR)/vendor/lmcache/rust/raw_block
 KVIO_SO    = $(KVIO_DIR)/build/lmcache_rust_raw_block_io.so
 KVIO_IR_CRATE = $(KVIO_DIR)/rust/kvio-ir
 KVIO_IR_BIN   = $(KVIO_DIR)/build/kvio-ir
+KVIO_NATIVE_SO = $(firstword $(wildcard \
+	$(KVIO_DIR)/vendor/lmcache/lmcache/lmcache_native*.so))
+KVIO_TRACER = $(NVMETP_TARGET)
+
+INSTALL_PROGRAMS = $(TARGET) $(REPLAYER_TARGET) $(MMAP_TARGET) \
+	$(IOU_TARGET) $(NVME_TARGET) $(NVMETP_TARGET)
+KVIO_INSTALL_ROOT = $(libexecdir)/ebpf-syscall
+MANPAGES = $(wildcard man/*.1)
 
 kvio: kvio-ir
 	@command -v cargo >/dev/null 2>&1 || { \
@@ -175,6 +192,108 @@ kvio-ir-kani:
 kvio-test: kvio-ir kvio-ir-test
 	@python3 -m py_compile tools/kvio/*.py
 	@python3 -m unittest discover -s tests -p 'test_kvio*.py' -v
+
+# kvio resolves its helpers relative to its launcher. Keep that source-like
+# layout under libexec and expose only the launcher through bindir.
+install: install-tools install-kvio install-man
+
+install-tools:
+	@for program in $(INSTALL_PROGRAMS); do \
+		test -x "$$program" || { \
+			echo "ERROR: $$program is not built; run 'make all' first."; \
+			exit 1; \
+		}; \
+	done
+	$(INSTALL) -d "$(DESTDIR)$(bindir)"
+	@for program in $(INSTALL_PROGRAMS); do \
+		$(INSTALL) -m 755 "$$program" \
+			"$(DESTDIR)$(bindir)/$$(basename "$$program")"; \
+	done
+
+install-kvio: install-kvio-man
+	@test -x "$(KVIO_DIR)/kvio" || { \
+		echo "ERROR: kvio launcher is missing."; exit 1; \
+	}
+	@test -f "$(KVIO_SO)" || { \
+		echo "ERROR: $(KVIO_SO) is missing; run 'make kvio' first."; \
+		exit 1; \
+	}
+	@test -x "$(KVIO_IR_BIN)" || { \
+		echo "ERROR: $(KVIO_IR_BIN) is missing; run 'make kvio' first."; \
+		exit 1; \
+	}
+	@test -n "$(KVIO_NATIVE_SO)" -a -f "$(KVIO_NATIVE_SO)" || { \
+		echo "ERROR: LMCache native module is missing; run 'make kvio' first."; \
+		exit 1; \
+	}
+	@test -x "$(KVIO_TRACER)" || { \
+		echo "ERROR: $(NVMETP_TARGET) is not built; run 'make all' first."; \
+		exit 1; \
+	}
+	$(INSTALL) -d "$(DESTDIR)$(bindir)" \
+		"$(DESTDIR)$(KVIO_INSTALL_ROOT)/tools/kvio/build" \
+		"$(DESTDIR)$(KVIO_INSTALL_ROOT)/tools/kvio/vendor/lmcache" \
+		"$(DESTDIR)$(KVIO_INSTALL_ROOT)/examples/lmcache" \
+		"$(DESTDIR)$(KVIO_INSTALL_ROOT)/examples/replay"
+	$(INSTALL) -m 755 "$(KVIO_DIR)/kvio" \
+		"$(DESTDIR)$(KVIO_INSTALL_ROOT)/tools/kvio/kvio"
+	$(INSTALL) -m 644 tools/__init__.py \
+		"$(DESTDIR)$(KVIO_INSTALL_ROOT)/tools/__init__.py"
+	@for file in $(wildcard $(KVIO_DIR)/*.py); do \
+		$(INSTALL) -m 644 "$$file" \
+			"$(DESTDIR)$(KVIO_INSTALL_ROOT)/tools/kvio/$$(basename "$$file")"; \
+	done
+	@for file in $(KVIO_DIR)/modelconfig.json $(KVIO_DIR)/NOTICE \
+		$(KVIO_DIR)/README.md; do \
+		$(INSTALL) -m 644 "$$file" \
+			"$(DESTDIR)$(KVIO_INSTALL_ROOT)/tools/kvio/$$(basename "$$file")"; \
+	done
+	@for file in examples/lmcache/*.py; do \
+		$(INSTALL) -m 644 "$$file" \
+			"$(DESTDIR)$(KVIO_INSTALL_ROOT)/examples/lmcache/$$(basename "$$file")"; \
+	done
+	@for file in examples/replay/*.py; do \
+		$(INSTALL) -m 644 "$$file" \
+			"$(DESTDIR)$(KVIO_INSTALL_ROOT)/examples/replay/$$(basename "$$file")"; \
+	done
+	$(INSTALL) -m 644 examples/replay/README.md \
+		"$(DESTDIR)$(KVIO_INSTALL_ROOT)/examples/replay/README.md"
+	@cd "$(KVIO_DIR)/vendor/lmcache" && \
+		find lmcache -type d -print | while IFS= read -r dir; do \
+			$(INSTALL) -d \
+				"$(DESTDIR)$(KVIO_INSTALL_ROOT)/tools/kvio/vendor/lmcache/$$dir"; \
+		done && \
+		find lmcache -type f -name '*.py' -print | while IFS= read -r file; do \
+			$(INSTALL) -m 644 "$$file" \
+				"$(DESTDIR)$(KVIO_INSTALL_ROOT)/tools/kvio/vendor/lmcache/$$file"; \
+		done
+	$(INSTALL) -m 644 "$(KVIO_DIR)/vendor/lmcache/LICENSE" \
+		"$(KVIO_DIR)/vendor/lmcache/PROVENANCE.md" \
+		"$(DESTDIR)$(KVIO_INSTALL_ROOT)/tools/kvio/vendor/lmcache/"
+	$(INSTALL) -m 755 "$(KVIO_SO)" "$(KVIO_IR_BIN)" \
+		"$(DESTDIR)$(KVIO_INSTALL_ROOT)/tools/kvio/build/"
+	$(INSTALL) -m 755 "$(KVIO_NATIVE_SO)" \
+		"$(DESTDIR)$(KVIO_INSTALL_ROOT)/tools/kvio/vendor/lmcache/lmcache/"
+	$(INSTALL) -m 755 "$(KVIO_TRACER)" \
+		"$(DESTDIR)$(KVIO_INSTALL_ROOT)/$(NVMETP_TARGET)"
+	ln -sfn "$(KVIO_INSTALL_ROOT)/tools/kvio/kvio" \
+		"$(DESTDIR)$(bindir)/kvio"
+
+install-kvio-man:
+	@if test -f man/kvio.1; then \
+		$(INSTALL) -d "$(DESTDIR)$(mandir)/man1"; \
+		$(INSTALL) -m 644 man/kvio.1 \
+			"$(DESTDIR)$(mandir)/man1/kvio.1"; \
+	fi
+
+install-man:
+	@if test -n "$(MANPAGES)"; then \
+		$(INSTALL) -d "$(DESTDIR)$(mandir)/man1"; \
+		for page in $(MANPAGES); do \
+			$(INSTALL) -m 644 "$$page" \
+				"$(DESTDIR)$(mandir)/man1/$$(basename "$$page")"; \
+		done; \
+	fi
 
 vmlinux.h:
 	@echo "Generating vmlinux.h from running kernel..."
@@ -221,6 +340,9 @@ help:
 	@echo "  kvio-ir      - Build the Rust fio translation verifier"
 	@echo "  kvio-ir-test - Format, lint, and test the Rust verifier"
 	@echo "  kvio-ir-kani - Run bounded Kani proofs for the Rust verifier"
+	@echo "  install      - Install built tools, kvio, and manual pages"
+	@echo "  install-kvio - Install kvio and its manual page"
+	@echo "  install-man  - Install all available manual pages"
 	@echo "  install-deps - Install system dependencies"
 	@echo "  setup        - Setup libbpf and check tools"
 	@echo "  kvio-test    - Run kvio unit tests"
