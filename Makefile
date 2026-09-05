@@ -51,9 +51,9 @@ NVME_TARGET  = nvme_uring_cmd_monitor
 NVME_BPF_OBJ = nvme_uring_cmd_monitor.bpf.o
 NVME_SKEL    = nvme_uring_cmd_monitor.skel.h
 
-.PHONY: all clean setup kvio kvio-ir kvio-ir-test kvio-ir-kani kvio-test \
-	install install-tools install-kvio install-kvio-man install-man \
-	install-tool-man
+.PHONY: all clean setup kvio kvio-ir kvio-ir-offline kvio-ir-test \
+	kvio-ir-kani kvio-test kvio-offline install install-tools install-kvio \
+	install-kvio-offline install-kvio-man install-man install-tool-man
 
 all: setup $(TARGET) $(MMAP_TARGET) $(IOU_TARGET) $(NVME_TARGET) $(NVMETP_TARGET) $(REPLAYER_TARGET)
 
@@ -147,6 +147,14 @@ KVIO_IR_BIN   = $(KVIO_DIR)/build/kvio-ir
 KVIO_NATIVE_SO = $(firstword $(wildcard \
 	$(KVIO_DIR)/vendor/lmcache/lmcache/lmcache_native*.so))
 KVIO_TRACER = $(NVMETP_TARGET)
+KVIO_OFFLINE_PY = $(KVIO_DIR)/__init__.py $(KVIO_DIR)/release.py
+KVIO_OFFLINE_REPLAY_PY = examples/replay/capture_format.py \
+	examples/replay/mk_dev_iolog.py examples/replay/compare_streams.py
+KVIO_OFFLINE_DOCS = $(KVIO_DIR)/NOTICE $(KVIO_DIR)/README.md \
+	$(KVIO_DIR)/PRIVACY.md $(KVIO_DIR)/TODO.md \
+	$(KVIO_DIR)/OFFLINE-PROVENANCE.md \
+	$(KVIO_DIR)/bank-local-result.example.json \
+	$(KVIO_DIR)/offline-capture-v1.example.jsonl
 
 INSTALL_PROGRAMS = $(TARGET) $(REPLAYER_TARGET) $(MMAP_TARGET) \
 	$(IOU_TARGET) $(NVME_TARGET) $(NVMETP_TARGET)
@@ -178,6 +186,21 @@ kvio-ir:
 	cp $(KVIO_IR_CRATE)/target/release/kvio-ir $(KVIO_IR_BIN)
 	@ln -sf $(KVIO_DIR)/kvio kvio
 	@echo "kvio fio verifier built: $(KVIO_IR_BIN)"
+
+kvio-ir-offline:
+	@command -v cargo >/dev/null 2>&1 || { \
+		echo "ERROR: cargo not found -- kvio-ir is a Rust crate."; \
+		exit 1; \
+	}
+	cargo build --offline --release --locked --manifest-path $(KVIO_IR_CRATE)/Cargo.toml
+	@mkdir -p $(KVIO_DIR)/build
+	cp $(KVIO_IR_CRATE)/target/release/kvio-ir $(KVIO_IR_BIN)
+	@ln -sf $(KVIO_DIR)/kvio kvio
+	@echo "kvio fio verifier built without network access: $(KVIO_IR_BIN)"
+
+kvio-offline: kvio-ir-offline $(KVIO_TRACER)
+	@ln -sf $(KVIO_DIR)/kvio kvio
+	@echo "kvio offline tools built: ./kvio -- try './kvio doctor'"
 
 kvio-ir-test:
 	cargo fmt --check --manifest-path $(KVIO_IR_CRATE)/Cargo.toml
@@ -247,8 +270,9 @@ install-kvio: install-kvio-man
 	done
 	@for file in $(KVIO_DIR)/modelconfig.json $(KVIO_DIR)/NOTICE \
 		$(KVIO_DIR)/README.md $(KVIO_DIR)/PRIVACY.md \
-		$(KVIO_DIR)/TODO.md \
-		$(KVIO_DIR)/bank-local-result.example.json; do \
+		$(KVIO_DIR)/TODO.md $(KVIO_DIR)/OFFLINE-PROVENANCE.md \
+		$(KVIO_DIR)/bank-local-result.example.json \
+		$(KVIO_DIR)/offline-capture-v1.example.jsonl; do \
 		$(INSTALL) -m 644 "$$file" \
 			"$(DESTDIR)$(KVIO_INSTALL_ROOT)/tools/kvio/$$(basename "$$file")"; \
 	done
@@ -278,6 +302,47 @@ install-kvio: install-kvio-man
 		"$(DESTDIR)$(KVIO_INSTALL_ROOT)/tools/kvio/build/"
 	$(INSTALL) -m 755 "$(KVIO_NATIVE_SO)" \
 		"$(DESTDIR)$(KVIO_INSTALL_ROOT)/tools/kvio/vendor/lmcache/lmcache/"
+	$(INSTALL) -m 755 "$(KVIO_TRACER)" \
+		"$(DESTDIR)$(KVIO_INSTALL_ROOT)/$(NVMETP_TARGET)"
+	ln -sfn "$(KVIO_INSTALL_ROOT)/tools/kvio/kvio" \
+		"$(DESTDIR)$(bindir)/kvio"
+
+# Install one kvio entry point with only the payload-free capture, fio
+# translation, independent verifier, comparison, and bounded-result paths.
+# This package deliberately excludes LMCache, PyTorch, model data, and all
+# engine-driving commands.
+install-kvio-offline: install-kvio-man
+	@test ! -e "$(DESTDIR)$(KVIO_INSTALL_ROOT)" || { \
+		echo "ERROR: offline package root exists; use an empty staging root."; \
+		exit 1; \
+	}
+	@test -x "$(KVIO_DIR)/kvio" || { \
+		echo "ERROR: kvio launcher is missing."; exit 1; \
+	}
+	@test -x "$(KVIO_IR_BIN)" || { \
+		echo "ERROR: $(KVIO_IR_BIN) is missing; run 'make kvio-ir' first."; \
+		exit 1; \
+	}
+	@test -x "$(KVIO_TRACER)" || { \
+		echo "ERROR: $(NVMETP_TARGET) is not built; run 'make all' first."; \
+		exit 1; \
+	}
+	$(INSTALL) -d "$(DESTDIR)$(bindir)" \
+		"$(DESTDIR)$(KVIO_INSTALL_ROOT)/tools/kvio/build" \
+		"$(DESTDIR)$(KVIO_INSTALL_ROOT)/examples/replay"
+	$(INSTALL) -m 755 "$(KVIO_DIR)/kvio" \
+		"$(DESTDIR)$(KVIO_INSTALL_ROOT)/tools/kvio/kvio"
+	$(INSTALL) -m 644 tools/__init__.py \
+		"$(DESTDIR)$(KVIO_INSTALL_ROOT)/tools/__init__.py"
+	$(INSTALL) -m 644 $(KVIO_OFFLINE_PY) \
+		"$(DESTDIR)$(KVIO_INSTALL_ROOT)/tools/kvio/"
+	$(INSTALL) -m 644 $(KVIO_OFFLINE_REPLAY_PY) \
+		examples/replay/README.md \
+		"$(DESTDIR)$(KVIO_INSTALL_ROOT)/examples/replay/"
+	$(INSTALL) -m 644 $(KVIO_OFFLINE_DOCS) LICENSE \
+		"$(DESTDIR)$(KVIO_INSTALL_ROOT)/tools/kvio/"
+	$(INSTALL) -m 755 "$(KVIO_IR_BIN)" \
+		"$(DESTDIR)$(KVIO_INSTALL_ROOT)/tools/kvio/build/kvio-ir"
 	$(INSTALL) -m 755 "$(KVIO_TRACER)" \
 		"$(DESTDIR)$(KVIO_INSTALL_ROOT)/$(NVMETP_TARGET)"
 	ln -sfn "$(KVIO_INSTALL_ROOT)/tools/kvio/kvio" \
@@ -343,11 +408,14 @@ help:
 	@echo "Available targets:"
 	@echo "  all          - Build the complete project"
 	@echo "  kvio         - Build the kvio tool (vendored Rust engine; needs cargo)"
+	@echo "  kvio-offline - Build capture, fio, verifier, and result tools only"
 	@echo "  kvio-ir      - Build the Rust fio translation verifier"
+	@echo "  kvio-ir-offline - Build the verifier with Cargo network disabled"
 	@echo "  kvio-ir-test - Format, lint, and test the Rust verifier"
 	@echo "  kvio-ir-kani - Run bounded Kani proofs for the Rust verifier"
 	@echo "  install      - Install built tools, kvio, and manual pages"
 	@echo "  install-kvio - Install kvio and its manual page"
+	@echo "  install-kvio-offline - Install kvio without LMCache or PyTorch"
 	@echo "  install-man  - Install all available manual pages"
 	@echo "  install-deps - Install system dependencies"
 	@echo "  setup        - Setup libbpf and check tools"

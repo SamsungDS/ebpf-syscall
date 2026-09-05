@@ -1,0 +1,4 @@
+{"event_type":"capture_meta","schema_version":1,"emitter":"nvme_tp_monitor","disk_filter":true,"disk":"fixture0","lba_bytes":512}
+{"event_type":"nvme_cmd","seq":0,"ts":1000000,"op_name":"read","slba":8,"bytes":4096,"disk":"fixture0","nsid":1}
+{"event_type":"nvme_cmd","seq":1,"ts":1012500,"op_name":"read","slba":24,"bytes":8192,"disk":"fixture0","nsid":1}
+{"event_type":"drops","dropped":0}

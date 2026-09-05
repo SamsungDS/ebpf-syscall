@@ -34,6 +34,7 @@ HERE = os.path.dirname(os.path.realpath(__file__))
 TOP = os.path.dirname(os.path.dirname(HERE))
 VENDOR = os.path.join(HERE, "vendor", "lmcache")
 BUILD = os.path.join(HERE, "build")
+OFFLINE_INSTALL = not os.path.isdir(VENDOR)
 
 # Imports for in-tree subcommands must work both through the generated ./kvio
 # symlink and when this launcher is invoked at tools/kvio/kvio.
@@ -83,15 +84,20 @@ COMMANDS = {
 
 def usage(out=sys.stdout):
     out.write(__doc__.split("\n\n")[0] + "\n\nCommands:\n")
-    for name, (_, help_line, engine) in COMMANDS.items():
+    for name, (relative_path, help_line, engine) in COMMANDS.items():
+        if OFFLINE_INSTALL and not os.path.isfile(
+                os.path.join(TOP, relative_path)):
+            continue
         tag = " [engine]" if engine else ""
         out.write(f"  {name:<15} {help_line}{tag}\n")
     out.write("  doctor          check the build, python deps, and tracers\n")
-    out.write("  bench           run kvspill-derived storage-tier workloads\n")
-    out.write("  bench-compare   compare medians from two bench logs\n")
-    out.write("  release-build  build a bounded, unsigned result candidate\n")
-    out.write("  release-example print the canonical result draft\n")
-    out.write("  release-verify check candidate format and manifest only\n")
+    if not OFFLINE_INSTALL or os.path.isfile(os.path.join(HERE, "bench.py")):
+        out.write("  bench           run kvspill-derived storage-tier workloads\n")
+        out.write("  bench-compare   compare medians from two bench logs\n")
+    if not OFFLINE_INSTALL or os.path.isfile(os.path.join(HERE, "release.py")):
+        out.write("  release-build  build a bounded, unsigned result candidate\n")
+        out.write("  release-example print the canonical result draft\n")
+        out.write("  release-verify check candidate format and manifest only\n")
     out.write("\n[engine] commands use the vendored LMCache raw_block engine: "
               "run `make kvio` first.\nSee tools/kvio/README.md.\n")
 
@@ -116,6 +122,28 @@ def doctor():
         ok = ok and good
 
     print("kvio doctor:")
+    if OFFLINE_INSTALL:
+        print("  [note] minimal offline install: engine commands are absent")
+        check("capture parser and fio exporter present",
+              os.path.isfile(os.path.join(
+                  TOP, "examples/replay/capture_format.py")) and
+              os.path.isfile(os.path.join(
+                  TOP, "examples/replay/mk_dev_iolog.py")),
+              "reinstall with `make install-kvio-offline`")
+        check("bounded result builder present",
+              os.path.isfile(os.path.join(HERE, "release.py")),
+              "reinstall with `make install-kvio-offline`")
+        check("Rust fio verifier present",
+              os.path.isfile(os.path.join(BUILD, "kvio-ir")),
+              "reinstall with `make install-kvio-offline`")
+        check("tracer present: nvme_tp_monitor",
+              os.path.isfile(os.path.join(TOP, "nvme_tp_monitor")),
+              "reinstall with `make install-kvio-offline`")
+        import shutil as _sh
+        check("fio present for replay", _sh.which("fio") is not None,
+              "install fio")
+        print("doctor:", "all good" if ok else "problems found")
+        return 0 if ok else 1
     if os.environ.get("KVIO_USE_SYSTEM_LMCACHE") == "1":
         print("  [note] KVIO_USE_SYSTEM_LMCACHE=1: engine checks run against "
               "the installed LMCache, not the vendor")
@@ -186,9 +214,20 @@ def main():
     if cmd == "doctor":
         return doctor()
     if cmd == "bench":
+        if OFFLINE_INSTALL and not os.path.isfile(
+                os.path.join(HERE, "bench.py")):
+            sys.stderr.write(
+                "kvio bench: unavailable in the minimal offline install\n")
+            return 1
         from tools.kvio.bench import main as bench_main
         return bench_main(rest)
     if cmd == "bench-compare":
+        if OFFLINE_INSTALL and not os.path.isfile(
+                os.path.join(HERE, "compare.py")):
+            sys.stderr.write(
+                "kvio bench-compare: unavailable in the minimal "
+                "offline install\n")
+            return 1
         from tools.kvio.compare import main as compare_main
         return compare_main(rest)
     if cmd in ("release-build", "release-example", "release-verify"):
