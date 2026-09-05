@@ -39,6 +39,40 @@ The install honors `prefix`, `bindir`, `libexecdir`, `mandir`, and `DESTDIR`.
 It installs the supported tracers and replay tools as well as `kvio`. The
 optional NVMe smoke generators remain development tests and are not installed.
 
+For a trace-owning environment that does not need model projection or the
+LMCache engine, build and install the smaller offline package:
+
+```bash
+make kvio-offline
+sudo make install-kvio-offline
+kvio doctor
+```
+
+This is still the same `kvio` command. It installs only `record`, `iolog`,
+`fio-certify`, `compare`, the three `release-*` commands, and `doctor`. It omits
+LMCache, PyTorch, model data, download code, and engine-driving commands. Cargo
+registry access is disabled while building the verifier; required compiler and
+crate inputs must already be available. The install target also refuses an
+existing package root so files from a full install cannot contaminate the
+minimal boundary.
+
+The package includes a synthetic capture that exercises the entire
+non-device translation path:
+
+```bash
+cd /usr/local/libexec/ebpf-syscall/tools/kvio
+kvio iolog offline-capture-v1.example.jsonl /dev/fixture \
+    --bundle-dir /tmp/kvio-replay
+kvio fio-certify /tmp/kvio-replay
+kvio compare same:offline-capture-v1.example.jsonl:\
+offline-capture-v1.example.jsonl
+```
+
+No command above runs fio or touches a device. The fixture is invented public
+data, not a sanitized production capture. See
+[`OFFLINE-PROVENANCE.md`](OFFLINE-PROVENANCE.md) for the installed inventory,
+runtime dependencies, license files, and the remaining deployment checks.
+
 `make kvio` needs **cargo** (https://rustup.rs) and python3. The engine-driving
 commands also need the Python deps listed in `vendor/lmcache/PROVENANCE.md`
 (torch's **CPU wheel is fine** — kvio is GPU-free, which is not the same as

@@ -134,6 +134,32 @@ The install target honors ``prefix``, ``bindir``, ``libexecdir``, ``mandir``,
 and ``DESTDIR``.  It keeps kvio's helper scripts and native modules together
 under libexec and installs the user entry points under bindir.
 
+For an environment that keeps captures local and does not need model
+projection or the LMCache engine, install the smaller offline surface::
+
+   make kvio-offline
+   sudo make install-kvio-offline
+   kvio doctor
+
+This is the same ``kvio`` entry point, limited to ``record``, ``iolog``,
+``fio-certify``, ``compare``, the three ``release-*`` commands, and ``doctor``.
+It omits LMCache, PyTorch, model data, download code, and engine-driving
+commands.  Cargo registry access is disabled while building the verifier, so
+all build inputs must already be available.  Installation requires an empty
+package root to prevent files from a full install from entering this boundary.
+
+The package includes an invented public capture for a no-device check::
+
+   cd /usr/local/libexec/ebpf-syscall/tools/kvio
+   kvio iolog offline-capture-v1.example.jsonl /dev/fixture \
+       --bundle-dir /tmp/kvio-replay
+   kvio fio-certify /tmp/kvio-replay
+   kvio compare same:offline-capture-v1.example.jsonl:offline-capture-v1.example.jsonl
+
+These commands translate, certify, and compare files; they do not invoke fio
+or touch a device.  ``tools/kvio/OFFLINE-PROVENANCE.md`` lists the installed
+components, runtime dependencies, licenses, and remaining deployment checks.
+
 How to run
 ----------
 

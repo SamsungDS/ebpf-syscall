@@ -33,8 +33,10 @@ published artifact; changing the wording alone does not complete it.
 - [ ] Authenticate internal evidence and connect authorization to existing
   organizational identity, signing, revocation, and approval systems. A draft
   candidate must continue to report `export_allowed: false` until then.
-- [ ] Package the minimal capture/fio/verification path without PyTorch, model
-  downloads, network access, or the LMCache engine.
+- [x] Package the minimal capture/fio/verification path without PyTorch, model
+  downloads, a runtime network requirement, or the LMCache engine. Build the
+  Rust verifier with Cargo registry access disabled and ship a synthetic
+  fixture.
 - [ ] Run a bank-local A/B pilot that exports only fixed, rounded result fields.
   Add trace relocation only if that results-only boundary cannot answer the
   engineering question.
@@ -113,8 +115,10 @@ reject ambiguous or reused mappings rather than inventing that attribution.
 
 ## Packaging and regression tests
 
-- [ ] Add a clean installation test using `DESTDIR`, then run every
-  non-destructive subcommand from the installed path.
+- [x] Add a clean offline installation test using `DESTDIR`, block Python
+  socket creation, run every file-only workflow, and check recorder dispatch.
+- [ ] Produce a distribution SBOM, record final artifact hashes, and validate
+  the package under an independently enforced network-denied host or container.
 - [ ] Add compressed manual pages when a distribution packaging format is
   introduced.
 - [ ] Decide whether a future package should split the eBPF tracers, kvio

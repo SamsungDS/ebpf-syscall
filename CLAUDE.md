@@ -110,6 +110,14 @@ utility evidence, and human export authorization are three different verdicts.
 The public design boundary and implementation status live in
 `tools/kvio/PRIVACY.md`; do not invent a stronger claim in another page.
 
+`make kvio-offline` and `make install-kvio-offline` provide the first
+bank-local deployment slice. It is the same kvio launcher, limited to capture,
+fio translation, independent certification, stream comparison, bounded-result
+commands, and doctor. It excludes LMCache, PyTorch, model inputs, downloads,
+and engine commands. Keep that boundary small; do not add an engine dependency
+to an offline command. `tools/kvio/OFFLINE-PROVENANCE.md` defines its installed
+surface and remaining deployment checks.
+
 `tools/reproduce/gnn-readamp/` remains the worked payload-free example: a GNN
 reading node features off an SSD at 431× read amplification, charted A/B
 against the page-aware fix. Its historical replay matched counts, bytes, and

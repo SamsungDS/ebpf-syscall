@@ -20,6 +20,9 @@ Implemented today:
 - `kvio release-build` emits a bounded, unsigned results-only candidate.
 - `kvio release-verify` checks that candidate's closed grammar, exact two-file
   inventory, and payload hash.
+- `make install-kvio-offline` installs the capture, fio, verification,
+  comparison, and bounded-result paths without LMCache, PyTorch, model data,
+  or a runtime network requirement.
 
 Not implemented today:
 
@@ -249,10 +252,13 @@ that preserves the decision can still disclose a recognizable workload.
 
 ## Adoption and stop rules
 
-Package a minimal offline capture, fio, and verification path without PyTorch,
-model downloads, or network access. Measure capture overhead. Require an
-approved disposable replay target. Have a second operator reproduce a public
-fixture from the documentation before expanding scope.
+Use the minimal offline package for a trace-owning environment that does not
+need the engine. Its regression test installs into a clean `DESTDIR`, blocks
+Python socket creation, runs every file-only workflow against an invented
+public fixture, and checks recorder dispatch. An actual deployment must still
+deny network access at the host or container boundary, inventory final
+binaries, measure capture overhead, and require an approved disposable replay
+target. Have a second operator reproduce the fixture before expanding scope.
 
 Stop trace relocation when the permitted transform cannot preserve the storage
 decision or its residual disclosure is not approvable. Keep the bank-local

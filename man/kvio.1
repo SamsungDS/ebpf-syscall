@@ -289,6 +289,40 @@ kvio doctor
 .fi
 .RE
 .PP
+Build and install the smaller bank-local surface without LMCache, PyTorch,
+models, downloads, or engine-driving commands:
+.PP
+.RS
+.nf
+make kvio-offline
+sudo make install-kvio-offline
+kvio doctor
+.fi
+.RE
+.PP
+This remains the same
+.B kvio
+entry point.  It contains capture, fio translation, independent
+certification, device-stream comparison, bounded-result commands, and
+.BR doctor .
+The verifier build disables Cargo registry access.  The install refuses an
+existing package root so files from a full install cannot enter the smaller
+boundary.
+.PP
+Exercise the installed translation path with invented public data and no
+device access:
+.PP
+.RS
+.nf
+cd /usr/local/libexec/ebpf-syscall/tools/kvio
+kvio iolog offline-capture-v1.example.jsonl /dev/fixture \
+    --bundle-dir /tmp/kvio-replay
+kvio fio-certify /tmp/kvio-replay
+kvio compare same:offline-capture-v1.example.jsonl:\
+offline-capture-v1.example.jsonl
+.fi
+.RE
+.PP
 Project a KV stream without a GPU:
 .PP
 .RS
@@ -336,6 +370,10 @@ DGraphFin read-amplification case study and reproduction links.
 .TP
 .I tools/kvio/TODO.md
 Open privacy, fidelity, pacing, concurrency, and packaging work.
+.TP
+.I tools/kvio/OFFLINE-PROVENANCE.md
+Minimal-package inventory, dependency boundary, licenses, and deployment
+checks.
 .SH SEE ALSO
 .BR fio (1),
 .BR nvme_tp_monitor (1),

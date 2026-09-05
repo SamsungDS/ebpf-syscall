@@ -401,6 +401,24 @@
     <code>libexecdir</code>, <code>mandir</code>, and <code>DESTDIR</code>. It keeps kvio's
     helper scripts and native modules together under libexec and installs the user entry points
     under bindir.</p>
+  <h3>Minimal offline install</h3>
+  <p>When captures must stay local and model projection is unnecessary, install the same
+    <code>kvio</code> entry point with only capture, fio translation, independent
+    certification, stream comparison, bounded-result commands, and <code>doctor</code>.</p>
+  <pre><div class="bar"><span class="dot"></span><span class="dot"></span><span class="dot"></span>&nbsp; no LMCache, PyTorch, models, or downloads</div><code><span class="k">make</span> kvio-offline
+<span class="k">sudo make</span> install-kvio-offline
+<span class="k">kvio</span> doctor</code></pre>
+  <p>The verifier build disables Cargo registry access and fails if its locked inputs are not
+    already available. Installation requires an empty package root, preventing files from an
+    earlier full install from contaminating the smaller boundary.</p>
+  <pre><div class="bar"><span class="dot"></span><span class="dot"></span><span class="dot"></span>&nbsp; invented public fixture; no device access</div><code><span class="k">cd</span> <span class="p">/usr/local/libexec/ebpf-syscall/tools/kvio</span>
+<span class="k">kvio</span> iolog offline-capture-v1.example.jsonl <span class="p">/dev/fixture</span> \
+    <span class="v">--bundle-dir</span> /tmp/kvio-replay
+<span class="k">kvio</span> fio-certify /tmp/kvio-replay
+<span class="k">kvio</span> compare <span class="s">same:offline-capture-v1.example.jsonl:offline-capture-v1.example.jsonl</span></code></pre>
+  <p>These commands only translate, certify, and compare files. The installed
+    <code>OFFLINE-PROVENANCE.md</code> lists components, dependencies, license files, and
+    deployment checks still owned by the operator.</p>
 </section>
 
 <section id="run">
