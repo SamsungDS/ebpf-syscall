@@ -79,7 +79,9 @@ captured operations, offsets, lengths, order, and rounded timestamps.
 .B compare
 Compare an original device capture with one or more replay captures.  This is
 the runtime referee; it checks what fio, Linux, and the NVMe driver actually
-issued.
+issued.  With exactly one replay,
+.B \-\-update-bundle
+stores the hash-bound result in the matching confidential bundle.
 .TP
 .B release-build
 Build a bounded, unsigned results-only candidate.  Version 1 accepts only
@@ -263,8 +265,13 @@ rebases each capture to its first command and reports issue-time error at the
 also records command completion latency.
 .B kvio compare
 reports completion-latency distributions for the original and replay
-captures.  It does not yet pair every original command with its replayed
-completion.  It also does not measure application end-to-end latency, model
+captures.  Within each capture it pairs a completion with its command by
+hardware queue and NVMe command ID.  For example, queue 2 may reuse command ID
+7 after ID 7 completes.  Reuse before completion is ambiguous, so kvio refuses
+the per-command latency claim.  Missing or orphan completions and inconsistent
+latency timestamps also disable it.  When both captures pair completely and
+their command tuples match, kvio reports the per-command latency-error
+distribution.  It does not measure application end-to-end latency, model
 latency, time to first token, or time per output token.
 .PP
 Fio pacing, submission engines, Linux scheduling, and the controller can
@@ -354,9 +361,18 @@ replay_monitor=$!
 sleep 1
 sudo KVIO_TARGET=/dev/nvme2n1 fio replay/replay-block.fio
 wait "$replay_monitor"
-kvio compare original:source.jsonl:replay.jsonl
+kvio compare original:source.jsonl:replay.jsonl \
+    --update-bundle replay
+kvio fio-certify replay
 .fi
 .RE
+.PP
+The update requires the bundle's source-capture hash and normalized command
+stream to match
+.IR source.jsonl .
+It records the replay hash and runtime verdict, then refreshes
+.IR SHA256SUMS .
+The bundle retains exact placement and timing and remains confidential.
 .SH FILES
 .TP
 .I tools/kvio/README.md

@@ -54,7 +54,9 @@ device commands.
   (a capture plus any number of replays) and prints the comparison:
   exact operation, offset, length, and tuple sequences; issue-timing error;
   command counts, bytes, size distribution; and completion latency percentiles.
-  It replaces eyeballing two blkparse texts against each other.
+  With `--update-bundle`, exactly one source/replay comparison is saved in its
+  matching confidential bundle and checked by the Rust verifier. It replaces
+  eyeballing two blkparse texts against each other.
 - **`demo_replay_ab.sh`** — the experiment above, end to end, on a
   disposable machine with an empty NVMe namespace (it mkfs's the
   target; it refuses devices carrying a filesystem signature).
@@ -75,8 +77,30 @@ There are three different timing claims. The iolog preserves relative command
 issue times at fio's microsecond resolution. `compare_streams.py` rebases the
 two captures to their first commands and reports issue-time error at p50, p99,
 and max. It also reports each capture's completion-latency distribution from
-`nvme_cmp` records. It does not pair each original completion with a replay
-completion, and none of these measurements is application end-to-end latency.
+`nvme_cmp` records. Within each capture it pairs a command and completion by
+hardware queue and NVMe command ID, ordered by timestamp. For example, queue 2
+may issue command ID 7, complete it, and later reuse ID 7. That is unambiguous.
+If another command reuses `(queue 2, ID 7)` before the first completes, kvio
+cannot know which command the next completion belongs to, so it refuses the
+per-command latency comparison. Missing or orphan completions and inconsistent
+latency timestamps have the same result. Independent latency distributions
+remain visible, and none of these measurements is application end-to-end
+latency.
+
+To attach one observed replay result to the bundle that produced it:
+
+```bash
+./kvio compare run:source.jsonl:replay.jsonl \
+    --update-bundle replay
+./kvio fio-certify replay
+```
+
+The update requires the source capture hash and normalized commands to match
+the existing bundle. It records the replay capture hash, drop status, ordered
+stream verdicts, timing summaries, and completion-pairing status, then refreshes
+`SHA256SUMS`. An interrupted update leaves a detectable checksum mismatch; rerun
+the command from intact captures and bundle files. The bundle still exposes
+exact placement and timing and remains confidential internal evidence.
 
 The device capture is payload-free, not necessarily anonymous. Exact offsets,
 timing, namespace identity, and an unusual request shape can fingerprint a

@@ -548,8 +548,13 @@
     <code>kvio fio-certify</code> check the finite requested stream. A second
     <code>kvio record</code> capture plus <code>kvio compare</code> checks the ordered operation,
     offset, and length tuples actually issued by fio and Linux. It reports rebased issue-time error
-    and completion-latency distributions, but does not yet pair original and replay completions one
-    by one or measure application end-to-end latency.</p>
+    and completion-latency distributions. When both captures have unambiguous hardware-queue and
+    command-ID records, it pairs every completion with its command and reports per-command latency
+    error. A command ID may be reused after its earlier command completes; overlapping reuse,
+    missing or orphan completions, and inconsistent latency timestamps disable the paired claim.
+    <code>--update-bundle BUNDLE</code> stores one hash-bound source/replay result in its matching
+    confidential bundle, refreshes its checksums, and lets <code>fio-certify</code> reject
+    contradictory runtime fields. This does not measure application end-to-end latency.</p>
   <div class="note info"><b class="tag">worked example and open work</b> The
     <a href="gnn-readamp.html">DGraphFin case study</a> shows an architectural reduction in read
     amplification without retaining graph or feature contents. Exact offsets and timing remain

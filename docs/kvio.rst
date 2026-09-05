@@ -314,9 +314,15 @@ Fidelity has a file gate and a runtime gate. ``kvio iolog`` plus the
 independent Rust ``kvio fio-certify`` check the finite requested stream. A
 second ``kvio record`` capture plus ``kvio compare`` checks the ordered
 operation, offset, and length tuples actually issued by fio and Linux. It also
-reports rebased issue-time error and completion-latency distributions. It does
-not yet pair original and replay completions one by one, and it does not
-measure application end-to-end latency.
+reports rebased issue-time error and completion-latency distributions. When
+both captures have unambiguous hardware-queue and command-ID records, it pairs
+each completion with its command and reports per-command latency error. A
+command ID may be reused after its earlier command completes; overlapping reuse,
+missing or orphan completions, and inconsistent latency timestamps disable the
+paired claim. ``--update-bundle BUNDLE`` stores one hash-bound source/replay
+result in its matching confidential bundle, refreshes its checksums, and lets
+``fio-certify`` reject contradictory runtime fields. This does not measure
+application end-to-end latency.
 
 The `DGraphFin case study <gnn-readamp.html>`__ shows how the same method
 reveals an architectural reduction in read amplification while omitting graph

@@ -91,6 +91,10 @@ uploads). `pip install perfetto`.
    claim that fio, Linux, or the controller executes the same device
    stream. Re-record the fio run and use `compare_streams.py`, which
    reports operation, offset, length, tuple-order, and timing separately.
+   With one replay, `--update-bundle` stores a hash-bound runtime verdict in
+   the matching confidential bundle. Completion latency is paired only when
+   queue and command-ID reuse is unambiguous; never promote it to application
+   latency or a general fio-performance claim.
 
 ### Keep capture, replay bundles, and releases separate
 

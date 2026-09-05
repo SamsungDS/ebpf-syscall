@@ -11,8 +11,9 @@ published artifact; changing the wording alone does not complete it.
 - `kvio iolog` and `kvio fio-certify` check the finite file translation:
   operation, byte offset, length, order, and sub-microsecond timestamp
   quantization.
-- `kvio compare` checks the re-recorded device stream and reports issue-timing
-  error plus completion-latency distributions.
+- `kvio compare` checks the re-recorded device stream, reports issue-timing
+  error and completion latency, and can store that hash-bound result in the
+  confidential replay bundle.
 - These checks do not prove equal application latency, equal performance, or
   anonymity.
 - Capture schema v1 binds replay input to one selected device/namespace and a
@@ -87,11 +88,13 @@ reject ambiguous or reused mappings rather than inventing that attribution.
 
 ## Extend runtime fidelity
 
-- [ ] Write `kvio compare` results back into the bundle's
-  `runtime_device_validation` field instead of leaving it null.
-- [ ] Pair each completion with its command across queue and command-ID reuse,
+- [x] Write one source/replay `kvio compare` result into the bundle's
+  `runtime_device_validation` field, bind it to both captures, refresh bundle
+  checksums, and reject contradictory fields in the independent Rust verifier.
+- [x] Pair each completion with its command across queue and command-ID reuse,
   then report per-command latency error in addition to independent latency
-  distributions.
+  distributions. Refuse the paired claim for overlap, missing commands,
+  orphan completions, or inconsistent latency timestamps.
 - [ ] Validate fio timestamp pacing and publish tolerances for each supported
   IO engine at low and high IOPS.
 - [ ] Represent concurrent producers explicitly. A single fio iolog preserves

@@ -91,7 +91,8 @@ sudo ./kvio workload --model meta-llama/Llama-3.2-1B-Instruct --tp 1 \
      --out kv.pftrace                                      # attribute
 ./kvio iolog dev.jsonl /dev/source --bundle-dir replay     # certified fio export
 KVIO_TARGET=/dev/nvmeXnY fio replay/replay-block.fio       # issue the requests
-./kvio compare run:dev.jsonl:replay.jsonl                  # grade device result
+./kvio compare run:dev.jsonl:replay.jsonl \
+     --update-bundle replay                                # grade and save result
 ```
 
 (Flags above are real — see each subcommand's `--help`; `kvio plan` uses
@@ -193,8 +194,14 @@ Fidelity has two gates. `kvio iolog` and the independent Rust
 under a second `kvio record` capture and use `kvio compare` to check the
 ordered operation/offset/length tuples actually issued by the runtime. The
 comparison also reports rebased issue-time errors and completion-latency
-distributions. It does not yet pair original and replay completions one by one,
-and it does not measure application end-to-end latency.
+distributions. When both captures contain unambiguous queue and command-ID
+pairs, it matches every completion to its command and reports per-command
+latency error. Add `--update-bundle BUNDLE` for exactly one source/replay pair
+to store the replay-capture hash and runtime verdict in the matching bundle.
+The command verifies the bundle and its source-capture hash first, then refreshes
+the checksums; `fio-certify` independently rejects contradictory runtime fields.
+This remains confidential fidelity evidence and does not measure application
+end-to-end latency.
 
 The DGraphFin example in `../../docs/gnn-readamp.rst` shows the method: a
 page-aware GNN access pattern reduced `RA_signal` from 431× to 8.6× without the
