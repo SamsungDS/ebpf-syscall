@@ -95,6 +95,20 @@ pub struct CompletionLatency {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
+pub struct CompletionStatusResult {
+    pub error_count: usize,
+    pub all_commands_succeeded: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CompletionStatus {
+    pub source: CompletionStatusResult,
+    pub replay: CompletionStatusResult,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct CompletionPairing {
     pub source_complete: bool,
     pub replay_complete: bool,
@@ -121,6 +135,7 @@ pub struct RuntimeDeviceValidation {
     pub device_stream_equal: bool,
     pub timing_error_us: TimingError,
     pub completion_latency_us: CompletionLatency,
+    pub completion_status: CompletionStatus,
     pub completion_pairing: CompletionPairing,
 }
 
@@ -617,6 +632,28 @@ fn validate_runtime_device(
     {
         return Err(IrError::new(
             "complete runtime pairing must cover every command",
+        ));
+    }
+    if runtime.completion_status.source.error_count
+        > runtime.completion_latency_us.source.sample_count
+        || runtime.completion_status.replay.error_count
+            > runtime.completion_latency_us.replay.sample_count
+    {
+        return Err(IrError::new(
+            "runtime completion error count exceeds paired completions",
+        ));
+    }
+    let source_all_succeeded = runtime.completion_pairing.source_complete
+        && runtime.source_command_count > 0
+        && runtime.completion_status.source.error_count == 0;
+    let replay_all_succeeded = runtime.completion_pairing.replay_complete
+        && runtime.replay_command_count > 0
+        && runtime.completion_status.replay.error_count == 0;
+    if runtime.completion_status.source.all_commands_succeeded != source_all_succeeded
+        || runtime.completion_status.replay.all_commands_succeeded != replay_all_succeeded
+    {
+        return Err(IrError::new(
+            "runtime completion-success verdict is inconsistent",
         ));
     }
     let should_compare_completions = runtime.tuple_sequence_equal

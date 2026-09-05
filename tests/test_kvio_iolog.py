@@ -320,7 +320,9 @@ class IologTest(unittest.TestCase):
                  "lat_ns": 100_000, "hwq": 1, "cid": 9, "status": 0},
             ]
             write_capture(source_path, records)
-            write_capture(replay_path, records)
+            replay_records = [dict(record) for record in records]
+            replay_records[1]["status"] = 1
+            write_capture(replay_path, replay_records)
             rows, metadata = MODULE.load_capture(str(source_path))
             iolog = MODULE.emit_iolog(rows, "/dev/source")
             certificate, normalized = MODULE.translation_certificate(
@@ -368,6 +370,15 @@ class IologTest(unittest.TestCase):
             self.assertTrue(runtime["device_stream_equal"])
             self.assertTrue(runtime["completion_pairing"][
                 "per_command_compared"])
+            self.assertTrue(runtime["completion_status"]["source"][
+                "all_commands_succeeded"])
+            self.assertFalse(runtime["completion_status"]["replay"][
+                "all_commands_succeeded"])
+            self.assertEqual(
+                runtime["completion_status"]["replay"]["error_count"], 1)
+            self.assertIn("replay_completion_error_count=1", updated.stdout)
+            self.assertIn(
+                "replay_all_commands_succeeded=False", updated.stdout)
 
             verified = subprocess.run(
                 [str(VERIFIER), "certify", str(bundle)],
@@ -386,6 +397,18 @@ class IologTest(unittest.TestCase):
                 text=True, capture_output=True)
             self.assertNotEqual(rejected.returncode, 0)
             self.assertIn("device-stream verdict", rejected.stderr)
+
+            changed["runtime_device_validation"][
+                "device_stream_equal"] = True
+            changed["runtime_device_validation"]["completion_status"][
+                "replay"]["all_commands_succeeded"] = True
+            (bundle / "certificate.json").write_text(
+                json.dumps(changed), encoding="utf-8")
+            rejected = subprocess.run(
+                [str(VERIFIER), "certify", str(bundle)],
+                text=True, capture_output=True)
+            self.assertNotEqual(rejected.returncode, 0)
+            self.assertIn("completion-success verdict", rejected.stderr)
 
 
 if __name__ == "__main__":

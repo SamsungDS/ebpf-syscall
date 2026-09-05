@@ -198,6 +198,23 @@ def _latency_distribution(capture):
     }
 
 
+def _completion_status(capture):
+    completed = [
+        command.get("completion")
+        for command in capture["commands"]
+        if command.get("completion") is not None
+    ]
+    errors = sum(completion["status"] != 0 for completion in completed)
+    return {
+        "error_count": errors,
+        "all_commands_succeeded": (
+            bool(capture["commands"])
+            and capture.get("completion_pairing", {}).get("complete", False)
+            and errors == 0
+        ),
+    }
+
+
 def _normalized_commands(capture, lba_bytes):
     commands = capture["commands"]
     if not commands:
@@ -252,6 +269,20 @@ def update_runtime_bundle(
         "completion_latency_us": {
             "source": _latency_distribution(source),
             "replay": _latency_distribution(replay),
+        },
+        "completion_status": {
+            "source": {
+                "error_count": comparison[
+                    "source_completion_error_count"],
+                "all_commands_succeeded": comparison[
+                    "source_all_commands_succeeded"],
+            },
+            "replay": {
+                "error_count": comparison[
+                    "replay_completion_error_count"],
+                "all_commands_succeeded": comparison[
+                    "replay_all_commands_succeeded"],
+            },
         },
         "completion_pairing": {
             "source_complete": comparison[
@@ -393,6 +424,8 @@ def stats(capture):
 def exact_comparison(source, replay, lba_bytes):
     left = source["commands"]
     right = replay["commands"]
+    source_status = _completion_status(source)
+    replay_status = _completion_status(replay)
     source_tuples = [(c["op"], c["slba"] * lba_bytes, c["bytes"]) for c in left]
     replay_tuples = [(c["op"], c["slba"] * lba_bytes, c["bytes"]) for c in right]
     count_equal = len(left) == len(right)
@@ -413,6 +446,12 @@ def exact_comparison(source, replay, lba_bytes):
         "tuple_sequence_equal": source_tuples == replay_tuples,
         "source_completion_pairing_complete": source_pairing_complete,
         "replay_completion_pairing_complete": replay_pairing_complete,
+        "source_completion_error_count": source_status["error_count"],
+        "replay_completion_error_count": replay_status["error_count"],
+        "source_all_commands_succeeded": source_status[
+            "all_commands_succeeded"],
+        "replay_all_commands_succeeded": replay_status[
+            "all_commands_succeeded"],
         "per_command_completion_latency_compared": False,
         "completion_latency_error_p50_us": None,
         "completion_latency_error_p99_us": None,
