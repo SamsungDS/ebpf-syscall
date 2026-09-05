@@ -1,0 +1,89 @@
+{
+  "schema_version": 1,
+  "workloads": [
+    {
+      "capture": {
+        "content_identity": "prompt-content",
+        "format": "lmcache-agent",
+        "method": "application-jsonl",
+        "session_identity": "recorded",
+        "timing": "recorded"
+      },
+      "contribution_lanes": [
+        "opencode-prefix-growth",
+        "miniswe-prefix-growth",
+        "aider-shifted-context",
+        "repoagent-shifted-context",
+        "taubench-non-coding-agent"
+      ],
+      "evidence_label": "trace-derived",
+      "hardware_geometry": {
+        "available": false,
+        "capture_tool": null,
+        "device_model": null,
+        "kernel": null,
+        "logical_block_bytes": null,
+        "max_transfer_bytes": null
+      },
+      "id": "lmcache-agent-trace-780bcc2",
+      "privacy": {
+        "prompt_content": "retained",
+        "residual_disclosure": [
+          "prompt-content",
+          "request-cadence",
+          "session-linkage"
+        ],
+        "transformation": "none"
+      },
+      "source": {
+        "artifact_sha256": null,
+        "license": "Apache-2.0",
+        "revision": "780bcc2979715150d8b9fd4737e026e625444cc9",
+        "url": "https://github.com/LMCache/lmcache-agent-trace"
+      },
+      "title": "LMCache agent application traces",
+      "workload_class": "coding-and-tool-agent"
+    },
+    {
+      "capture": {
+        "content_identity": "observed-prefix-accounting",
+        "format": "tracelab",
+        "method": "sanitized-application-jsonl",
+        "session_identity": "pseudonymous",
+        "timing": "recorded"
+      },
+      "contribution_lanes": [
+        "claude-coding-agent",
+        "codex-coding-agent"
+      ],
+      "evidence_label": "trace-derived",
+      "hardware_geometry": {
+        "available": false,
+        "capture_tool": null,
+        "device_model": null,
+        "kernel": null,
+        "logical_block_bytes": null,
+        "max_transfer_bytes": null
+      },
+      "id": "tracelab-v0.0.1",
+      "privacy": {
+        "prompt_content": "removed",
+        "residual_disclosure": [
+          "provider",
+          "request-cadence",
+          "session-linkage",
+          "token-counts"
+        ],
+        "transformation": "source-sanitized"
+      },
+      "source": {
+        "artifact_sha256": "9d265eae69a31cae203848bea936f018148eed7ca8bf56050c5abe96da0b4e6b",
+        "license": "CC-BY-4.0",
+        "revision": "v0.0.1",
+        "url": "https://github.com/uw-syfi/TraceLab/releases/tag/v0.0.1"
+      },
+      "title": "TraceLab sanitized coding-agent rounds",
+      "workload_class": "coding-agent"
+    }
+  ]
+}

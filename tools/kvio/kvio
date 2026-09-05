@@ -48,6 +48,8 @@ COMMANDS = {
                      "GPU-free projection of a model x config's KV NVMe IO stream", False),
     "trace":        ("tools/kvio/agent_trace.py",
                      "compile real agent requests into an evidence-labeled KV plan", False),
+    "catalog":      ("tools/kvio/workload_catalog.py",
+                     "list and validate pinned workload evidence", False),
     # engine-driving (vendored RawBlockCore + built Rust module)
     "workload":     ("tools/kvio/workload.py",
                      "drive the real raw_block engine with a serving-shaped request mix", True),
