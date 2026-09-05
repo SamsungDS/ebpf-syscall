@@ -67,6 +67,61 @@ pub struct SourceCertificate {
     pub capture_drops: u64,
     pub unsupported_commands_omitted: usize,
     pub performance_equivalence_claimed: bool,
+    pub runtime_device_validation: Option<RuntimeDeviceValidation>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct LatencyDistribution {
+    pub sample_count: usize,
+    pub p50_us: Option<f64>,
+    pub p99_us: Option<f64>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct TimingError {
+    pub p50: Option<f64>,
+    pub p99: Option<f64>,
+    pub max: Option<f64>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CompletionLatency {
+    pub source: LatencyDistribution,
+    pub replay: LatencyDistribution,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CompletionPairing {
+    pub source_complete: bool,
+    pub replay_complete: bool,
+    pub per_command_compared: bool,
+    pub absolute_error_p50_us: Option<f64>,
+    pub absolute_error_p99_us: Option<f64>,
+    pub absolute_error_max_us: Option<f64>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeDeviceValidation {
+    pub schema_version: u32,
+    pub replay_capture_sha256: String,
+    pub source_command_count: usize,
+    pub replay_command_count: usize,
+    pub source_capture_complete: bool,
+    pub replay_capture_complete: bool,
+    pub command_count_equal: bool,
+    pub operation_sequence_equal: bool,
+    pub offset_sequence_equal: bool,
+    pub length_sequence_equal: bool,
+    pub tuple_sequence_equal: bool,
+    pub device_stream_equal: bool,
+    pub timing_error_us: TimingError,
+    pub completion_latency_us: CompletionLatency,
+    pub completion_pairing: CompletionPairing,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -107,7 +162,7 @@ pub struct ValidationCertificate {
     pub transfer_limit_checked: bool,
     pub source_certificate_consistent: bool,
     pub performance_equivalence_claimed: bool,
-    pub runtime_device_validation: Option<serde_json::Value>,
+    pub runtime_device_validation: Option<RuntimeDeviceValidation>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -433,6 +488,155 @@ fn sha256_hex(bytes: &[u8]) -> String {
     output
 }
 
+fn is_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn finite_nonnegative(value: f64) -> bool {
+    value.is_finite() && value >= 0.0
+}
+
+fn validate_latency_distribution(
+    distribution: &LatencyDistribution,
+    name: &str,
+) -> Result<(), IrError> {
+    match (distribution.p50_us, distribution.p99_us) {
+        (None, None) if distribution.sample_count == 0 => Ok(()),
+        (Some(p50), Some(p99))
+            if distribution.sample_count > 0
+                && finite_nonnegative(p50)
+                && finite_nonnegative(p99)
+                && p50 <= p99 =>
+        {
+            Ok(())
+        }
+        _ => Err(IrError::new(format!(
+            "{name} completion-latency distribution is inconsistent"
+        ))),
+    }
+}
+
+fn validate_error_triplet(
+    p50: Option<f64>,
+    p99: Option<f64>,
+    maximum: Option<f64>,
+    required: bool,
+    name: &str,
+) -> Result<(), IrError> {
+    match (p50, p99, maximum) {
+        (None, None, None) if !required => Ok(()),
+        (Some(p50), Some(p99), Some(maximum))
+            if required
+                && finite_nonnegative(p50)
+                && finite_nonnegative(p99)
+                && finite_nonnegative(maximum)
+                && p50 <= p99
+                && p99 <= maximum =>
+        {
+            Ok(())
+        }
+        _ => Err(IrError::new(format!(
+            "{name} error summary is inconsistent"
+        ))),
+    }
+}
+
+fn validate_runtime_device(
+    runtime: &RuntimeDeviceValidation,
+    workload: &Workload,
+    source_complete: bool,
+) -> Result<(), IrError> {
+    if runtime.schema_version != 1 {
+        return Err(IrError::new("unsupported runtime validation schema"));
+    }
+    if !is_sha256(&runtime.replay_capture_sha256) {
+        return Err(IrError::new("runtime replay digest is not SHA-256"));
+    }
+    if runtime.source_command_count != workload.commands.len() {
+        return Err(IrError::new(
+            "runtime source command count disagrees with workload",
+        ));
+    }
+    if runtime.command_count_equal != (runtime.source_command_count == runtime.replay_command_count)
+    {
+        return Err(IrError::new(
+            "runtime command-count verdict is inconsistent",
+        ));
+    }
+    if !runtime.command_count_equal
+        && (runtime.operation_sequence_equal
+            || runtime.offset_sequence_equal
+            || runtime.length_sequence_equal)
+    {
+        return Err(IrError::new(
+            "runtime sequence verdict cannot pass with unequal counts",
+        ));
+    }
+    if runtime.source_capture_complete != source_complete {
+        return Err(IrError::new(
+            "runtime source-completeness verdict is inconsistent",
+        ));
+    }
+    let components_equal = runtime.operation_sequence_equal
+        && runtime.offset_sequence_equal
+        && runtime.length_sequence_equal;
+    if runtime.tuple_sequence_equal != (runtime.command_count_equal && components_equal) {
+        return Err(IrError::new("runtime tuple verdict is inconsistent"));
+    }
+    let stream_equal = runtime.source_capture_complete
+        && runtime.replay_capture_complete
+        && runtime.tuple_sequence_equal;
+    if runtime.device_stream_equal != stream_equal {
+        return Err(IrError::new(
+            "runtime device-stream verdict is inconsistent",
+        ));
+    }
+    validate_error_triplet(
+        runtime.timing_error_us.p50,
+        runtime.timing_error_us.p99,
+        runtime.timing_error_us.max,
+        runtime.command_count_equal && runtime.source_command_count > 0,
+        "runtime issue-timing",
+    )?;
+    validate_latency_distribution(&runtime.completion_latency_us.source, "source")?;
+    validate_latency_distribution(&runtime.completion_latency_us.replay, "replay")?;
+    if runtime.completion_latency_us.source.sample_count > runtime.source_command_count
+        || runtime.completion_latency_us.replay.sample_count > runtime.replay_command_count
+    {
+        return Err(IrError::new(
+            "runtime completion sample count exceeds command count",
+        ));
+    }
+    if (runtime.completion_pairing.source_complete
+        && runtime.completion_latency_us.source.sample_count != runtime.source_command_count)
+        || (runtime.completion_pairing.replay_complete
+            && runtime.completion_latency_us.replay.sample_count != runtime.replay_command_count)
+    {
+        return Err(IrError::new(
+            "complete runtime pairing must cover every command",
+        ));
+    }
+    let should_compare_completions = runtime.tuple_sequence_equal
+        && runtime.completion_pairing.source_complete
+        && runtime.completion_pairing.replay_complete
+        && runtime.source_command_count > 0;
+    if runtime.completion_pairing.per_command_compared != should_compare_completions {
+        return Err(IrError::new(
+            "runtime per-command completion verdict is inconsistent",
+        ));
+    }
+    validate_error_triplet(
+        runtime.completion_pairing.absolute_error_p50_us,
+        runtime.completion_pairing.absolute_error_p99_us,
+        runtime.completion_pairing.absolute_error_max_us,
+        should_compare_completions,
+        "runtime completion-latency",
+    )
+}
+
 pub fn validate_translation(
     workload: &Workload,
     iolog: &str,
@@ -514,6 +718,9 @@ pub fn validate_translation(
             "timestamp rounding bound disagrees with source certificate",
         ));
     }
+    if let Some(runtime) = &source.runtime_device_validation {
+        validate_runtime_device(runtime, workload, source_complete)?;
+    }
 
     Ok(ValidationCertificate {
         schema_version: 1,
@@ -532,7 +739,7 @@ pub fn validate_translation(
         transfer_limit_checked: constraints.max_transfer_bytes.is_some(),
         source_certificate_consistent: true,
         performance_equivalence_claimed: false,
-        runtime_device_validation: None,
+        runtime_device_validation: source.runtime_device_validation.clone(),
     })
 }
 

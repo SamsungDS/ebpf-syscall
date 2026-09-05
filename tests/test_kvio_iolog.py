@@ -57,6 +57,69 @@ class IologTest(unittest.TestCase):
         self.assertFalse(comparison["offset_sequence_equal"])
         self.assertFalse(comparison["tuple_sequence_equal"])
 
+    def test_referee_pairs_completions_across_command_id_reuse(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source_path = root / "source.jsonl"
+            replay_path = root / "replay.jsonl"
+            commands = [
+                {"event_type": "nvme_cmd", "seq": 0, "ts": 1_000_000,
+                 "op_name": "read", "slba": 0, "bytes": 4096,
+                 "hwq": 2, "cid": 7},
+                {"event_type": "nvme_cmp", "ts": 1_100_000,
+                 "lat_ns": 100_000, "hwq": 2, "cid": 7, "status": 0},
+                {"event_type": "nvme_cmd", "seq": 1, "ts": 1_200_000,
+                 "op_name": "read", "slba": 8, "bytes": 4096,
+                 "hwq": 2, "cid": 7},
+                {"event_type": "nvme_cmp", "ts": 1_400_000,
+                 "lat_ns": 200_000, "hwq": 2, "cid": 7, "status": 0},
+            ]
+            write_capture(source_path, commands)
+            replay = [dict(record) for record in commands]
+            replay[1].update(ts=1_150_000, lat_ns=150_000)
+            replay[3].update(ts=1_500_000, lat_ns=300_000)
+            write_capture(replay_path, replay)
+
+            source_capture = COMPARE.load(str(source_path))
+            replay_capture = COMPARE.load(str(replay_path))
+            comparison = COMPARE.exact_comparison(
+                source_capture, replay_capture, 4096)
+            self.assertTrue(source_capture["completion_pairing"]["complete"])
+            self.assertTrue(replay_capture["completion_pairing"]["complete"])
+            self.assertTrue(comparison[
+                "per_command_completion_latency_compared"])
+            self.assertEqual(
+                comparison["completion_latency_error_max_us"], 100.0)
+
+    def test_referee_rejects_ambiguous_completion_pairing_claim(self):
+        with tempfile.TemporaryDirectory() as directory:
+            capture = Path(directory) / "capture.jsonl"
+            write_capture(capture, [
+                {"event_type": "nvme_cmd", "seq": 0, "ts": 1,
+                 "op_name": "read", "slba": 0, "bytes": 4096,
+                 "hwq": 0, "cid": 3},
+                {"event_type": "nvme_cmd", "seq": 1, "ts": 2,
+                 "op_name": "read", "slba": 8, "bytes": 4096,
+                 "hwq": 0, "cid": 3},
+                {"event_type": "nvme_cmp", "ts": 3, "lat_ns": 1,
+                 "hwq": 0, "cid": 3, "status": 0},
+            ])
+            loaded = COMPARE.load(str(capture))
+            self.assertFalse(loaded["completion_pairing"]["complete"])
+            self.assertEqual(
+                loaded["completion_pairing"]["ambiguous_key_reuse"], 1)
+
+    def test_referee_does_not_claim_empty_completion_comparison(self):
+        empty = {
+            "commands": [],
+            "drops": 0,
+            "completion_pairing": {"complete": True},
+        }
+        comparison = COMPARE.exact_comparison(empty, empty, 4096)
+        self.assertTrue(comparison["tuple_sequence_equal"])
+        self.assertFalse(comparison[
+            "per_command_completion_latency_compared"])
+
     def test_referee_rejects_malformed_or_unsupported_capture(self):
         with tempfile.TemporaryDirectory() as directory:
             capture = Path(directory) / "capture.jsonl"
@@ -242,6 +305,87 @@ class IologTest(unittest.TestCase):
                 text=True, capture_output=True)
             self.assertNotEqual(tampered.returncode, 0)
             self.assertIn("iolog hash disagrees", tampered.stderr)
+
+    @unittest.skipUnless(VERIFIER.is_file(), "build verifier with make kvio-ir")
+    def test_compare_updates_bundle_with_checked_runtime_evidence(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source_path = root / "source.jsonl"
+            replay_path = root / "replay.jsonl"
+            records = [
+                {"event_type": "nvme_cmd", "seq": 0, "ts": 1_000_000,
+                 "op_name": "read", "slba": 1, "bytes": 4096,
+                 "hwq": 1, "cid": 9},
+                {"event_type": "nvme_cmp", "ts": 1_100_000,
+                 "lat_ns": 100_000, "hwq": 1, "cid": 9, "status": 0},
+            ]
+            write_capture(source_path, records)
+            write_capture(replay_path, records)
+            rows, metadata = MODULE.load_capture(str(source_path))
+            iolog = MODULE.emit_iolog(rows, "/dev/source")
+            certificate, normalized = MODULE.translation_certificate(
+                rows, iolog, str(source_path), metadata)
+            bundle = root / "bundle"
+            MODULE.write_bundle(str(bundle), iolog, certificate, normalized)
+
+            other_source = root / "other-source.jsonl"
+            other_records = [dict(record) for record in records]
+            other_records[0]["slba"] = 2
+            write_capture(other_source, other_records)
+            mismatched = subprocess.run(
+                [
+                    sys.executable,
+                    str(COMPARE_PATH),
+                    f"wrong:{other_source}:{other_source}",
+                    "--update-bundle",
+                    str(bundle),
+                ],
+                text=True,
+                capture_output=True,
+            )
+            self.assertNotEqual(mismatched.returncode, 0)
+            self.assertIn(
+                "source capture does not match the runtime bundle",
+                mismatched.stderr,
+            )
+
+            updated = subprocess.run(
+                [
+                    sys.executable,
+                    str(COMPARE_PATH),
+                    f"same:{source_path}:{replay_path}",
+                    "--update-bundle",
+                    str(bundle),
+                ],
+                text=True,
+                capture_output=True,
+            )
+            self.assertEqual(updated.returncode, 0, updated.stderr)
+            self.assertIn("device_stream_equal=True", updated.stdout)
+            runtime = json.loads(
+                (bundle / "certificate.json").read_text(encoding="utf-8")
+            )["runtime_device_validation"]
+            self.assertTrue(runtime["device_stream_equal"])
+            self.assertTrue(runtime["completion_pairing"][
+                "per_command_compared"])
+
+            verified = subprocess.run(
+                [str(VERIFIER), "certify", str(bundle)],
+                text=True, capture_output=True)
+            self.assertEqual(verified.returncode, 0, verified.stderr)
+            result = json.loads(verified.stdout)
+            self.assertEqual(result["runtime_device_validation"], runtime)
+
+            changed = json.loads(
+                (bundle / "certificate.json").read_text(encoding="utf-8"))
+            changed["runtime_device_validation"]["device_stream_equal"] = False
+            (bundle / "certificate.json").write_text(
+                json.dumps(changed), encoding="utf-8")
+            rejected = subprocess.run(
+                [str(VERIFIER), "certify", str(bundle)],
+                text=True, capture_output=True)
+            self.assertNotEqual(rejected.returncode, 0)
+            self.assertIn("device-stream verdict", rejected.stderr)
 
 
 if __name__ == "__main__":
