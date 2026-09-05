@@ -46,9 +46,10 @@ device commands.
 - **`mk_dev_iolog.py`** — capture → replay. Converts an
   `nvme_tp_monitor` JSONL capture into a fio version-3 iolog: one
   entry per captured NVMe command, with its byte offset, length, and
-  relative timestamp. It requires capture-time LBA metadata, rejects drops and
-  unknown operations, uses fio's microsecond timestamp unit, and reparses the
-  result to certify ordered operation/offset/length preservation.
+  relative timestamp. It requires a versioned, single-device/namespace capture
+  with capture-time LBA metadata, rejects drops and unknown operations, uses
+  fio's microsecond timestamp unit, and reparses the result to certify ordered
+  operation/offset/length preservation.
 - **`compare_streams.py`** — the referee. Takes N tp-monitor JSONLs
   (a capture plus any number of replays) and prints the comparison:
   exact operation, offset, length, and tuple sequences; issue-timing error;
@@ -83,6 +84,19 @@ workload. `nvme_uring_cmd_monitor --kv` is a separate path that records
 `key_hex`; never publish that output as an anonymized trace without additional
 review. Planned sanitization transforms and their fidelity tradeoffs are in
 `../../tools/kvio/TODO.md`.
+
+Treat the current capture and bundle as confidential engineering evidence. The
+bundle retains exact placement and timing and includes a digest of its source
+capture. It is not an external release package. A release format must rebuild
+all allowed files from a separate representation and receive an independent
+authorization decision; that format is not implemented yet.
+
+Capture schema v1 starts with one `capture_meta`, records the selected `--disk`,
+contains commands from one device/namespace identity, and ends with one
+terminal `drops` record. Both replay tools reject duplicate JSON keys, unknown
+versions, mixed scopes, and records after the footer. Use
+`--allow-legacy-capture` to inspect an old unversioned capture. That escape
+hatch does not prove which namespace an old stream covered.
 
 `make kvio-ir` builds an independent Rust validator. Run
 `./kvio fio-certify BUNDLE` to check the normalized workload hash, iolog hash,

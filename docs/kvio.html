@@ -502,6 +502,22 @@
     range, timing reveals cadence, and a distinctive pattern can identify a workload. The separate
     <code>nvme_uring_cmd_monitor --kv</code> path records <code>key_hex</code> and needs an
     additional privacy review before publication.</p>
+  <p>Keep three boundaries separate:</p>
+  <ul>
+    <li>A <strong>capture</strong> is confidential source evidence. It retains device scope,
+      exact placement, timing, queue metadata, and completion observations.</li>
+    <li>The current <strong>fio replay bundle</strong> is a confidential fidelity artifact. It
+      retains exact placement and timing, and its certificate contains a digest of the source
+      capture. <code>fio-certify</code> checks translation, not release safety.</li>
+    <li>An <strong>external release</strong> needs a fresh allowlisted grammar, independent
+      evidence, and human authorization. kvio does not implement that boundary yet. Do not export
+      a capture or current replay bundle merely because it is payload-free.</li>
+  </ul>
+  <p>Capture schema v1 begins with one <code>capture_meta</code> record, binds the stream to one
+    selected <code>--disk</code> and device/namespace identity, and ends with exactly one
+    <code>drops</code> record. Replay consumers reject duplicate JSON keys, unknown versions,
+    mixed scopes, and a non-terminal footer. Use <code>--allow-legacy-capture</code> to inspect an
+    old unversioned capture; the override cannot reconstruct its missing scope guarantee.</p>
   <p>Fidelity has a file gate and a runtime gate. <code>kvio iolog</code> plus the independent Rust
     <code>kvio fio-certify</code> check the finite requested stream. A second
     <code>kvio record</code> capture plus <code>kvio compare</code> checks the ordered operation,
@@ -520,7 +536,8 @@
   <p>New <code>nvme_tp_monitor</code> captures discover the selected namespace's logical LBA size
     from sysfs and record it with a stable command sequence. Without <code>--disk</code>, the
     monitor requires an explicit <code>--lba-size</code> because one value cannot describe several
-    namespaces. <code>kvio iolog</code> rejects incomplete captures, drops, and unsupported commands,
+    namespaces. <code>kvio iolog</code> rejects incomplete captures, drops, unsupported commands,
+    malformed versioned envelopes, and mixed scopes,
     converts nanoseconds to fio v3 microseconds, then independently reparses its output and checks
     the ordered <code>(operation, offset, length)</code> stream.</p>
   <pre><div class="bar"><span class="dot"></span><span class="dot"></span><span class="dot"></span>&nbsp; standard fio interchange</div><code><span class="k">sudo ./kvio</span> record <span class="v">--disk</span> nvme0n1 \

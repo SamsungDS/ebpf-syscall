@@ -9,77 +9,68 @@ part of the stream-equivalence claim.
 from __future__ import annotations
 
 import argparse
-import json
 from collections import Counter
+
+from capture_format import CaptureFormatError, load_records, validate_envelope
 
 
 class ComparisonError(ValueError):
     pass
 
 
-def load(path):
+def load(path, allow_legacy_capture=False):
     commands, latencies = [], []
     lba_bytes = None
-    drops = None
     seen_seq = set()
-    with open(path, encoding="utf-8") as source:
-        for source_seq, line in enumerate(source):
-            if not line.strip():
-                continue
-            try:
-                record = json.loads(line)
-            except json.JSONDecodeError as error:
+    try:
+        records = load_records(path)
+        envelope = validate_envelope(
+            path, records, allow_legacy=allow_legacy_capture)
+    except CaptureFormatError as error:
+        raise ComparisonError(str(error)) from error
+    for source_seq, (line_number, record) in enumerate(records):
+        event_type = record.get("event_type")
+        if event_type == "capture_meta" and record.get("lba_bytes") is not None:
+            candidate = int(record["lba_bytes"])
+            if lba_bytes is not None and lba_bytes != candidate:
+                raise ComparisonError(f"{path}: conflicting LBA sizes")
+            lba_bytes = candidate
+        elif event_type == "nvme_cmd":
+            operation = record["op_name"]
+            if operation not in ("read", "write", "flush"):
                 raise ComparisonError(
-                    f"{path}:{source_seq + 1}: invalid JSON") from error
-            if not isinstance(record, dict):
+                    f"{path}:{line_number}: unsupported NVMe command "
+                    f"{operation!r}")
+            sequence = int(record.get("seq", source_seq))
+            if sequence in seen_seq:
                 raise ComparisonError(
-                    f"{path}:{source_seq + 1}: expected a JSON object")
-            event_type = record.get("event_type")
-            if event_type == "capture_meta" and record.get("lba_bytes") is not None:
-                candidate = int(record["lba_bytes"])
-                if lba_bytes is not None and lba_bytes != candidate:
-                    raise ComparisonError(f"{path}: conflicting LBA sizes")
-                lba_bytes = candidate
-            elif event_type == "drops":
-                candidate = int(record.get("dropped", 0))
-                if drops is not None and drops != candidate:
-                    raise ComparisonError(f"{path}: conflicting drop counts")
-                drops = candidate
-            elif event_type == "nvme_cmd":
-                operation = record["op_name"]
-                if operation not in ("read", "write", "flush"):
-                    raise ComparisonError(
-                        f"{path}:{source_seq + 1}: unsupported NVMe command "
-                        f"{operation!r}")
-                sequence = int(record.get("seq", source_seq))
-                if sequence in seen_seq:
-                    raise ComparisonError(
-                        f"{path}: duplicate command sequence {sequence}")
-                seen_seq.add(sequence)
-                timestamp = int(record["ts"])
-                slba = 0 if operation == "flush" else int(record["slba"])
-                length = 0 if operation == "flush" else int(record["bytes"])
-                if sequence < 0 or timestamp < 0 or slba < 0 or length < 0:
-                    raise ComparisonError(
-                        f"{path}:{source_seq + 1}: negative command field")
-                if operation != "flush" and length == 0:
-                    raise ComparisonError(
-                        f"{path}:{source_seq + 1}: zero command length")
-                commands.append({
-                    "seq": sequence,
-                    "source_seq": source_seq,
-                    "ts": timestamp,
-                    "op": "datasync" if operation == "flush" else operation,
-                    "slba": slba,
-                    "bytes": length,
-                })
-            elif event_type == "nvme_cmp":
-                latencies.append(int(record["lat_ns"]) / 1e3)
+                    f"{path}: duplicate command sequence {sequence}")
+            seen_seq.add(sequence)
+            timestamp = int(record["ts"])
+            slba = 0 if operation == "flush" else int(record["slba"])
+            length = 0 if operation == "flush" else int(record["bytes"])
+            if sequence < 0 or timestamp < 0 or slba < 0 or length < 0:
+                raise ComparisonError(
+                    f"{path}:{line_number}: negative command field")
+            if operation != "flush" and length == 0:
+                raise ComparisonError(
+                    f"{path}:{line_number}: zero command length")
+            commands.append({
+                "seq": sequence,
+                "source_seq": source_seq,
+                "ts": timestamp,
+                "op": "datasync" if operation == "flush" else operation,
+                "slba": slba,
+                "bytes": length,
+            })
+        elif event_type == "nvme_cmp":
+            latencies.append(int(record["lat_ns"]) / 1e3)
     commands.sort(key=lambda command: (
         command["ts"], command["seq"], command["source_seq"]))
     latencies.sort()
     return {"commands": commands, "latencies_us": latencies,
-            "lba_bytes": lba_bytes, "drops": drops}
+            "lba_bytes": lba_bytes, "drops": envelope.drops,
+            "capture_scope": envelope.scope}
 
 
 def _percentile(values, fraction):
@@ -146,8 +137,10 @@ def exact_comparison(source, replay, lba_bytes):
     return result
 
 
-def report(name, paths, lba_override=None):
-    captures = {label: load(path) for label, path in paths}
+def report(name, paths, lba_override=None, allow_legacy_capture=False):
+    captures = {
+        label: load(path, allow_legacy_capture) for label, path in paths
+    }
     source = captures["capture"]
     lba_bytes = lba_override or source["lba_bytes"]
     if lba_bytes is None:
@@ -184,6 +177,9 @@ def build_parser():
                         help="NAME:CAPTURE:REPLAY_A[:REPLAY_B...] (legacy interface)")
     parser.add_argument("--lba-bytes", type=int,
                         help="required for legacy captures without capture_meta")
+    parser.add_argument(
+        "--allow-legacy-capture", action="store_true",
+        help="accept unversioned captures without v1 scope guarantees")
     return parser
 
 
@@ -198,7 +194,7 @@ def main(argv=None):
             paths = [("capture", capture_path)]
             paths.extend((f"replay-{index + 1}", path)
                          for index, path in enumerate(replays))
-            report(name, paths, args.lba_bytes)
+            report(name, paths, args.lba_bytes, args.allow_legacy_capture)
     except (ComparisonError, OSError, KeyError, TypeError, ValueError) as error:
         raise SystemExit(f"kvio compare: {error}") from error
     return 0

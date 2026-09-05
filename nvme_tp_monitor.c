@@ -167,6 +167,18 @@ int main(int argc, char **argv)
 			return 0;
 		} else { fprintf(stderr, "unknown arg %s\n", argv[i]); return 2; }
 	}
+	if (disk_filter) {
+		if (!*disk_filter) {
+			fprintf(stderr, "--disk must be an NVMe block-device name\n");
+			return 2;
+		}
+		for (const char *p = disk_filter; *p; p++) {
+			if (!isalnum((unsigned char)*p)) {
+				fprintf(stderr, "--disk must be an NVMe block-device name\n");
+				return 2;
+			}
+		}
+	}
 	if (!lba_size) {
 		int error;
 
@@ -209,14 +221,16 @@ int main(int argc, char **argv)
 	if (disk_filter)
 		fprintf(out,
 			"{\"event_type\":\"capture_meta\","
-			"\"emitter\":\"nvme_tp_monitor\",\"lba_bytes\":%u,"
-			"\"lba_source\":\"%s\",\"disk_filter\":true}\n",
-			lba_size, lba_source);
+			"\"schema_version\":1,\"emitter\":\"nvme_tp_monitor\","
+			"\"lba_bytes\":%u,\"lba_source\":\"%s\","
+			"\"disk_filter\":true,\"disk\":\"%s\"}\n",
+			lba_size, lba_source, disk_filter);
 	else
 		fprintf(out,
 			"{\"event_type\":\"capture_meta\","
-			"\"emitter\":\"nvme_tp_monitor\",\"lba_bytes\":%u,"
-			"\"lba_source\":\"%s\",\"disk_filter\":false}\n",
+			"\"schema_version\":1,\"emitter\":\"nvme_tp_monitor\","
+			"\"lba_bytes\":%u,\"lba_source\":\"%s\","
+			"\"disk_filter\":false,\"disk\":null}\n",
 			lba_size, lba_source);
 	emit_anchor();
 	time_t t0 = time(NULL), last_anchor = t0;

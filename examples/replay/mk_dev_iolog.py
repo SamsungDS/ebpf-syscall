@@ -17,6 +17,8 @@ import hashlib
 import json
 from pathlib import Path
 
+from capture_format import CaptureFormatError, load_records, validate_envelope
+
 
 V3_HEADER = "fio version 3 iolog"
 SUPPORTED = {"read", "write", "flush"}
@@ -39,52 +41,50 @@ def _sha256_file(path: str | Path) -> str:
 
 
 def load_capture(path: str, requested_lba: int | None = None,
-                 allow_drops: bool = False, allow_unsupported: bool = False):
+                 allow_drops: bool = False, allow_unsupported: bool = False,
+                 allow_legacy_capture: bool = False):
     rows = []
     metadata_lba = None
-    drops = None
     unsupported = []
     seen_seq = set()
-    with open(path, encoding="utf-8") as source:
-        for source_seq, line in enumerate(source):
-            try:
-                record = json.loads(line)
-            except json.JSONDecodeError as error:
-                raise CaptureError(f"{path}:{source_seq + 1}: invalid JSON") from error
-            event_type = record.get("event_type")
-            if event_type == "capture_meta" and record.get("lba_bytes") is not None:
-                candidate = int(record["lba_bytes"])
-                if metadata_lba is not None and metadata_lba != candidate:
-                    raise CaptureError("capture contains conflicting LBA sizes")
-                metadata_lba = candidate
-            elif event_type == "drops":
-                drops = int(record.get("dropped", 0))
-            elif event_type == "nvme_cmd":
-                operation = record.get("op_name")
-                if operation not in SUPPORTED:
-                    unsupported.append((source_seq + 1, operation))
-                    continue
-                seq = int(record.get("seq", source_seq))
-                timestamp_ns = int(record["ts"])
-                slba = int(record.get("slba", 0))
-                length_bytes = 0 if operation == "flush" else int(record["bytes"])
-                if seq in seen_seq:
-                    raise CaptureError(f"capture contains duplicate command seq {seq}")
-                if seq < 0 or timestamp_ns < 0 or slba < 0:
-                    raise CaptureError(f"{path}:{source_seq + 1}: negative command field")
-                if operation != "flush" and length_bytes <= 0:
-                    raise CaptureError(f"{path}:{source_seq + 1}: non-positive command length")
-                seen_seq.add(seq)
-                rows.append({
-                    "seq": seq,
-                    "source_seq": source_seq,
-                    "timestamp_ns": timestamp_ns,
-                    "op": "datasync" if operation == "flush" else operation,
-                    "slba": slba,
-                    "length_bytes": length_bytes,
-                })
-    if drops is None:
-        raise CaptureError("capture has no final drops record; it may be incomplete")
+    try:
+        records = load_records(path)
+        envelope = validate_envelope(
+            path, records, allow_legacy=allow_legacy_capture)
+    except CaptureFormatError as error:
+        raise CaptureError(str(error)) from error
+    for source_seq, (line_number, record) in enumerate(records):
+        event_type = record.get("event_type")
+        if event_type == "capture_meta" and record.get("lba_bytes") is not None:
+            candidate = int(record["lba_bytes"])
+            if metadata_lba is not None and metadata_lba != candidate:
+                raise CaptureError("capture contains conflicting LBA sizes")
+            metadata_lba = candidate
+        elif event_type == "nvme_cmd":
+            operation = record.get("op_name")
+            if operation not in SUPPORTED:
+                unsupported.append((line_number, operation))
+                continue
+            seq = int(record.get("seq", source_seq))
+            timestamp_ns = int(record["ts"])
+            slba = int(record.get("slba", 0))
+            length_bytes = 0 if operation == "flush" else int(record["bytes"])
+            if seq in seen_seq:
+                raise CaptureError(f"capture contains duplicate command seq {seq}")
+            if seq < 0 or timestamp_ns < 0 or slba < 0:
+                raise CaptureError(f"{path}:{line_number}: negative command field")
+            if operation != "flush" and length_bytes <= 0:
+                raise CaptureError(f"{path}:{line_number}: non-positive command length")
+            seen_seq.add(seq)
+            rows.append({
+                "seq": seq,
+                "source_seq": source_seq,
+                "timestamp_ns": timestamp_ns,
+                "op": "datasync" if operation == "flush" else operation,
+                "slba": slba,
+                "length_bytes": length_bytes,
+            })
+    drops = envelope.drops
     if drops and not allow_drops:
         raise CaptureError(f"capture reports {drops} dropped events; use --allow-drops to override")
     if unsupported and not allow_unsupported:
@@ -115,6 +115,9 @@ def load_capture(path: str, requested_lba: int | None = None,
     return rows, {
         "lba_bytes": lba_bytes, "drops": drops,
         "unsupported_commands_omitted": len(unsupported),
+        "capture_schema_version": (
+            None if envelope.legacy else envelope.metadata["schema_version"]),
+        "capture_scope": envelope.scope,
     }
 
 
@@ -257,6 +260,9 @@ def build_parser() -> argparse.ArgumentParser:
                         help="required for legacy captures without capture_meta")
     parser.add_argument("--allow-drops", action="store_true")
     parser.add_argument("--allow-unsupported", action="store_true")
+    parser.add_argument(
+        "--allow-legacy-capture", action="store_true",
+        help="accept an unversioned capture without v1 scope guarantees")
     parser.add_argument("--bundle-dir", help="write a certified portable fio bundle")
     return parser
 
@@ -265,7 +271,8 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
         rows, meta = load_capture(
-            args.capture, args.lba_bytes, args.allow_drops, args.allow_unsupported)
+            args.capture, args.lba_bytes, args.allow_drops,
+            args.allow_unsupported, args.allow_legacy_capture)
         iolog = emit_iolog(rows, args.device)
         certificate, normalized = translation_certificate(rows, iolog, args.capture, meta)
         if args.bundle_dir:

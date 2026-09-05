@@ -103,6 +103,24 @@ exposes cadence, and a distinctive pattern can identify a workload. The
 separate `nvme_uring_cmd_monitor --kv` path records `key_hex` and requires an
 additional privacy review before sharing.
 
+There are three separate artifacts and decisions:
+
+1. A **capture** is confidential source evidence. It includes device scope,
+   exact placement, issue timing, queue metadata, and completion observations.
+2. A **fio replay bundle** is a confidential fidelity artifact. It preserves
+   exact placement and timing, and its current certificate contains a digest of
+   the source capture. `fio-certify` checks translation, not release safety.
+3. An **external release** needs a separate allowlisted format and approval
+   process. kvio does not implement that format yet. Do not export a current
+   capture or replay bundle merely because it contains no payload bytes.
+
+New capture schema v1 files begin with one `capture_meta` record, bind the
+stream to one `--disk` scope, and end with exactly one `drops` record. The
+replay tools reject duplicate JSON keys, unknown schema versions, mixed
+device/namespace commands, and a non-terminal drops record. Old unversioned
+captures require `--allow-legacy-capture`; that option permits inspection but
+cannot add the missing scope guarantee.
+
 Fidelity has two gates. `kvio iolog` and the independent Rust
 `kvio fio-certify` check the finite requested stream before execution. Run fio
 under a second `kvio record` capture and use `kvio compare` to check the
@@ -145,8 +163,9 @@ content-reuse policy, not a claim that kvio implements CacheBlend.
 ## fio interchange and the exact claim
 
 `kvio iolog` converts a measured NVMe capture to fio v3 microsecond timestamps,
-preserves equal-timestamp order, requires the capture-time LBA size, and rejects
-drops or unsupported commands. `--bundle-dir` emits the iolog, block and
+preserves equal-timestamp order, requires a versioned single-scope capture and
+its LBA size, and rejects drops or unsupported commands. `--bundle-dir` emits
+the iolog, block and
 NVMe-passthrough job files, normalized IR, checksums, and a translation
 certificate. The certificate establishes that reparsing the fio artifact gives
 the same ordered operation/offset/length sequence. It does not establish that

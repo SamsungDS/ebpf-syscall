@@ -4,12 +4,14 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 MODULE_PATH = ROOT / "examples" / "replay" / "mk_dev_iolog.py"
+sys.path.insert(0, str(MODULE_PATH.parent))
 SPEC = importlib.util.spec_from_file_location("mk_dev_iolog", MODULE_PATH)
 MODULE = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(MODULE)
@@ -21,7 +23,18 @@ VERIFIER = ROOT / "tools" / "kvio" / "build" / "kvio-ir"
 
 
 def write_capture(path, rows, *, lba=4096, drops=0):
-    records = [{"event_type": "capture_meta", "lba_bytes": lba}, *rows,
+    commands = []
+    for row in rows:
+        row = dict(row)
+        if row.get("event_type") == "nvme_cmd":
+            row.setdefault("disk", "nvme1n1")
+            row.setdefault("nsid", 1)
+        commands.append(row)
+    records = [{
+        "event_type": "capture_meta", "schema_version": 1,
+        "emitter": "nvme_tp_monitor", "lba_bytes": lba,
+        "lba_source": "sysfs", "disk_filter": True, "disk": "nvme1n1",
+    }, *commands,
                {"event_type": "drops", "dropped": drops}]
     path.write_text("".join(json.dumps(row) + "\n" for row in records), encoding="utf-8")
 
@@ -56,6 +69,65 @@ class IologTest(unittest.TestCase):
             ])
             with self.assertRaisesRegex(COMPARE.ComparisonError, "unsupported"):
                 COMPARE.load(str(capture))
+
+    def test_capture_rejects_duplicate_json_keys(self):
+        with tempfile.TemporaryDirectory() as directory:
+            capture = Path(directory) / "capture.jsonl"
+            capture.write_text(
+                '{"event_type":"capture_meta","schema_version":1,'
+                '"emitter":"nvme_tp_monitor","lba_bytes":4096,'
+                '"lba_source":"sysfs","disk_filter":true,'
+                '"disk":"nvme1n1"}\n'
+                '{"event_type":"nvme_cmd","disk":"nvme1n1","nsid":1,'
+                '"seq":0,"ts":1,"op_name":"read","slba":1,'
+                '"slba":2,"bytes":4096}\n'
+                '{"event_type":"drops","dropped":0}\n',
+                encoding="utf-8")
+            with self.assertRaisesRegex(MODULE.CaptureError,
+                                        "duplicate JSON key 'slba'"):
+                MODULE.load_capture(str(capture))
+            with self.assertRaisesRegex(COMPARE.ComparisonError,
+                                        "duplicate JSON key 'slba'"):
+                COMPARE.load(str(capture))
+
+    def test_capture_requires_terminal_drop_accounting(self):
+        with tempfile.TemporaryDirectory() as directory:
+            capture = Path(directory) / "capture.jsonl"
+            write_capture(capture, [
+                {"event_type": "nvme_cmd", "seq": 0, "ts": 1,
+                 "op_name": "read", "slba": 0, "bytes": 4096},
+            ])
+            lines = capture.read_text(encoding="utf-8").splitlines()
+            capture.write_text("\n".join([lines[0], lines[2], lines[1]]) + "\n",
+                               encoding="utf-8")
+            with self.assertRaisesRegex(MODULE.CaptureError,
+                                        "drops record must be the final"):
+                MODULE.load_capture(str(capture))
+
+    def test_capture_rejects_unknown_version_and_mixed_scope(self):
+        with tempfile.TemporaryDirectory() as directory:
+            capture = Path(directory) / "capture.jsonl"
+            rows = [
+                {"event_type": "nvme_cmd", "seq": 0, "ts": 1,
+                 "op_name": "read", "slba": 0, "bytes": 4096},
+            ]
+            write_capture(capture, rows)
+            text = capture.read_text(encoding="utf-8")
+            capture.write_text(text.replace('"schema_version": 1',
+                                            '"schema_version": 2'),
+                               encoding="utf-8")
+            with self.assertRaisesRegex(MODULE.CaptureError,
+                                        "unsupported capture schema_version 2"):
+                MODULE.load_capture(str(capture))
+
+            write_capture(capture, rows + [
+                {"event_type": "nvme_cmd", "disk": "nvme1n1", "nsid": 2,
+                 "seq": 1, "ts": 2, "op_name": "read", "slba": 1,
+                 "bytes": 4096},
+            ])
+            with self.assertRaisesRegex(MODULE.CaptureError,
+                                        "spans multiple device/namespace"):
+                MODULE.load_capture(str(capture))
 
     def test_iolog_uses_microseconds_and_stable_equal_timestamp_order(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -99,8 +171,12 @@ class IologTest(unittest.TestCase):
                 json.dumps({"event_type": "drops", "dropped": 0}) + "\n",
                 encoding="utf-8")
             with self.assertRaisesRegex(MODULE.CaptureError, "pass --lba-bytes"):
-                MODULE.load_capture(str(capture))
-            rows, metadata = MODULE.load_capture(str(capture), requested_lba=512)
+                MODULE.load_capture(str(capture), allow_legacy_capture=True)
+            with self.assertRaisesRegex(MODULE.CaptureError,
+                                        "legacy unversioned format"):
+                MODULE.load_capture(str(capture), requested_lba=512)
+            rows, metadata = MODULE.load_capture(
+                str(capture), requested_lba=512, allow_legacy_capture=True)
             self.assertEqual(rows[0]["offset_bytes"], 512)
             self.assertEqual(metadata["lba_bytes"], 512)
 

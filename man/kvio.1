@@ -147,6 +147,25 @@ without review: that mode records each 16-byte object key as
 kvio does not yet provide a general sanitizer that remaps offsets and time
 while stating the fidelity lost by that transform.  This work is tracked in
 .IR tools/kvio/TODO.md .
+.PP
+Keep three boundaries separate.  A capture is confidential source evidence.
+The current fio bundle is a confidential fidelity artifact: it preserves exact
+placement and timing and contains a digest of the source capture.  It is not an
+external release package.  An external release needs a fresh allowlisted
+format, independent evidence, and human authorization; kvio does not implement
+that boundary yet.
+.PP
+Capture schema version 1 starts with one
+.B capture_meta
+record, identifies one selected
+.B \--disk
+scope, and ends with exactly one
+.B drops
+record.  Replay consumers reject duplicate JSON keys, unknown versions, mixed
+device or namespace identities, and records after that footer.  To inspect an
+older unversioned capture, pass
+.BR \--allow-legacy-capture .
+This compatibility option cannot restore missing scope evidence.
 .SH DGRAPHFIN EXAMPLE
 The DGraphFin case study demonstrates how a payload-free device trace can show
 the benefit of an architectural change.  DGraphFin is a public
@@ -184,8 +203,9 @@ sensitive metadata.
 .SS Requested stream
 .B kvio iolog
 rejects an incomplete capture, reported drops, unsupported operations,
-duplicate sequence values, missing or conflicting LBA geometry, unaligned
-ranges, and arithmetic overflow.  It sorts commands by monotonic timestamp
+duplicate JSON keys or sequence values, unknown capture versions, mixed
+device/namespace scope, non-terminal accounting, missing or conflicting LBA
+geometry, unaligned ranges, and arithmetic overflow.  It sorts commands by monotonic timestamp
 and stable sequence, emits relative fio microseconds, reparses the result, and
 certifies the ordered operation, offset, and length stream.  Timestamp
 quantization is less than one microsecond.

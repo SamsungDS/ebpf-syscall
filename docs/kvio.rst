@@ -247,6 +247,25 @@ distinctive pattern can identify a workload. The separate
 ``nvme_uring_cmd_monitor --kv`` path records ``key_hex`` and needs an
 additional privacy review before publication.
 
+Keep three boundaries separate:
+
+* A **capture** is confidential source evidence. It retains device scope,
+  exact placement, timing, queue metadata, and completion observations.
+* The current **fio replay bundle** is a confidential fidelity artifact. It
+  retains exact placement and timing, and its certificate contains a digest of
+  the source capture. ``fio-certify`` checks translation, not release safety.
+* An **external release** needs a fresh allowlisted grammar, independent
+  evidence, and human authorization. kvio does not implement that boundary
+  yet. Do not export a capture or current replay bundle merely because it is
+  payload-free.
+
+Capture schema v1 begins with one ``capture_meta`` record, binds the stream to
+one selected ``--disk`` and device/namespace identity, and ends with exactly
+one ``drops`` record. Replay consumers reject duplicate JSON keys, unknown
+versions, mixed scopes, and a non-terminal footer. Use
+``--allow-legacy-capture`` to inspect old unversioned captures; the override
+cannot reconstruct their missing scope guarantee.
+
 Fidelity has a file gate and a runtime gate. ``kvio iolog`` plus the
 independent Rust ``kvio fio-certify`` check the finite requested stream. A
 second ``kvio record`` capture plus ``kvio compare`` checks the ordered
@@ -345,8 +364,9 @@ Storage engineers can consume a captured stream without learning kvio's
 engine.  New ``nvme_tp_monitor`` captures discover the selected namespace's
 logical LBA size from sysfs and record it with a stable command sequence.
 Without ``--disk``, the monitor requires an explicit ``--lba-size`` because a
-single value cannot describe several namespaces.  ``kvio iolog`` rejects incomplete captures, dropped
-events, and unsupported commands by default, converts monotonic nanoseconds to
+single value cannot describe several namespaces.  ``kvio iolog`` rejects
+incomplete captures, dropped events, unsupported commands, malformed versioned
+envelopes, and mixed scopes by default, converts monotonic nanoseconds to
 fio v3 microseconds, reparses its own output, and can emit a portable bundle::
 
    sudo ./kvio record --disk nvme0n1 \
