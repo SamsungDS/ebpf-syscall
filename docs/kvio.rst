@@ -223,6 +223,10 @@ it does not recreate a capture.
      - An application-level agent trace
      - Compile observed requests into a cache load/store plan
      - No
+   * - ``kvio catalog``
+     - Pinned workload metadata
+     - Validate source, capture, privacy, and hardware evidence
+     - No
    * - ``kvio workload``
      - Model settings or an agent plan
      - Issue cache loads and stores through LMCache's real storage engine
@@ -444,6 +448,15 @@ TraceLab split by Claude and Codex for real day-to-day coding-agent cache
 accounting, and TauBench for a non-coding agent domain.  Add each as a pinned,
 separately labeled workload; do not average them into one supposed universal
 "agent" profile.
+
+``kvio catalog`` records this contribution boundary as validated JSON. Each
+entry must name its source URL and revision, optional artifact SHA-256, capture
+method, timing/session/content evidence, privacy transformation and residual
+disclosure, hardware geometry, and evidence label. Run ``kvio catalog --check``
+in CI or ``kvio catalog --json`` to inspect it. The initial LMCache and TraceLab
+entries are ``trace-derived`` and explicitly lack device geometry; they are not
+measured storage profiles. A ``measured`` entry must supply the device model,
+logical LBA size, maximum transfer size, kernel, and capture tool.
 
 Export and certify fio replays
 ------------------------------

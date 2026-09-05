@@ -165,6 +165,11 @@ Keep request timing and session boundaries, pin the dataset artifact, label
 the output `trace-derived`, and never turn one source into a universal
 `agent` benchmark. `docs/kvio.rst` records the current source revisions and
 the OpenCode, Aider/RepoAgent, TraceLab, and TauBench contribution lanes.
+`kvio catalog` is the closed machine-readable source of workload provenance.
+Keep source revision, capture method, privacy transform, residual disclosure,
+hardware geometry, and evidence label explicit. Do not label an entry
+`measured` without complete device geometry; the initial LMCache and TraceLab
+entries are `trace-derived` and have no storage-device evidence.
 
 ## Reproduce recipes
 

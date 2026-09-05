@@ -113,6 +113,7 @@ it does not recreate a capture.
 |---|---|---|---|
 | `kvio plan` | Model and cache geometry | Predict command sizes and counts; no application timing or reuse | No |
 | `kvio trace` | An application-level agent trace | Compile observed requests into a cache load/store plan | No |
+| `kvio catalog` | Pinned workload metadata | List or validate source, capture, privacy, and hardware evidence | No |
 | `kvio workload` | Model settings or an agent plan | Issue cache loads and stores through LMCache's real storage engine | Yes; may write |
 | `kvio record` | A selected NVMe namespace | Observe the commands that actually reach the NVMe driver | Read-only observation |
 | `kvio perfetto` | Semantic records plus a device capture | Attribute device commands to cache objects and make a timeline | No |
@@ -250,6 +251,15 @@ The plan uses complete chunks only. `--policy prefix` models ordinary
 prefix-key lookup, `--policy substring` recognizes exact complete chunks after
 a shift, and `--capacity-chunks` enables LRU eviction. The latter is a simple
 content-reuse policy, not a claim that kvio implements CacheBlend.
+
+`kvio catalog` makes the contribution boundary machine-readable. The built-in
+catalog records each source URL and revision, optional artifact SHA-256,
+capture method, timing/session/content evidence, privacy transformation and
+residual disclosure, hardware geometry, and evidence label. Use `--check` in
+CI or `--json` to inspect it. The initial LMCache and TraceLab entries are
+`trace-derived` and explicitly have no device geometry; they are not measured
+storage profiles. A new `measured` entry must provide device model, logical LBA
+size, maximum transfer size, kernel, and capture tool.
 
 ## fio interchange and the exact claim
 

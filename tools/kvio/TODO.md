@@ -110,8 +110,10 @@ reject ambiguous or reused mappings rather than inventing that attribution.
 
 ## Grow the real-workload catalog
 
-- [ ] Add a machine-readable workload schema with source, revision, capture
+- [x] Add a machine-readable workload schema with source, revision, capture
   method, hardware geometry, privacy transformation, and evidence label.
+  Validate unknown fields, duplicate identifiers, artifact digests, and the
+  distinction between trace-derived and device-measured evidence.
 - [ ] Record real agentic prefix-growth, restore, eviction, and same-device
   interference traces. Keep synthetic stress profiles clearly labeled.
 - [ ] Add measured profiles only after preserving the source record and the

@@ -485,6 +485,14 @@
     OpenCode or MiniSWE for append-heavy prefix growth, Aider or RepoAgent for shifted repository
     context, TraceLab split by Claude and Codex for everyday coding-agent accounting, and TauBench
     for a non-coding domain. Keep each pinned and separately labeled.</div>
+  <p><code>kvio catalog</code> records that contribution boundary as validated JSON. Each entry
+    names its source URL and revision, optional artifact SHA-256, capture method,
+    timing/session/content evidence, privacy transformation and residual disclosure, hardware
+    geometry, and evidence label. Run <code>kvio catalog --check</code> in CI or
+    <code>kvio catalog --json</code> to inspect it. The initial LMCache and TraceLab entries are
+    <code>trace-derived</code> and explicitly lack device geometry; they are not measured storage
+    profiles. A <code>measured</code> entry must supply the device model, logical LBA size, maximum
+    transfer size, kernel, and capture tool.</p>
   <div class="note warn"><b class="tag">policy boundary</b>
     <code>--policy substring</code> recognizes identical complete token chunks after a shift. It is
     a useful fixed-chunk model, not a claim that kvio implements CacheBlend. Incomplete tail chunks
@@ -498,6 +506,7 @@
     <tbody>
       <tr><td><code>kvio plan</code></td><td>Model and cache geometry</td><td>Predict command sizes and counts; no application timing or reuse</td><td>No</td></tr>
       <tr><td><code>kvio trace</code></td><td>Application-level agent trace</td><td>Compile observed requests into a cache load/store plan</td><td>No</td></tr>
+      <tr><td><code>kvio catalog</code></td><td>Pinned workload metadata</td><td>Validate source, capture, privacy, and hardware evidence</td><td>No</td></tr>
       <tr><td><code>kvio workload</code></td><td>Model settings or an agent plan</td><td>Issue cache loads and stores through LMCache's real engine</td><td>Yes; may write</td></tr>
       <tr><td><code>kvio record</code></td><td>Selected NVMe namespace</td><td>Observe commands that reach the NVMe driver</td><td>Read-only observation</td></tr>
       <tr><td><code>kvio perfetto</code></td><td>Semantic records and device capture</td><td>Attribute commands to cache objects and make a timeline</td><td>No</td></tr>

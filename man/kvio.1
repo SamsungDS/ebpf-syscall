@@ -32,6 +32,15 @@ LMCache traces can derive content identity with a pinned tokenizer.  Promptless
 TraceLab records retain observed token and cache accounting but must model
 logical chunk identity.
 .TP
+.B catalog
+List or validate the pinned workload catalog.  Each entry records source and
+revision, capture method, privacy transformation, residual disclosure,
+hardware geometry, and evidence label.  Use
+.B \-\-check
+for validation or
+.B \-\-json
+for the complete machine-readable catalog.
+.TP
 .B workload
 Issue stores and loads through LMCache's real raw-block engine.  It accepts a
 model configuration or a plan made by
@@ -358,6 +367,15 @@ kvio plan --model Llama-3.1-8B --chunk-tokens 256 --op store
 .fi
 .RE
 .PP
+Inspect and validate pinned workload evidence:
+.PP
+.RS
+.nf
+kvio catalog
+kvio catalog --check
+.fi
+.RE
+.PP
 Make and check a portable replay bundle:
 .PP
 .RS
@@ -397,6 +415,9 @@ The bundle retains exact placement and timing and remains confidential.
 .TP
 .I tools/kvio/README.md
 Full command workflows, model geometry, engine design, and benchmark profiles.
+.TP
+.I tools/kvio/workload_catalog.json
+Pinned workload sources and their capture, privacy, and hardware evidence.
 .TP
 .I examples/replay/README.md
 Device-level replay rationale, fio translation, and runtime fidelity method.
