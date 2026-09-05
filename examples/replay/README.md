@@ -87,6 +87,12 @@ latency timestamps have the same result. Independent latency distributions
 remain visible, and none of these measurements is application end-to-end
 latency.
 
+Completion success is another independent claim. Two captures can have the
+same requested `(operation, offset, length)` stream while the replay returns a
+nonzero NVMe completion status. The report and stored runtime evidence retain
+the source and replay error counts and claim `all_commands_succeeded` only when
+every command pairs unambiguously and every completion status is zero.
+
 To attach one observed replay result to the bundle that produced it:
 
 ```bash
@@ -97,10 +103,11 @@ To attach one observed replay result to the bundle that produced it:
 
 The update requires the source capture hash and normalized commands to match
 the existing bundle. It records the replay capture hash, drop status, ordered
-stream verdicts, timing summaries, and completion-pairing status, then refreshes
-`SHA256SUMS`. An interrupted update leaves a detectable checksum mismatch; rerun
-the command from intact captures and bundle files. The bundle still exposes
-exact placement and timing and remains confidential internal evidence.
+stream verdicts, timing summaries, pairing status, and completion status, then
+refreshes `SHA256SUMS`. An interrupted update leaves a
+detectable checksum mismatch; rerun the command from intact captures and bundle
+files. The bundle still exposes exact placement and timing and remains
+confidential internal evidence.
 
 The device capture is payload-free, not necessarily anonymous. Exact offsets,
 timing, namespace identity, and an unusual request shape can fingerprint a

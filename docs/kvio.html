@@ -554,7 +554,10 @@
     missing or orphan completions, and inconsistent latency timestamps disable the paired claim.
     <code>--update-bundle BUNDLE</code> stores one hash-bound source/replay result in its matching
     confidential bundle, refreshes its checksums, and lets <code>fio-certify</code> reject
-    contradictory runtime fields. This does not measure application end-to-end latency.</p>
+    contradictory runtime fields. Completion error counts and
+    <code>all_commands_succeeded</code> are separate from requested-stream equality: the same
+    ordered requests can still return a nonzero NVMe status. This does not measure application
+    end-to-end latency.</p>
   <p>The replay claim ends at one NVMe leaf namespace. <code>nvme_tp_monitor --disk</code>
     matches the requested name against the leaf request's kernel <code>disk_name</code>; use a
     whole namespace such as <code>nvme1n1</code>, not a partition. IO through a filesystem,

@@ -94,7 +94,10 @@ uploads). `pip install perfetto`.
    With one replay, `--update-bundle` stores a hash-bound runtime verdict in
    the matching confidential bundle. Completion latency is paired only when
    queue and command-ID reuse is unambiguous; never promote it to application
-   latency or a general fio-performance claim.
+   latency or a general fio-performance claim. Requested-stream equality and
+   completion success are separate: preserve nonzero NVMe status counts and
+   require complete pairing plus status zero before saying all commands
+   succeeded.
 
 The device witness is a leaf-namespace view. A stack above NVMe may map,
 split, merge, or reorder IO before the tracepoint, and schema v1 does not record

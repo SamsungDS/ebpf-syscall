@@ -321,8 +321,10 @@ command ID may be reused after its earlier command completes; overlapping reuse,
 missing or orphan completions, and inconsistent latency timestamps disable the
 paired claim. ``--update-bundle BUNDLE`` stores one hash-bound source/replay
 result in its matching confidential bundle, refreshes its checksums, and lets
-``fio-certify`` reject contradictory runtime fields. This does not measure
-application end-to-end latency.
+``fio-certify`` reject contradictory runtime fields. Completion error counts
+and ``all_commands_succeeded`` are separate from requested-stream equality:
+the same ordered requests can still return a nonzero NVMe status. This does not
+measure application end-to-end latency.
 
 The replay claim ends at one NVMe leaf namespace. ``nvme_tp_monitor --disk``
 matches the requested name against the leaf request's kernel ``disk_name``;

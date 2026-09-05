@@ -271,8 +271,11 @@ hardware queue and NVMe command ID.  For example, queue 2 may reuse command ID
 the per-command latency claim.  Missing or orphan completions and inconsistent
 latency timestamps also disable it.  When both captures pair completely and
 their command tuples match, kvio reports the per-command latency-error
-distribution.  It does not measure application end-to-end latency, model
-latency, time to first token, or time per output token.
+distribution.  It separately reports nonzero completion counts and whether
+every paired command completed with NVMe status zero.  Requested-stream
+equality does not imply completion success.  kvio does not measure application
+end-to-end latency, model latency, time to first token, or time per output
+token.
 .PP
 Fio pacing, submission engines, Linux scheduling, and the controller can
 change timing even when the input file is exact.  Re-recording is therefore

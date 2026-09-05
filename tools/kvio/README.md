@@ -196,10 +196,13 @@ ordered operation/offset/length tuples actually issued by the runtime. The
 comparison also reports rebased issue-time errors and completion-latency
 distributions. When both captures contain unambiguous queue and command-ID
 pairs, it matches every completion to its command and reports per-command
-latency error. Add `--update-bundle BUNDLE` for exactly one source/replay pair
-to store the replay-capture hash and runtime verdict in the matching bundle.
-The command verifies the bundle and its source-capture hash first, then refreshes
-the checksums; `fio-certify` independently rejects contradictory runtime fields.
+latency error. It also reports nonzero NVMe completion counts and says whether
+all source and replay commands succeeded. Requested-stream equality remains a
+separate verdict: the same ordered requests can still fail at completion. Add
+`--update-bundle BUNDLE` for exactly one source/replay pair to store the
+replay-capture hash and runtime verdict in the matching bundle. The command
+verifies the bundle and its source-capture hash first, then refreshes the
+checksums; `fio-certify` independently rejects contradictory runtime fields.
 This remains confidential fidelity evidence and does not measure application
 end-to-end latency.
 

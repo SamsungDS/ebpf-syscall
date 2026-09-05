@@ -12,8 +12,9 @@ published artifact; changing the wording alone does not complete it.
   operation, byte offset, length, order, and sub-microsecond timestamp
   quantization.
 - `kvio compare` checks the re-recorded device stream, reports issue-timing
-  error and completion latency, and can store that hash-bound result in the
-  confidential replay bundle.
+  error, completion latency, and nonzero completion status, and can store that
+  hash-bound result in the confidential replay bundle. Requested-stream
+  equality and successful completion are separate verdicts.
 - These checks do not prove equal application latency, equal performance, or
   anonymity.
 - Capture schema v1 binds replay input to one selected device/namespace and a
