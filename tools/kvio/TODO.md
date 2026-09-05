@@ -15,6 +15,26 @@ published artifact; changing the wording alone does not complete it.
   error plus completion-latency distributions.
 - These checks do not prove equal application latency, equal performance, or
   anonymity.
+- Capture schema v1 binds replay input to one selected device/namespace and a
+  terminal drop count. Legacy unversioned input requires an explicit override.
+
+## Build a bank-local release boundary first
+
+- [x] Distinguish confidential capture, confidential replay bundle, and an
+  externally authorized release in the manuals.
+- [x] Reject duplicate JSON keys, non-terminal drop accounting, unknown capture
+  versions, and mixed device/namespace scope for versioned replay input.
+- [ ] Define a fresh, closed external-result grammar. Do not reuse the current
+  bundle, which preserves exact placement and carries a source digest.
+- [ ] Add an offline verifier that rejects unknown files and fields, real paths,
+  source digests, executable hooks, path traversal, and hash mismatches.
+- [ ] Keep bundle conformance, bank-internal evidence, and human release
+  authorization as separate machine-readable verdicts.
+- [ ] Package the minimal capture/fio/verification path without PyTorch, model
+  downloads, network access, or the LMCache engine.
+- [ ] Run a bank-local A/B pilot that exports only fixed, rounded result fields.
+  Add trace relocation only if that results-only boundary cannot answer the
+  engineering question.
 
 ## Repeat the historical DGraphFin replay
 
@@ -31,11 +51,11 @@ The old run established rounded command-count, byte-count, and request-size
 agreement. Its referee did not compare ordered offsets and its timestamps were
 compressed by 1,000. It is not evidence for the checks above.
 
-## Define and implement trace sanitization
+## Define and implement optional trace relocation
 
-- [ ] Write a threat model for workload identity, tenant identity, device
-  layout, request cadence, and KV object identity. Use the terms
-  *payload-free*, *data-minimized*, and *anonymous* deliberately.
+- [x] Maintain the threat model in [`PRIVACY.md`](PRIVACY.md) for workload
+  identity, tenant identity, device layout, request cadence, and KV object
+  identity. Use *payload-free*, *data-minimized*, and *anonymous* deliberately.
 - [ ] Add a sanitizer that can remove disk, namespace, PID, TID, process name,
   `user_data`, queue, command ID, clock anchors, and absolute time.
 - [ ] Reject or cryptographically remap `key_hex`, object IDs, and session IDs.
@@ -52,6 +72,13 @@ Exact offsets and timing are necessary for exact device replay, so strong
 sanitization and exact fidelity cannot always be offered by the same artifact.
 Provide separate shareable and in-house artifacts when the threat model
 requires it.
+
+Relocating addresses does not hide the access graph: `A, B, A, C` and
+`X, Y, X, Z` have the same repetition pattern. Call relocated traces
+confidential transformed traces, disclose that linkage can remain, and prefer
+bank-local results when that disclosure is unacceptable. A storage slot is
+also not automatically an application object, tenant, or customer; v1 must
+reject ambiguous or reused mappings rather than inventing that attribution.
 
 ## Extend runtime fidelity
 

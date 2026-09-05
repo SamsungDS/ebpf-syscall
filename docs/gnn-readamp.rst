@@ -81,7 +81,13 @@ Capture a confidential workload without capturing payloads
 
 This is why the capture matters beyond a pretty chart. This device capture — and the fio iolog made from it — carries only IO *shape*: operation, offset, length, timing. No feature values, node ids, graph contents, or keys are recorded by this path.
 
-So a third party can run a **confidential** GNN — real financial-fraud data, private customer graph — and use these artifacts to reproduce its device-request shape without disclosing payload bytes. ``mk_dev_iolog.py`` turns the capture into a fio v3 request stream and certifies its ordered operation, offset, and length translation:
+An operator can therefore run a **confidential** GNN — real financial-fraud
+data or a private customer graph — and reproduce its device-request shape
+without putting payload bytes in the capture. The current capture and replay
+bundle remain confidential operational metadata; they are for bank-local use
+or a separately reviewed controlled transfer, not automatic publication.
+``mk_dev_iolog.py`` turns the capture into a fio v3 request stream and
+certifies its ordered operation, offset, and length translation:
 
 ::
 
@@ -108,7 +114,7 @@ This aggregate result did not establish identical ordered offsets. It shows why 
 
 **public stand-in** DGraphFin is a *public* dataset; it plays the role of the confidential graph here so the whole pipeline is reproducible. Payload omission is a property of this capture method, not of this particular dataset.
 
-**privacy boundary** Payload-free does not mean anonymous. Exact offsets reveal locality and address range; timing reveals request cadence; device identity and an unusual access pattern can fingerprint a workload. ``nvme_uring_cmd_monitor --kv`` is a different capture path and records ``key_hex``. Review and minimize every artifact before sharing it. A configurable sanitizer remains open work in ``tools/kvio/TODO.md``.
+**privacy boundary** Payload-free does not mean anonymous. Exact offsets reveal locality and address range; timing reveals request cadence; device identity and an unusual access pattern can fingerprint a workload. ``nvme_uring_cmd_monitor --kv`` is a different capture path and records ``key_hex``. The current fio bundle also preserves exact placement and timing and includes a source-capture digest. It is a fidelity artifact, not a release package. Review and minimize every artifact before a controlled transfer. A separate external format remains open work in ``tools/kvio/TODO.md``.
 
 **honest gap** The historical **+0.0%** result covers command count, total bytes,
 and size distribution; the old referee did not compare ordered offsets.  It

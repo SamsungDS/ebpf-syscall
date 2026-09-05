@@ -92,16 +92,26 @@ uploads). `pip install perfetto`.
    stream. Re-record the fio run and use `compare_streams.py`, which
    reports operation, offset, length, tuple-order, and timing separately.
 
-### Why the replay path is the privacy story
+### Keep capture, replay bundles, and releases separate
 
-Because a device capture and its iolog carry only IO *shape* — no bytes,
-no keys, no features — a third party can run a **confidential** workload
-(a financial-fraud GNN, a private KV cache), capture it with these
-tracers, and hand back a trace or iolog we can replay and visualize
-without ever seeing their data. `tools/reproduce/gnn-readamp/` is the
-worked example: a GNN reading node features off an SSD at 431× read
-amplification, captured, charted A/B against the page-aware fix, and
-replayed from a data-free iolog at +0.0% command inflation.
+A device capture omits payload bytes, keys, and application contents, but it
+still exposes exact placement, request timing, device identity, queue details,
+and a potentially identifying access pattern. The current fio bundle preserves
+exact offsets and timing and includes a source-trace digest. It is a fidelity
+artifact for confidential internal use, not a sanitized release format.
+
+Do not describe either artifact as anonymous or safe to publish. A future
+external release must use a separate allowlisted grammar, rebuild every
+sidecar, omit source digests and real paths, name its residual disclosures,
+and pass independent release review. Bundle conformance, internal privacy and
+utility evidence, and human export authorization are three different verdicts.
+The public design boundary and implementation status live in
+`tools/kvio/PRIVACY.md`; do not invent a stronger claim in another page.
+
+`tools/reproduce/gnn-readamp/` remains the worked payload-free example: a GNN
+reading node features off an SSD at 431× read amplification, charted A/B
+against the page-aware fix. Its historical replay matched counts, bytes, and
+sizes; it did not establish ordered-offset or correctly paced runtime fidelity.
 
 ## The kvio tool (`make kvio` → `./kvio`)
 

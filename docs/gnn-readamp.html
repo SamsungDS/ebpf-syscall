@@ -213,11 +213,12 @@
   <p class="lead">This is why the capture matters beyond a pretty chart. A device capture — and the fio
     iolog made from it — carries only IO <em>shape</em>: operation, offset, length, timing. This path
     records no feature values, node IDs, graph contents, or keys.</p>
-  <p>So a third party can run their <strong>confidential</strong> GNN — real financial-fraud data,
-    private customer graph — and use these artifacts to reproduce its device-request shape without
-    disclosing payload bytes.
-    <code>mk_dev_iolog.py</code> turns the capture into a fio v3 request stream and certifies its
-    ordered operation, offset, and length translation:</p>
+  <p>An operator can therefore run a <strong>confidential</strong> GNN — real financial-fraud data
+    or a private customer graph — and reproduce its device-request shape without putting payload
+    bytes in the capture. The current capture and replay bundle remain confidential operational
+    metadata; they are for bank-local use or a separately reviewed controlled transfer, not
+    automatic publication. <code>mk_dev_iolog.py</code> turns the capture into a fio v3 request
+    stream and certifies its ordered operation, offset, and length translation:</p>
   <pre><div class="bar"><span class="dot"></span>nbr.iolog — 240,698 lines, and nothing but IO shape</div><code>fio version 3 iolog
 0 /dev/nvme0n1 add
 0 /dev/nvme0n1 open
@@ -245,9 +246,10 @@
   <div class="note warn"><b class="tag">privacy boundary</b> Payload-free does not mean anonymous.
     Exact offsets reveal locality and address range; timing reveals request cadence; device identity
     and an unusual access pattern can fingerprint a workload. <code>nvme_uring_cmd_monitor --kv</code>
-    is a different capture path and records <code>key_hex</code>. Review and minimize every artifact
-    before sharing it. A configurable sanitizer remains open work in
-    <code>tools/kvio/TODO.md</code>.</div>
+    is a different capture path and records <code>key_hex</code>. The current fio bundle also
+    preserves exact placement and timing and includes a source-capture digest. It is a fidelity
+    artifact, not a release package. Review and minimize every artifact before a controlled
+    transfer. A separate external format remains open work in <code>tools/kvio/TODO.md</code>.</div>
   <div class="note warn"><b class="tag">honest gap</b> The historical <b>+0.0%</b> result covers
     command count, total bytes, and size distribution; the old referee did not compare ordered
     offsets. It also used an exporter that divided nanoseconds into milliseconds even though fio v3

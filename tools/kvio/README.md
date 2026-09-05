@@ -133,7 +133,9 @@ The DGraphFin example in `../../docs/gnn-readamp.rst` shows the method: a
 page-aware GNN access pattern reduced `RA_signal` from 431× to 8.6× without the
 published trace carrying graph or feature contents. The remaining sanitizer,
 hardware replay, pacing, concurrency, and latency work is tracked explicitly
-in [`TODO.md`](TODO.md). The installed `kvio(1)` manual summarizes all three.
+in [`TODO.md`](TODO.md). [`PRIVACY.md`](PRIVACY.md) defines the bank-local
+release strategy, threat model, and language the project can defend. The
+installed `kvio(1)` manual summarizes all three.
 
 ## Compile captured agent requests
 

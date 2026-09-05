@@ -518,6 +518,9 @@
     <code>drops</code> record. Replay consumers reject duplicate JSON keys, unknown versions,
     mixed scopes, and a non-terminal footer. Use <code>--allow-legacy-capture</code> to inspect an
     old unversioned capture; the override cannot reconstruct its missing scope guarantee.</p>
+  <p><code>tools/kvio/PRIVACY.md</code> defines the bank-local release strategy, threat model,
+    proposed profiles, and language the project can defend. Planned features are labeled there;
+    no external release format exists yet.</p>
   <p>Fidelity has a file gate and a runtime gate. <code>kvio iolog</code> plus the independent Rust
     <code>kvio fio-certify</code> check the finite requested stream. A second
     <code>kvio record</code> capture plus <code>kvio compare</code> checks the ordered operation,

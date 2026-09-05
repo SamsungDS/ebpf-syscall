@@ -50,5 +50,5 @@ Every case study has a reproduce recipe under ``tools/reproduce/`` in the
 repository, and the tracers, converters, and replay tools it uses are
 described in ``CLAUDE.md``. The GNN read-amplification recipe
 (``tools/reproduce/gnn-readamp/``) is the worked end-to-end example:
-capture with eBPF, chart the A/B on Perfetto, and replay from a data-free
+capture with eBPF, chart the A/B on Perfetto, and replay from a payload-free
 fio iolog.

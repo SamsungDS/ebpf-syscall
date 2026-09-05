@@ -266,6 +266,10 @@ versions, mixed scopes, and a non-terminal footer. Use
 ``--allow-legacy-capture`` to inspect old unversioned captures; the override
 cannot reconstruct their missing scope guarantee.
 
+``tools/kvio/PRIVACY.md`` defines the bank-local release strategy, threat
+model, proposed profiles, and language the project can defend. Planned
+features are labeled there; no external release format exists yet.
+
 Fidelity has a file gate and a runtime gate. ``kvio iolog`` plus the
 independent Rust ``kvio fio-certify`` check the finite requested stream. A
 second ``kvio record`` capture plus ``kvio compare`` checks the ordered
