@@ -24,12 +24,15 @@ published artifact; changing the wording alone does not complete it.
   externally authorized release in the manuals.
 - [x] Reject duplicate JSON keys, non-terminal drop accounting, unknown capture
   versions, and mixed device/namespace scope for versioned replay input.
-- [ ] Define a fresh, closed external-result grammar. Do not reuse the current
+- [x] Define a fresh, closed external-result grammar. Do not reuse the current
   bundle, which preserves exact placement and carries a source digest.
-- [ ] Add an offline verifier that rejects unknown files and fields, real paths,
+- [x] Add an offline verifier that rejects unknown files and fields, real paths,
   source digests, executable hooks, path traversal, and hash mismatches.
-- [ ] Keep bundle conformance, bank-internal evidence, and human release
+- [x] Keep bundle conformance, bank-internal evidence, and human release
   authorization as separate machine-readable verdicts.
+- [ ] Authenticate internal evidence and connect authorization to existing
+  organizational identity, signing, revocation, and approval systems. A draft
+  candidate must continue to report `export_allowed: false` until then.
 - [ ] Package the minimal capture/fio/verification path without PyTorch, model
   downloads, network access, or the LMCache engine.
 - [ ] Run a bank-local A/B pilot that exports only fixed, rounded result fields.

@@ -249,7 +249,8 @@
     is a different capture path and records <code>key_hex</code>. The current fio bundle also
     preserves exact placement and timing and includes a source-capture digest. It is a fidelity
     artifact, not a release package. Review and minimize every artifact before a controlled
-    transfer. A separate external format remains open work in <code>tools/kvio/TODO.md</code>.</div>
+    transfer. kvio can build a bounded results-only draft, but a trace-release format and release
+    authorization remain open work in <code>tools/kvio/TODO.md</code>.</div>
   <div class="note warn"><b class="tag">honest gap</b> The historical <b>+0.0%</b> result covers
     command count, total bytes, and size distribution; the old referee did not compare ordered
     offsets. It also used an exporter that divided nanoseconds into milliseconds even though fio v3

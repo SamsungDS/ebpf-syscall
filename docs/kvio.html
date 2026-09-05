@@ -154,6 +154,7 @@
   <a href="#deps">Dependencies</a>
   <a href="#run">How to run</a>
   <a href="#agent-traces">Agent traces</a>
+  <a href="#result-release">Result candidates</a>
   <a href="#fio-export">fio export</a>
   <a href="#bench">Storage benchmarks</a>
   <a href="#fidelity">Fidelity metrics</a>
@@ -485,6 +486,9 @@
       <tr><td><code>kvio iolog</code></td><td>Device capture</td><td>Export the requested stream as a fio replay bundle</td><td>No</td></tr>
       <tr><td><code>kvio fio-certify</code></td><td>Fio replay bundle</td><td>Check that the bundle describes the captured requested stream</td><td>No</td></tr>
       <tr><td><code>kvio compare</code></td><td>Original and replay captures</td><td>Report what fio and the storage stack preserved</td><td>No</td></tr>
+      <tr><td><code>kvio release-build</code></td><td>Bounded result draft</td><td>Build a two-file results-only candidate with no source trace</td><td>No</td></tr>
+      <tr><td><code>kvio release-example</code></td><td>No input</td><td>Print the canonical result draft</td><td>No</td></tr>
+      <tr><td><code>kvio release-verify</code></td><td>Results-only candidate</td><td>Check its closed grammar, inventory, and payload hash</td><td>No</td></tr>
       <tr><td><code>kvio bench</code></td><td>Evidence-labeled stress profile</td><td>Run sustained pressure without claiming capture fidelity</td><td>Yes, including writes</td></tr>
       <tr><td><code>kvio bench-compare</code></td><td>Repeated benchmark results</td><td>Compare two configurations' median results</td><td>No</td></tr>
     </tbody>
@@ -509,9 +513,10 @@
     <li>The current <strong>fio replay bundle</strong> is a confidential fidelity artifact. It
       retains exact placement and timing, and its certificate contains a digest of the source
       capture. <code>fio-certify</code> checks translation, not release safety.</li>
-    <li>An <strong>external release</strong> needs a fresh allowlisted grammar, independent
-      evidence, and human authorization. kvio does not implement that boundary yet. Do not export
-      a capture or current replay bundle merely because it is payload-free.</li>
+    <li>An <strong>external release</strong> needs an allowlisted grammar, independent evidence,
+      and human authorization. kvio implements a bounded results-only draft and format checker,
+      but not evidence authentication or release authorization. Do not export a capture or current
+      replay bundle merely because it is payload-free.</li>
   </ul>
   <p>Capture schema v1 begins with one <code>capture_meta</code> record, binds the stream to one
     selected <code>--disk</code> and device/namespace identity, and ends with exactly one
@@ -519,8 +524,8 @@
     mixed scopes, and a non-terminal footer. Use <code>--allow-legacy-capture</code> to inspect an
     old unversioned capture; the override cannot reconstruct its missing scope guarantee.</p>
   <p><code>tools/kvio/PRIVACY.md</code> defines the bank-local release strategy, threat model,
-    proposed profiles, and language the project can defend. Planned features are labeled there;
-    no external release format exists yet.</p>
+    proposed profiles, and language the project can defend. Planned features are labeled there.
+    The results-only format is a draft candidate, not an authorization to transfer it.</p>
   <p>Fidelity has a file gate and a runtime gate. <code>kvio iolog</code> plus the independent Rust
     <code>kvio fio-certify</code> check the finite requested stream. A second
     <code>kvio record</code> capture plus <code>kvio compare</code> checks the ordered operation,
@@ -534,8 +539,28 @@
     work is tracked in <code>tools/kvio/TODO.md</code> and summarized in <code>kvio(1)</code>.</div>
 </section>
 
+<section id="result-release">
+  <h2><span class="n">08</span>Build a bounded result candidate</h2>
+  <p><code>kvio release-build</code> accepts a closed set of storage questions, metrics, coarse
+    ratio bands, evidence labels, and residual-disclosure labels. It rejects free text, exact
+    numerical results, paths, source hashes, unknown fields, duplicate keys, and non-draft status.</p>
+  <pre><div class="bar"><span class="dot"></span><span class="dot"></span><span class="dot"></span>&nbsp; results only; no source trace</div><code><span class="k">./kvio</span> release-example &gt; result.json
+<span class="k">./kvio</span> release-build result.json candidate
+<span class="k">./kvio</span> release-verify candidate</code></pre>
+  <p>The candidate contains only <code>result.json</code> and <code>manifest.json</code>.
+    Verification checks the closed grammar, exact inventory, regular-file types, and payload hash.
+    Success still reports <code>internal_evidence: not_checked</code>,
+    <code>release_authorization: not_checked</code>, and <code>export_allowed: false</code>. Connect
+    those decisions to the organization's existing review and signing systems before transferring
+    a candidate.</p>
+  <div class="note warn"><b class="tag">bounded format, bounded claim</b> The 64 KiB input ceiling
+    gives more than 100 times headroom over the 617-byte example while bounding parser memory for a
+    format intended to stay small. The command does not inspect a confidential source, perform a
+    privacy attack, authenticate a reviewer, or authorize release.</div>
+</section>
+
 <section id="fio-export">
-  <h2><span class="n">08</span>Export a certified fio replay</h2>
+  <h2><span class="n">09</span>Export a certified fio replay</h2>
   <p>New <code>nvme_tp_monitor</code> captures discover the selected namespace's logical LBA size
     from sysfs and record it with a stable command sequence. Without <code>--disk</code>, the
     monitor requires an explicit <code>--lba-size</code> because one value cannot describe several
@@ -584,7 +609,7 @@
 </section>
 
 <section id="bench">
-  <h2><span class="n">09</span><code>kvio bench</code>: sustained storage pressure</h2>
+  <h2><span class="n">10</span><code>kvio bench</code>: sustained storage pressure</h2>
   <p><code>kvio bench</code> asks how much KV-like I/O a storage tier can sustain,
     what its tail latency is under load, and how large transfers affect another
     workload on the same drive. It runs fio without a GPU or model server and saves
@@ -682,7 +707,7 @@
 </section>
 
 <section id="fidelity">
-  <h2><span class="n">10</span>Fidelity metrics</h2>
+  <h2><span class="n">11</span>Fidelity metrics</h2>
   <p>Three complementary scores, joined per object by <code>trace_id</code>. AUC is
     deliberately <em>not</em> used — there is no class label; the geometry is deterministic.</p>
   <div class="grid c3">
@@ -709,7 +734,7 @@
 </section>
 
 <section id="results">
-  <h2><span class="n">11</span>Validated results</h2>
+  <h2><span class="n">12</span>Validated results</h2>
   <p class="muted">On an 8× H100 server with real Samsung Gen5 NVMe (io_uring_cmd passthrough on
     <code>/dev/ng</code>), the projection was validated against a <b>real GPU-driven vLLM +
     LMCache offload</b> — the previously hardware-gated step is now closed.</p>

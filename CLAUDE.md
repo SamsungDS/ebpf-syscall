@@ -100,8 +100,10 @@ and a potentially identifying access pattern. The current fio bundle preserves
 exact offsets and timing and includes a source-trace digest. It is a fidelity
 artifact for confidential internal use, not a sanitized release format.
 
-Do not describe either artifact as anonymous or safe to publish. A future
-external release must use a separate allowlisted grammar, rebuild every
+Do not describe either artifact as anonymous or safe to publish. The bounded
+`bank-local-results-v1` draft contains no trace, exact measurement, path, or
+free text, but its verifier deliberately reports `export_allowed: false`.
+A future trace release must use a separate allowlisted grammar, rebuild every
 sidecar, omit source digests and real paths, name its residual disclosures,
 and pass independent release review. Bundle conformance, internal privacy and
 utility evidence, and human export authorization are three different verdicts.

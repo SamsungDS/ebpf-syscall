@@ -84,6 +84,9 @@ it does not recreate a capture.
 | `kvio iolog` | A device capture | Export the captured requested stream as a fio replay bundle | No |
 | `kvio fio-certify` | A fio replay bundle | Check that the bundle still describes the captured requested stream | No |
 | `kvio compare` | Original and replay device captures | Report what fio and the storage stack actually preserved | No |
+| `kvio release-build` | A bounded result draft | Build a two-file results-only candidate with no source trace | No |
+| `kvio release-example` | No input | Print the canonical result draft | No |
+| `kvio release-verify` | A results-only candidate | Check its closed grammar, inventory, and payload hash | No |
 | `kvio bench` | An evidence-labeled stress profile | Run sustained storage pressure without claiming capture fidelity | Yes, including writes |
 | `kvio bench-compare` | Results from repeated benchmark runs | Compare the median results of two configurations | No |
 
@@ -91,6 +94,35 @@ The exact-replay path is therefore `record` → `iolog` → `fio-certify` → ru
 fio while recording again → `compare`. The agent path begins one level above
 that: `trace` → `workload`, with `record` running alongside it. `bench` and
 `bench-compare` are a separate controlled-load path.
+
+## Build a results-only candidate
+
+`kvio release-build` is the first narrow release boundary. It accepts only a
+closed set of storage questions, metrics, coarse ratio bands, evidence labels,
+and residual-disclosure labels. It rejects free text, exact numerical results,
+paths, source hashes, unknown fields, duplicate keys, and non-draft status.
+
+```bash
+./kvio release-example > result.json
+# Edit only values allowed by the example's closed enumerations.
+./kvio release-build result.json candidate
+./kvio release-verify candidate
+```
+
+The candidate contains only `result.json` and `manifest.json`. The verifier
+rejects extra files, symlinks, changed bytes, unsupported schemas, and malformed
+inventory. The 64 KiB input ceiling is more than 100 times the 617-byte example
+while still bounding parser memory for this deliberately small format.
+The reported ratio is candidate divided by baseline; `PRIVACY.md` defines the
+bucket endpoints and explains that they are disclosure boundaries, not
+statistical or service-level thresholds.
+
+Successful verification reports `bundle_conformance: pass`, but also reports
+`internal_evidence: not_checked`, `release_authorization: not_checked`, and
+`export_allowed: false`. The command does not inspect the confidential source,
+run privacy attacks, authenticate reviewers, or authorize transfer. Connect
+those decisions to the organization's existing review and signing systems
+before any candidate leaves its boundary.
 
 ## Privacy and fidelity boundary
 
@@ -110,8 +142,9 @@ There are three separate artifacts and decisions:
 2. A **fio replay bundle** is a confidential fidelity artifact. It preserves
    exact placement and timing, and its current certificate contains a digest of
    the source capture. `fio-certify` checks translation, not release safety.
-3. An **external release** needs a separate allowlisted format and approval
-   process. kvio does not implement that format yet. Do not export a current
+3. An **external release** needs an allowlisted format and approval process.
+   kvio implements a bounded results-only draft and format checker, but not
+   evidence authentication or release authorization. Do not export a current
    capture or replay bundle merely because it contains no payload bytes.
 
 New capture schema v1 files begin with one `capture_meta` record, bind the

@@ -81,6 +81,22 @@ Compare an original device capture with one or more replay captures.  This is
 the runtime referee; it checks what fio, Linux, and the NVMe driver actually
 issued.
 .TP
+.B release-build
+Build a bounded, unsigned results-only candidate.  Version 1 accepts only
+enumerated storage questions, metrics, coarse ratio bands, evidence classes,
+and residual-disclosure labels.  It rejects free text, exact numerical results,
+paths, source hashes, unknown fields, duplicate keys, and non-draft status.
+.TP
+.B release-example
+Print the canonical version 1 result draft for editing and use with
+.BR release-build .
+.TP
+.B release-verify
+Check the candidate's closed grammar, exact two-file inventory, regular-file
+types, and payload hash.  Success establishes format conformance only.  It
+reports internal evidence and release authorization as not checked and always
+reports that export is not allowed.
+.TP
 .B bench
 Run evidence-labeled, sustained fio workloads derived from kvspill.  These
 measure restore pressure, small-read interference, eviction pressure, and
@@ -119,6 +135,20 @@ Use
 .B kvio bench
 for controlled sustained pressure.  Do not describe its output as replay
 fidelity.
+.PP
+To build and inspect a bounded results-only draft, run:
+.PP
+.RS
+.nf
+kvio release-example > result.json
+kvio release-build result.json candidate
+kvio release-verify candidate
+.fi
+.RE
+.PP
+The candidate is not an authorization to transfer data.  Connect internal
+evidence, human approval, signer trust, and revocation to the organization's
+existing controls before it leaves that boundary.
 .SH TRACE MINIMIZATION AND PRIVACY
 .B nvme_tp_monitor
 does not read application payloads.  Its capture contains device and namespace
@@ -152,8 +182,9 @@ Keep three boundaries separate.  A capture is confidential source evidence.
 The current fio bundle is a confidential fidelity artifact: it preserves exact
 placement and timing and contains a digest of the source capture.  It is not an
 external release package.  An external release needs a fresh allowlisted
-format, independent evidence, and human authorization; kvio does not implement
-that boundary yet.
+format, independent evidence, and human authorization.  kvio implements a
+bounded results-only draft and format checker, but not evidence authentication,
+release authorization, or a transformed trace-release format.
 .PP
 Capture schema version 1 starts with one
 .B capture_meta

@@ -221,6 +221,18 @@ it does not recreate a capture.
      - Original and replay device captures
      - Report what fio and the storage stack actually preserved
      - No
+   * - ``kvio release-build``
+     - A bounded result draft
+     - Build a two-file results-only candidate with no source trace
+     - No
+   * - ``kvio release-example``
+     - No input
+     - Print the canonical result draft
+     - No
+   * - ``kvio release-verify``
+     - A results-only candidate
+     - Check its closed grammar, inventory, and payload hash
+     - No
    * - ``kvio bench``
      - An evidence-labeled stress profile
      - Run sustained pressure without claiming capture fidelity
@@ -254,9 +266,10 @@ Keep three boundaries separate:
 * The current **fio replay bundle** is a confidential fidelity artifact. It
   retains exact placement and timing, and its certificate contains a digest of
   the source capture. ``fio-certify`` checks translation, not release safety.
-* An **external release** needs a fresh allowlisted grammar, independent
-  evidence, and human authorization. kvio does not implement that boundary
-  yet. Do not export a capture or current replay bundle merely because it is
+* An **external release** needs an allowlisted grammar, independent evidence,
+  and human authorization. kvio implements a bounded results-only draft and
+  format checker, but not evidence authentication or release authorization.
+  Do not export a capture or current replay bundle merely because it is
   payload-free.
 
 Capture schema v1 begins with one ``capture_meta`` record, binds the stream to
@@ -268,7 +281,8 @@ cannot reconstruct their missing scope guarantee.
 
 ``tools/kvio/PRIVACY.md`` defines the bank-local release strategy, threat
 model, proposed profiles, and language the project can defend. Planned
-features are labeled there; no external release format exists yet.
+features are labeled there. The results-only format is a draft candidate, not
+an authorization to transfer it.
 
 Fidelity has a file gate and a runtime gate. ``kvio iolog`` plus the
 independent Rust ``kvio fio-certify`` check the finite requested stream. A
@@ -283,6 +297,30 @@ reveals an architectural reduction in read amplification while omitting graph
 and feature contents. Exact offsets and timing remain sensitive metadata. Open
 sanitization, corrected hardware replay, pacing, concurrency, and latency work
 is tracked in ``tools/kvio/TODO.md`` and summarized in ``kvio(1)``.
+
+Build a bounded result candidate
+--------------------------------
+
+``kvio release-build`` accepts a closed set of storage questions, metrics,
+coarse ratio bands, evidence labels, and residual-disclosure labels. It rejects
+free text, exact numerical results, paths, source hashes, unknown fields,
+duplicate keys, and non-draft status::
+
+   ./kvio release-example > result.json
+   ./kvio release-build result.json candidate
+   ./kvio release-verify candidate
+
+The candidate contains only ``result.json`` and ``manifest.json``. Verification
+checks the closed grammar, exact inventory, regular-file types, and payload
+hash. Its successful verdict still reports ``internal_evidence: not_checked``,
+``release_authorization: not_checked``, and ``export_allowed: false``. Connect
+those decisions to the organization's existing review and signing systems
+before transferring a candidate.
+
+The 64 KiB input ceiling is more than 100 times the 617-byte example while
+bounding parser memory for a format intended to stay small. The command does
+not inspect a confidential source, perform a privacy attack, authenticate a
+reviewer, or authorize release.
 
 Compile real agent traffic
 --------------------------

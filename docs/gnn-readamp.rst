@@ -114,7 +114,7 @@ This aggregate result did not establish identical ordered offsets. It shows why 
 
 **public stand-in** DGraphFin is a *public* dataset; it plays the role of the confidential graph here so the whole pipeline is reproducible. Payload omission is a property of this capture method, not of this particular dataset.
 
-**privacy boundary** Payload-free does not mean anonymous. Exact offsets reveal locality and address range; timing reveals request cadence; device identity and an unusual access pattern can fingerprint a workload. ``nvme_uring_cmd_monitor --kv`` is a different capture path and records ``key_hex``. The current fio bundle also preserves exact placement and timing and includes a source-capture digest. It is a fidelity artifact, not a release package. Review and minimize every artifact before a controlled transfer. A separate external format remains open work in ``tools/kvio/TODO.md``.
+**privacy boundary** Payload-free does not mean anonymous. Exact offsets reveal locality and address range; timing reveals request cadence; device identity and an unusual access pattern can fingerprint a workload. ``nvme_uring_cmd_monitor --kv`` is a different capture path and records ``key_hex``. The current fio bundle also preserves exact placement and timing and includes a source-capture digest. It is a fidelity artifact, not a release package. Review and minimize every artifact before a controlled transfer. kvio can build a bounded results-only draft, but a trace-release format and release authorization remain open work in ``tools/kvio/TODO.md``.
 
 **honest gap** The historical **+0.0%** result covers command count, total bytes,
 and size distribution; the old referee did not compare ordered offsets.  It

@@ -17,12 +17,15 @@ Implemented today:
 - `kvio compare` measures what a re-recorded fio run issued to the device.
 - `kvio bench` provides workloads designed from public information and labels
   their evidence.
+- `kvio release-build` emits a bounded, unsigned results-only candidate.
+- `kvio release-verify` checks that candidate's closed grammar, exact two-file
+  inventory, and payload hash.
 
 Not implemented today:
 
 - A format authorized for release outside the data owner's boundary.
-- A fixed results-only release grammar and offline release verifier.
 - Trace relocation, time transformation, signing, or approval adapters.
+- Authentication of internal evidence or authorization to export a candidate.
 - Re-identification tests or a claim that any trace is anonymous.
 - A differential-privacy mechanism or privacy budget.
 
@@ -98,8 +101,37 @@ bounded result fields. Do not allow arbitrary metric names, free text,
 per-command rows, source paths, exact timestamps, or unbounded arrays. Keep the
 full evidence and source binding in a private audit record.
 
-This is the first planned release profile because it can answer an engineering
-question without moving the trace.
+`kvio release-build` implements the first candidate grammar. It accepts only
+enumerated questions, metrics, coarse ratio bands, evidence classes, and
+residual disclosures. It emits no source trace, exact result, path, free text,
+or source digest. `kvio release-verify` checks format conformance and explicitly
+returns `export_allowed: false`; it does not authenticate internal evidence or
+authorize transfer.
+
+The 64 KiB input limit gives more than 100 times headroom over the 617-byte
+example while bounding a format intended to remain small. The local A/B recipe,
+evidence statement, signing adapter, and human approval integration remain
+planned.
+
+The ratio is the candidate value divided by the baseline value. Its buckets
+disclose direction and coarse magnitude without publishing the measured value:
+
+| label | interval |
+| --- | --- |
+| `below-0.80` | ratio < 0.80 |
+| `0.80-to-0.90` | 0.80 <= ratio < 0.90 |
+| `0.90-to-0.95` | 0.90 <= ratio < 0.95 |
+| `0.95-to-1.05` | 0.95 <= ratio <= 1.05 |
+| `1.05-to-1.10` | 1.05 < ratio <= 1.10 |
+| `1.10-to-1.20` | 1.10 < ratio <= 1.20 |
+| `above-1.20` | ratio > 1.20 |
+
+Version 1 permits `no-material-change` only in the central band and uses 10%
+and 20% boundaries for neighboring buckets. These are representation
+boundaries, not statistical-significance, service-level, privacy, or regulatory
+thresholds. If a pilot's predeclared decision cannot be represented honestly
+by them, revise the format version before inspecting the result instead of
+forcing the result into a bucket.
 
 ### Partner-relocated trace
 
