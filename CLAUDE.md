@@ -96,6 +96,12 @@ uploads). `pip install perfetto`.
    queue and command-ID reuse is unambiguous; never promote it to application
    latency or a general fio-performance claim.
 
+The device witness is a leaf-namespace view. A stack above NVMe may map,
+split, merge, or reorder IO before the tracepoint, and schema v1 does not record
+native multipath path/ANA/failover state. Use whole namespaces, capture each
+namespace separately, and never claim to reconstruct partition, filesystem,
+device-mapper, LVM, RAID, or controller-path semantics from the leaf stream.
+
 ### Keep capture, replay bundles, and releases separate
 
 A device capture omits payload bytes, keys, and application contents, but it

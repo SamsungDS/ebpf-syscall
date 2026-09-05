@@ -203,6 +203,18 @@ the checksums; `fio-certify` independently rejects contradictory runtime fields.
 This remains confidential fidelity evidence and does not measure application
 end-to-end latency.
 
+The replay claim ends at one NVMe namespace. `nvme_tp_monitor --disk` compares
+the requested name with the leaf request's kernel `disk_name`; use a whole
+namespace such as `nvme1n1`, not a partition. IO through a filesystem,
+device-mapper, LVM, or software RAID is observed only after that upper layer
+has mapped, split, merged, or reordered it. The resulting namespace-relative
+LBAs are valid leaf-device evidence but do not reconstruct file offsets,
+logical-volume addresses, RAID members, or redundancy. Native NVMe multipath
+also needs separate evidence: schema v1 does not record controller path, ANA
+state, failover, or transport identity. Record each namespace separately;
+unfiltered or mixed-namespace captures, including namespaces with different
+logical block sizes, are not certifiable replay input.
+
 The DGraphFin example in `../../docs/gnn-readamp.rst` shows the method: a
 page-aware GNN access pattern reduced `RA_signal` from 431× to 8.6× without the
 published trace carrying graph or feature contents. The remaining sanitizer,

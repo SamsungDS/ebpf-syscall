@@ -102,8 +102,10 @@ reject ambiguous or reused mappings rather than inventing that attribution.
 - [ ] Test flush, discard, and write semantics before certifying those
   operations. Keep raw-device recipes read-only until the destructive case is
   intentional and independently guarded.
-- [ ] Document limits for stacked block devices, multipath, partitions, and
-  captures that span namespaces with different logical block sizes.
+- [x] Document limits for stacked block devices, native NVMe multipath,
+  partitions, and captures that span namespaces with different logical block
+  sizes. Define the claim as a leaf-namespace stream, not an upper-layer or
+  controller-path reconstruction.
 
 ## Grow the real-workload catalog
 

@@ -555,6 +555,16 @@
     <code>--update-bundle BUNDLE</code> stores one hash-bound source/replay result in its matching
     confidential bundle, refreshes its checksums, and lets <code>fio-certify</code> reject
     contradictory runtime fields. This does not measure application end-to-end latency.</p>
+  <p>The replay claim ends at one NVMe leaf namespace. <code>nvme_tp_monitor --disk</code>
+    matches the requested name against the leaf request's kernel <code>disk_name</code>; use a
+    whole namespace such as <code>nvme1n1</code>, not a partition. IO through a filesystem,
+    device-mapper, LVM, or software RAID is visible only after that upper layer has mapped, split,
+    merged, or reordered it. The captured namespace-relative LBAs are leaf-device evidence; they
+    do not reconstruct file offsets, logical-volume addresses, RAID members, or redundancy.
+    Schema v1 also omits the controller path, ANA state, failover, and transport identity required
+    to certify native NVMe multipath behavior. Record each namespace separately. Unfiltered or
+    mixed-namespace captures, including namespaces with different logical block sizes, are not
+    certifiable replay input.</p>
   <div class="note info"><b class="tag">worked example and open work</b> The
     <a href="gnn-readamp.html">DGraphFin case study</a> shows an architectural reduction in read
     amplification without retaining graph or feature contents. Exact offsets and timing remain

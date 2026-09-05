@@ -31,7 +31,9 @@ Write newline-delimited JSON to the path instead of standard output.
 Capture only the named block namespace, for example
 .BR nvme1n1 .
 The monitor discovers its logical block size from sysfs.  Filtering is
-required for an unambiguous portable replay capture.
+required for an unambiguous portable replay capture.  Pass the whole namespace
+name, not a partition such as
+.BR nvme1n1p1 .
 .TP
 .BI \-\-lba-size " bytes"
 Supply a positive power-of-two logical block size.  This is required when
@@ -59,8 +61,22 @@ completion-latency distributions.
 .PP
 Completion records do not carry disk identity.  Consumers pair them using
 hardware queue, command ID, and time ordering or use their latency
-distribution.  Current kvio comparison does not establish a one-to-one latency
-pair between an original command and its replay.
+distribution.  kvio refuses one-to-one latency comparison when command-ID
+reuse overlaps, a completion is missing or orphaned, or its recorded latency
+disagrees with the command and completion timestamps.
+.SH TOPOLOGY LIMITS
+The tracepoint observes requests at an NVMe leaf namespace.  IO submitted
+through a partition, filesystem, device-mapper, LVM, or software RAID has
+already been mapped, split, merged, or reordered.  The capture describes the
+resulting namespace-relative device commands; it cannot reconstruct the
+upper-layer address or redundancy semantics.
+.PP
+The schema records the kernel disk name and NVMe namespace ID, but not native
+NVMe multipath controller selection, ANA state, failover, or transport
+identity.  It therefore cannot certify path behavior.  Capture each namespace
+separately.  A single LBA size cannot decode an unfiltered capture spanning
+namespaces with different formats, and kvio rejects that capture as replay
+input.
 .SH SEE ALSO
 .BR kvio (1),
 .BR nvme_uring_cmd_monitor (1),
