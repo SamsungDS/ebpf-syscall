@@ -247,7 +247,8 @@ install-kvio: install-kvio-man
 	done
 	@for file in $(KVIO_DIR)/modelconfig.json $(KVIO_DIR)/NOTICE \
 		$(KVIO_DIR)/README.md $(KVIO_DIR)/PRIVACY.md \
-		$(KVIO_DIR)/TODO.md; do \
+		$(KVIO_DIR)/TODO.md \
+		$(KVIO_DIR)/bank-local-result.example.json; do \
 		$(INSTALL) -m 644 "$$file" \
 			"$(DESTDIR)$(KVIO_INSTALL_ROOT)/tools/kvio/$$(basename "$$file")"; \
 	done

@@ -18,6 +18,9 @@ translation-certified and device behavior is checked by re-recording.
     ./kvio iolog ...     # device capture -> certified fio v3 replay bundle
     ./kvio fio-certify   # independently validate a bundle in Rust
     ./kvio compare ...   # grade a replay against its capture
+    ./kvio release-build # build a bounded, unsigned result candidate
+    ./kvio release-example # print the canonical result draft
+    ./kvio release-verify # check candidate format and manifest only
     ./kvio bench ...     # run sustained kvspill-derived fio workloads
     ./kvio bench-compare # compare median results from two bench runs
 
@@ -86,6 +89,9 @@ def usage(out=sys.stdout):
     out.write("  doctor          check the build, python deps, and tracers\n")
     out.write("  bench           run kvspill-derived storage-tier workloads\n")
     out.write("  bench-compare   compare medians from two bench logs\n")
+    out.write("  release-build  build a bounded, unsigned result candidate\n")
+    out.write("  release-example print the canonical result draft\n")
+    out.write("  release-verify check candidate format and manifest only\n")
     out.write("\n[engine] commands use the vendored LMCache raw_block engine: "
               "run `make kvio` first.\nSee tools/kvio/README.md.\n")
 
@@ -185,6 +191,9 @@ def main():
     if cmd == "bench-compare":
         from tools.kvio.compare import main as compare_main
         return compare_main(rest)
+    if cmd in ("release-build", "release-example", "release-verify"):
+        from tools.kvio.release import main as release_main
+        return release_main([cmd] + rest)
     if cmd not in COMMANDS:
         sys.stderr.write(f"kvio: unknown command '{cmd}'\n\n")
         usage(sys.stderr)

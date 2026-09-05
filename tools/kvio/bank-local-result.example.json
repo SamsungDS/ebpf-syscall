@@ -1,0 +1,24 @@
+{
+  "comparison": {
+    "metric": "p99-completion-latency",
+    "outcome": "candidate-lower",
+    "ratio_band": "0.90-to-0.95",
+    "repeat_count_band": "5-to-9"
+  },
+  "conditions": {
+    "offered_load": "fixed",
+    "runtime_evidence": "re-recorded-device-stream",
+    "target_class": "local-nvme",
+    "workload_evidence": "measured-capture"
+  },
+  "profile": "bank-local-results-v1",
+  "question": "restore-tail-latency",
+  "residual_disclosures": [
+    "aggregate-comparison",
+    "coarse-ratio-band",
+    "storage-class",
+    "workload-class"
+  ],
+  "schema": "kvio-bank-local-result-v1",
+  "status": "draft"
+}
