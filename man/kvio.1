@@ -10,8 +10,8 @@ kvio \- project, issue, capture, replay, and benchmark KV-cache storage IO
 .B kvio
 answers four different questions about a storage-backed KV cache:
 what IO a model configuration should produce, what IO a real workload asks
-for, what commands reached the NVMe device, and whether a storage tier can
-sustain controlled pressure.
+for, what commands the Linux NVMe driver built and completed, and whether a
+storage tier can sustain controlled pressure.
 These are different claims and use different commands.
 .PP
 Commands that issue KV IO use LMCache's real raw-block engine.  Commands that
@@ -160,6 +160,62 @@ kvio release-verify candidate
 The candidate is not an authorization to transfer data.  Connect internal
 evidence, human approval, signer trust, and revocation to the organization's
 existing controls before it leaves that boundary.
+.SH CAPTURE MODEL
+Do not infer an NVMe command count from the number of
+.BR io_uring_enter (2)
+calls.  An application writes SQEs into a shared submission ring, so one call
+can submit many requests.  With SQPOLL, the kernel poll thread can consume more
+SQEs without another system call while it remains awake.  For example:
+.PP
+.RS
+.nf
+userspace:  SQE 0 ... SQE 63
+                      |
+            one io_uring_enter(fd, 64, ...)
+                      v
+kernel:     nvme_ns_chr_uring_cmd() x 64
+            nvme_setup_cmd          x 64
+                      v
+completion: 64 NVMe completions
+.fi
+.RE
+.PP
+A generic syscall monitor that hooks
+.BR io_uring_enter (2)
+sees one call in this example, but cannot recover the 64 commands.  This
+tree's
+.BR syscall_monitor (1)
+does not hook that call and records none of those SQEs or commands.
+.B kvio record
+runs
+.BR nvme_tp_monitor (1),
+which hooks
+.B nvme_setup_cmd
+and
+.B nvme_complete_rq
+inside the Linux NVMe driver.  It therefore records the 64 driver requests and
+their 64 completion observations below the io_uring batching boundary.
+.PP
+Use
+.BR syscall_monitor (1)
+for its selected read/write and filesystem calls,
+.BR iouring_monitor (1)
+for accepted io_uring read/write intent and its completions,
+.BR nvme_uring_cmd_monitor (1)
+for passthrough commands with SQE
+.B user_data
+correlation, and
+.BR nvme_tp_monitor (1)
+for namespace-wide Linux NVMe driver requests.  Every io_uring SQE has
+.BR user_data ;
+the passthrough monitor can associate it with that command, but the cookie is
+never transmitted to the NVMe device.  The namespace tracepoints do not carry
+it, so kvio attributes those commands by device-offset range and monotonic
+operation window.
+.PP
+Treat both NVMe monitors as driver witnesses, not PCIe bus analyzers.  They do
+not observe firmware execution, FTL or NAND operations, or SPDK/VFIO and other
+paths that bypass the Linux NVMe driver.
 .SH TRACE MINIMIZATION AND PRIVACY
 .B nvme_tp_monitor
 does not read application payloads.  Its capture contains device and namespace

@@ -8,6 +8,25 @@ ordinary per-command DMA mapping with a requested blk-iobuf retained mapping.
 It prints exactly one JSON object on stdout for a run that reaches the
 measurement phase; diagnostics go to stderr.
 
+Observation boundary
+--------------------
+
+Do not use syscall counts to decide whether the firing test exercised every
+command.  The program writes SQEs into a shared ring, and one
+``io_uring_enter()`` may submit many of them.  ``nvme_uring_cmd_monitor`` hooks
+the ``nvme_ns_chr_uring_cmd`` and ``nvme_ns_head_chr_uring_cmd`` issue paths,
+then the ``nvme_uring_cmd_end_io`` completion path.  It can
+therefore record every command even when the workload makes relatively few
+system calls.  This tree's ``syscall_monitor`` does not hook
+``io_uring_enter()``; a generic tracer that did would still see only the batch
+call, not the SQEs.
+
+The monitor reads ``user_data`` from the embedded SQE to correlate submission
+and completion.  Every io_uring SQE has that field, but it is an application
+cookie returned in the CQE, not part of the NVMe command.  Treat the result as
+a Linux-driver trace, not a PCIe-wire or firmware trace.  SPDK/VFIO and other
+userspace-owned controller paths are outside this observation point.
+
 Build and host-only tests
 -------------------------
 

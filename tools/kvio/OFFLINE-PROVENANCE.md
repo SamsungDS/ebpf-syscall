@@ -7,7 +7,9 @@ download client, or engine-driving command.
 
 ## Installed functions
 
-- `kvio record` invokes the local `nvme_tp_monitor` binary.
+- `kvio record` invokes the local `nvme_tp_monitor` binary. Its setup and
+  completion hooks are below syscall/io_uring batching and cover the selected
+  Linux NVMe namespace, not PCIe traffic or userspace-owned controller paths.
 - `kvio iolog` converts a strict capture-v1 stream to a confidential fio
   replay bundle.
 - `kvio fio-certify` invokes the independent Rust translation verifier.

@@ -17,6 +17,42 @@ observes NVMe uring-command submissions and completions.  Normal namespace
 mode decodes logical block addresses and lengths.  NVMe Key-Value mode decodes
 store, retrieve, delete, and exist commands.  Output includes request identity,
 timestamps, completion status and latency, and a final loss-accounting record.
+.SH OBSERVATION POINT
+The submission probes run at
+.B nvme_ns_chr_uring_cmd
+and
+.BR nvme_ns_head_chr_uring_cmd ,
+on each attempt to issue an NVMe passthrough SQE.  The completion probe runs at
+.BR nvme_uring_cmd_end_io .
+This is below the system-call batching boundary: one
+.BR io_uring_enter (2)
+can submit 64 SQEs.  Without a handler retry, a loss-free capture records 64
+submissions and 64 completions.  SQPOLL can consume SQEs without a system call
+per command.
+This tree's
+.BR syscall_monitor (1)
+does not hook
+.BR io_uring_enter (2)
+at all.
+.PP
+Every io_uring SQE has a 64-bit
+.B user_data
+field.  The monitor can associate that cookie with an NVMe command because it
+reads the embedded SQE on this passthrough path.  The kernel returns the cookie
+in the CQE; it is not part of the command sent to the device.
+.PP
+At submission, the BPF program stores the issue time and cookie in a hash keyed
+by
+.BR "struct io_uring_cmd *" .
+The completion hook looks up and deletes that entry, computes latency in the
+kernel, and emits the completion through the ring buffer.  Require the final
+loss and completeness fields to pass before calling the stream complete.
+.PP
+This is a Linux-driver witness, not a PCIe bus analyzer.  It does not cover
+ordinary POSIX or file io_uring IO, controller firmware, FTL or NAND work, or
+SPDK/VFIO paths that bypass the Linux NVMe driver.  Use
+.BR nvme_tp_monitor (1)
+for all requests that reach a selected Linux NVMe namespace.
 .SH OPTIONS
 .TP
 .BI \-\-pid " PID"
@@ -50,11 +86,12 @@ does copy object keys.  Process name, PID, TID, user_data, queue, command ID,
 offsets or keys, sizes, and timing can all be sensitive.  Do not call a raw KV
 capture anonymous and do not publish one without a field-by-field review.
 .SH FIDELITY
-Check the final drop and correlation records before treating a capture as
+Check the final loss and completeness fields before treating a capture as
 complete.  This monitor covers the io_uring NVMe passthrough path; use
 .BR nvme_tp_monitor (1)
 for namespace-wide driver tracepoints independent of the submitting API.
 .SH SEE ALSO
 .BR kvio (1),
+.BR syscall_monitor (1),
 .BR iouring_monitor (1),
 .BR nvme_tp_monitor (1)

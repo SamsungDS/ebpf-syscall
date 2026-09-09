@@ -13,7 +13,7 @@ produces — from real model geometry, on real hardware, *without a GPU or a
 model*.  kvio can validate command geometry against a captured application or
 apply sustained KV-like pressure directly to a storage tier.
 
-**engine:** LMCache ``raw_block`` io_uring_cmd passthrough **tracer:** eBPF ``nvme_uring_cmd_monitor`` **needs:** an NVMe char device (``/dev/ngXnY``) **GPU:** not required **validated:** byte-exact on real NVMe **source:** `mcgrof/LMCache @ ``kvio`` <https://github.com/mcgrof/LMCache/tree/kvio>`__
+**engine:** LMCache ``raw_block`` **device witness:** eBPF ``nvme_tp_monitor`` **passthrough correlation:** ``nvme_uring_cmd_monitor`` **GPU:** not required **validated:** byte-exact on real NVMe **source:** `mcgrof/LMCache @ ``kvio`` <https://github.com/mcgrof/LMCache/tree/kvio>`__
 
 
 What it is
@@ -21,7 +21,7 @@ What it is
 
 Storage and systems engineers need to evaluate the disk I/O of LLM KV-cache offload — command sizes, counts, volume, latency — but that I/O normally only exists behind a GPU running a model through vLLM + LMCache. **kvio removes the GPU from that loop.**
 
-The key observation: **storage I/O geometry is content-independent.** How many NVMe commands a KV store/load produces, and how big each one is, depends only on the KV block size and the device's transfer limit — not on the actual tensor values. So *real model dimensions + fake bytes* reproduce the real offload I/O pattern. kvio computes the block size from real model geometry, issues that store/load workload through LMCache's real ``raw_block`` NVMe-passthrough engine, and confirms the result against the actual device commands captured by an eBPF tracer.
+The key observation: **storage I/O geometry is content-independent.** How many NVMe commands a KV store/load produces, and how big each one is, depends only on the KV block size and the device's transfer limit — not on the actual tensor values. So *real model dimensions + fake bytes* reproduce the real offload I/O pattern. kvio computes the block size from real model geometry, issues that store/load workload through LMCache's real ``raw_block`` NVMe-passthrough engine, and confirms the result against the commands built and completed by the Linux NVMe driver.
 
 **scope** A GPU is only needed to capture real *access patterns and timing* — which chunk is stored when, hit vs. miss. The I/O *geometry* for any given model is fully determined and reproduced here, GPU-free.
 
@@ -58,10 +58,10 @@ The distinguishing feature: follow **one KV object** from the LMCache payload, t
 +------------------------+------------------------------------------------------------------------------------------------+---------------------------------------+
 | io_uring / rust engine | the submission for each device command                                                         | user_data = (trace_id<<32) \| counter |
 +------------------------+------------------------------------------------------------------------------------------------+---------------------------------------+
-| eBPF NVMe tracer       | every ``nvme_setup_cmd``: opcode, slba, nlb, bytes                                             | reads back ``user_data``              |
+| passthrough tracer     | each ``IORING_OP_URING_CMD`` NVMe command: opcode, slba, nlb, bytes                            | reads the SQE's ``user_data``         |
 +------------------------+------------------------------------------------------------------------------------------------+---------------------------------------+
 
-The validator recovers the object for any command as ``trace_id = user_data >> 32``, joining one logical intent to its N (≤ MDTS) wire commands. The low 32 bits stay a unique completion counter, so CQE matching is unchanged.
+The validator recovers the object for any command as ``trace_id = user_data >> 32``, joining one logical intent to its N (≤ MDTS) driver-visible commands. The low 32 bits stay a unique completion counter, so CQE matching is unchanged. ``user_data`` exists on every io_uring SQE; what is specific to this passthrough tracer is its ability to read that SQE and associate the cookie with the NVMe command. The cookie is never sent to the device.
 
 **K/V aware** The semantic record carries a ``part`` (``kv``/``k``/``v``) and, for packed asymmetric-KV blobs, a ``components`` breakdown (K / V / scale bytes) read from the ``EncodedKV`` header — so a store's device bytes can be attributed to K vs V once the codec emits an asymmetric split.
 
@@ -91,7 +91,10 @@ The projector: model/params → device ops, NVMe command count, per-command size
 **nvme_uring_cmd_monitor ebpf-syscall**
 
 
-The eBPF tracer: one JSONL record per ``nvme_setup_cmd``, carrying ``user_data`` so each wire command is attributable.
+The passthrough-specific eBPF tracer: one JSONL submission and completion pair
+per NVMe uring command.  It reads ``user_data`` from the embedded SQE so that
+each driver-visible command can be attributed without claiming that the cookie
+reached the device.
 
 **kvio_validate ebpf-syscall**
 
@@ -174,16 +177,16 @@ How to run
        --device /dev/ng0n1 --engine uring_cmd \
        --record /tmp/kvio_record.json --trace /tmp/sem.jsonl
 
-2 · Capture the wire trace alongside it
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+2 · Capture the passthrough command trace alongside it
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 ::
 
      ebpf-syscallsudo ./nvme_uring_cmd_monitor --dur 90 --lba-size 512 --jsonl /tmp/nvme.jsonl &
    # ... run step 1 with LMCACHE_KVIO_TRACE=/tmp/sem.jsonl ...
 
-3 · Validate projection vs. real device commands
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+3 · Validate projection vs. driver-visible commands
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 ::
 
@@ -276,6 +279,78 @@ The exact-replay path is ``record`` → ``iolog`` → ``fio-certify`` → run fi
 while recording again → ``compare``.  The agent path begins one level above
 that: ``trace`` → ``workload``, with ``record`` running alongside it.  ``bench``
 and ``bench-compare`` are a separate controlled-load path.
+
+How eBPF sees NVMe commands after io_uring batching
+---------------------------------------------------
+
+Do not count ``io_uring_enter()`` calls and call that an NVMe command count.
+Applications fill a shared submission ring with many SQEs and may submit them
+with one system call.  With ``IORING_SETUP_SQPOLL``, the kernel poll thread can
+consume more SQEs without another system call while it remains awake.  For
+example::
+
+   userspace:  SQE 0 ... SQE 63
+                         |
+               one io_uring_enter(fd, 64, ...)
+                         v
+   kernel:     nvme_ns_chr_uring_cmd() x 64
+               nvme_setup_cmd          x 64
+                         v
+   completion: 64 NVMe completions
+
+A generic syscall tracer that hooks ``io_uring_enter()`` sees the one call in
+this example.  It cannot recover the 64 commands from that call.  This tree's
+``syscall_monitor`` does not hook ``io_uring_enter()``, so it records none of
+those SQEs or commands.  ``kvio record`` instead runs
+``nvme_tp_monitor``, which attaches to ``nvme_setup_cmd`` and
+``nvme_complete_rq`` inside the Linux NVMe driver.  Those hooks run once per
+driver request, below io_uring batching, so the capture contains 64 command
+records and 64 completion observations.
+
+Choose the observation point that answers the question:
+
+.. list-table::
+   :header-rows: 1
+
+   * - Tool
+     - What it observes
+     - What it cannot prove
+   * - ``syscall_monitor``
+     - Selected read/write and filesystem calls; not ``io_uring_enter()``
+     - io_uring activity, SQE count, or NVMe command count
+   * - ``iouring_monitor``
+     - Accepted io_uring read/write intent and its completions
+     - ``IORING_OP_URING_CMD`` or the stream after lower-layer transformations
+   * - ``nvme_uring_cmd_monitor``
+     - NVMe passthrough SQEs and driver completions, including ``user_data``
+     - POSIX, file, or other non-passthrough IO
+   * - ``nvme_tp_monitor``
+     - Requests built and completed by the Linux NVMe driver, regardless of the submitting API
+     - SPDK/VFIO or another userspace-owned controller path that bypasses that driver
+
+The attachment sites are literal BPF program declarations in this tree::
+
+   SEC("tp_btf/nvme_setup_cmd")       /* namespace-wide submission */
+   SEC("tp_btf/nvme_complete_rq")     /* namespace-wide completion */
+   SEC("fentry/nvme_ns_chr_uring_cmd") /* passthrough SQE */
+   SEC("fentry/nvme_uring_cmd_end_io") /* passthrough completion */
+
+At setup, ``nvme_tp_monitor`` copies the opcode, namespace, LBA, length, queue,
+command ID, and timestamp into a ring-buffer record.  It also stores the issue
+timestamp in a BPF hash keyed by ``struct request *``.  The completion hook
+looks up and deletes that entry, computes latency in the kernel, and emits a
+completion record.  The passthrough monitor uses the same pattern keyed by
+``struct io_uring_cmd *`` and also copies ``user_data`` from the embedded SQE.
+Always require the final loss record to report zero before calling either
+stream complete.
+
+The NVMe monitors are driver witnesses, not PCIe bus analyzers.  They do not
+show firmware execution, NAND operations, FTL behavior, or commands sent by a
+userspace driver.  They record command metadata rather than payload bytes.
+For object attribution, the passthrough monitor can recover a cookie from the
+SQE's ``user_data``.  The namespace-wide tracepoint has no such cookie, so
+kvio joins its command to a semantic object by the object's disjoint byte range
+and monotonic operation window.
 
 Privacy and fidelity boundary
 -----------------------------
@@ -692,12 +767,12 @@ Validated results
 
 On an 8× H100 server with real Samsung Gen5 NVMe (io_uring_cmd passthrough on ``/dev/ng``), the projection was validated against a **real GPU-driven vLLM + LMCache offload** — the previously hardware-gated step is now closed.
 
-**real GPU, kernel-verified** vLLM (Llama-3.1-8B) on an H100 offloading KV to ``/dev/ng1n1``: **230/230 objects exact** (cmds *and* bytes), WAPE 0.0000%, size-distribution TV 0.0000, over **58,729 real NVMe commands** captured by the eBPF tracer and joined by ``trace_id``. Roundtrip proof: repeated prompts (temp 0) regenerated *identical* outputs from NVMe-loaded KV vs. recomputed KV. The GPU-free generator, run at the same geometry, reproduced that device command stream *indistinguishably*.
+**real GPU, kernel-verified** vLLM (Llama-3.1-8B) on an H100 offloading KV to ``/dev/ng1n1``: **230/230 objects exact** (cmds *and* bytes), WAPE 0.0000%, size-distribution TV 0.0000, over **58,729 driver-visible NVMe commands** captured by the eBPF tracer and joined by ``trace_id``. Roundtrip proof: repeated prompts (temp 0) regenerated *identical* outputs from NVMe-loaded KV vs. recomputed KV. The GPU-free generator, run at the same geometry, reproduced that driver-visible command stream *indistinguishably*.
 
 Scale & parity campaign — 7 models, 1B → 70B, TP 1/2/4
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-Each cell: real GPU capture → wire-validate → replay the recorded manifest → regenerate GPU-free from the calculator. Every real leg was exact.
+Each cell: real GPU capture → validate at the Linux NVMe driver → replay the recorded manifest → regenerate GPU-free from the calculator. Every real leg was exact.
 
 ============= ============== == ======= =========== =======
 Model         KV family      TP Objects Exact-match WAPE
@@ -715,8 +790,8 @@ Llama-3.1-70B GQA            4  916     100.0%      0.0000%
 
 **load vs recompute — capacity, not speed** On this H100 + Gen5-NVMe rig, loading KV from NVMe is still slower than recomputing prefill on the GPU, but the gap **collapses with scale**: load ÷ recompute falls from ~\ **6.9×** (1B) to ~\ **2.2×** (70B, TP4). The crossover — where offload beats recompute — lies beyond 70B, or on slower GPUs / faster storage. (n=2/cell, ~QD1; directional, not a rigorous latency benchmark — tokenizers differ across families.)
 
-**bottom line** Capture wiring, the cross-layer ``trace_id`` join, fidelity metrics, and record/replay are byte-faithful on real NVMe, now proven against a real GPU offload across 7 models and TP degrees. The GPU-free generator and the recorded-manifest replay both reproduce the real device command stream exactly, so anyone can simulate a model's KV-offload I/O — including its TP sharding — with *no GPU*.
+**bottom line** Capture wiring, the cross-layer ``trace_id`` join, fidelity metrics, and record/replay are byte-faithful at the Linux NVMe driver, now proven against a real GPU offload across 7 models and TP degrees. The GPU-free generator and the recorded-manifest replay both reproduce that driver-visible command stream exactly, so anyone can simulate a model's KV-offload I/O — including its TP sharding — with *no GPU*.
 
-**case study** The same eBPF attribution found a concrete engineering win: LMCache's KV loader ran at ~11% of a Gen5 NVMe (single-threaded, QD~1). See `The QD~1 KV-load bottleneck — found with eBPF, fixed with parallel loads <kvio-loadpath.html>`__ for the wire evidence, how to reproduce it, and the ~2.8× fix.
+**case study** The same eBPF attribution found a concrete engineering win: LMCache's KV loader ran at ~11% of a Gen5 NVMe (single-threaded, QD~1). See `The QD~1 KV-load bottleneck — found with eBPF, fixed with parallel loads <kvio-loadpath.html>`__ for the Linux-driver evidence, how to reproduce it, and the ~2.8× fix.
 
-kvio — GPU-free KV-cache-offload storage-IO projector & replayer engine: LMCache ``raw_block`` · tracer: eBPF ``nvme_uring_cmd_monitor``
+kvio — GPU-free KV-cache-offload storage-IO projector & replayer engine: LMCache ``raw_block`` · device witness: eBPF ``nvme_tp_monitor`` · passthrough correlation: ``nvme_uring_cmd_monitor``

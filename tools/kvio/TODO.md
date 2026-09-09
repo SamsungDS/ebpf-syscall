@@ -6,8 +6,11 @@ published artifact; changing the wording alone does not complete it.
 
 ## Current boundary
 
-- A drop-free `nvme_tp_monitor` capture records the requested NVMe command
-  stream and completion-latency metadata without recording payload bytes.
+- A drop-free `nvme_tp_monitor` capture records the commands built and
+  completed by the selected Linux NVMe namespace, plus completion-latency
+  metadata, without recording payload bytes. It is below syscall and io_uring
+  batching, but it is not a PCIe/firmware trace and cannot see SPDK/VFIO paths
+  that bypass the Linux NVMe driver.
 - `kvio iolog` and `kvio fio-certify` check the finite file translation:
   operation, byte offset, length, order, and sub-microsecond timestamp
   quantization.

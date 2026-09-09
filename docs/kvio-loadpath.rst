@@ -39,12 +39,31 @@ same drive, 128 KiB sequential read, ``ioengine=io_uring``
 
 the loader left ~90% of the drive on the floor
 
-The device is not the bottleneck — the software path is. The only way to know that for sure is to look at the actual NVMe commands on the wire.
+The device is not the bottleneck — the software path is. Establish that by
+examining the commands built and completed by the Linux NVMe driver.
 
-The wire evidence
------------------
+The driver evidence
+-------------------
 
-The eBPF tracer ``nvme_uring_cmd_monitor`` records every NVMe command on the io_uring_cmd path — opcode, LBA, byte count, the issuing thread, the io_uring ``user_data``, and a nanosecond timestamp. Replaying a real 70B/TP4 load and reading the trace back:
+The eBPF tracer ``nvme_uring_cmd_monitor`` records every NVMe passthrough
+command seen by its Linux-driver hooks — opcode, LBA, byte count, the issuing
+thread, the io_uring ``user_data``, and a nanosecond timestamp. Replaying a
+real 70B/TP4 load and reading the trace back:
+
+Do not infer this command count from system calls.  Userspace can put 160 SQEs
+for one object into the shared ring and submit them with one
+``io_uring_enter()``; SQPOLL can consume SQEs without another call while it is
+awake.  The tracer hooks the ``nvme_ns_chr_uring_cmd`` issue path and
+``nvme_uring_cmd_end_io`` completion path below that batching boundary.
+That is why a mild syscall rate can still produce a per-command trace; require
+the final loss count to be zero before calling it complete.  This tree's
+``syscall_monitor`` does not hook ``io_uring_enter()`` at
+all; even a generic tracer that did would see only the batch call.
+
+This is not a PCIe bus capture.  It does not observe device firmware, the FTL,
+NAND operations, or a userspace driver such as SPDK/VFIO.  ``user_data`` is an
+SQE/CQE cookie that the tracer reads in the kernel; it is not transmitted to
+the NVMe device.
 
 **serial** **72,960 read commands, all from one process / one kernel thread.** ``max concurrent in-flight objects = 1``; consecutive commands belong to the same object 99.4% of the time. Each 20 MiB object's 160 reads fire back-to-back, then the next object starts — nothing overlaps.
 
@@ -94,8 +113,8 @@ All three steps run on any box with an NVMe char device (``/dev/ngXnY``) and the
        --device /dev/ng1n1 --obj-mib 20 --nobj 128 \
        --workers 1,2,4,8,16,32 --qd 8
 
-3 · Confirm the wire behavior
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+3 · Confirm the driver behavior
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 ::
 

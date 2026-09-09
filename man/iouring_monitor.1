@@ -1,7 +1,7 @@
 .\" SPDX-License-Identifier: Apache-2.0
 .TH IOURING_MONITOR 1 "September 2026" "ebpf-syscall" "User Commands"
 .SH NAME
-iouring_monitor \- record io_uring submissions and completions with eBPF
+iouring_monitor \- record io_uring read/write intent and completions with eBPF
 .SH SYNOPSIS
 .B iouring_monitor
 .RB [ \-\-pid " PID" ]
@@ -9,7 +9,10 @@ iouring_monitor \- record io_uring submissions and completions with eBPF
 .RB [ \-\-jsonl " PATH" ]
 .SH DESCRIPTION
 .B iouring_monitor
-attaches to io_uring tracepoints and records submission and completion events.
+attaches to accepted io_uring read/write preparation paths and the completion
+tracepoint.  It records intent and completion events for tracked requests; it
+does not trace
+.BR IORING_OP_URING_CMD .
 It can restrict process-scoped events to one process and writes a final drop
 record so consumers can reject an incomplete capture.
 .SH OPTIONS
@@ -23,8 +26,18 @@ Stop after the given duration.  Otherwise stop with SIGINT or SIGTERM.
 .BI \-\-jsonl " path"
 Write newline-delimited JSON to the path instead of standard output.
 .SH FIDELITY
-This observes io_uring, not the NVMe device.  Filesystems and the block layer
-can split, merge, cache, or reorder requests below this point.  Use
+This observes io_uring, not system-call counts and not the NVMe device.  An
+application writes SQEs into shared memory.  One
+.BR io_uring_enter (2)
+can submit many SQEs, and SQPOLL can consume SQEs without a system call per IO.
+This monitor observes supported read/write events, whereas
+.BR syscall_monitor (1)
+does not hook
+.BR io_uring_enter (2)
+or see those requests.
+.PP
+Filesystems and the block layer can split, merge, cache, or reorder requests
+below this point.  Use
 .BR nvme_tp_monitor (1)
 when the device command stream is the required witness.
 .SH PRIVACY
@@ -32,5 +45,6 @@ The trace contains process and request metadata.  It does not copy IO payloads,
 but identifiers, lengths, and timing can still reveal workload structure.
 .SH SEE ALSO
 .BR kvio (1),
+.BR syscall_monitor (1),
 .BR nvme_uring_cmd_monitor (1),
 .BR nvme_tp_monitor (1)

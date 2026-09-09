@@ -2,12 +2,20 @@ ebpf-syscall
 ============
 
 Observe real storage IO at the layer where it actually happens — syscalls,
-io_uring, mmap page faults, and NVMe device commands — and turn those
+io_uring, mmap page faults, and Linux NVMe driver requests — and turn those
 captures into things you can *look at* (Perfetto timelines) and *reproduce*
 (fio replays). The recurring idea across every tool here is the
 **two-witness join**: the application knows *intent* (what it asked for),
 the kernel or device knows *mechanism* (what actually moved), and the
 interesting number is the gap between them.
+
+Do not treat those layers as interchangeable.  ``syscall_monitor`` does not
+hook ``io_uring_enter()``, and even a generic syscall tracer would see one
+batch call rather than every SQE.  ``kvio record`` attaches at
+``nvme_setup_cmd`` and ``nvme_complete_rq`` below that batching boundary.  See
+`How eBPF sees NVMe commands after io_uring batching
+<kvio.html#join>`__ for the concrete 64-SQE example, exact probe sites,
+correlation maps, and limits of the Linux-driver witness.
 
 These pages are the reStructuredText build of the project's case studies,
 so they are searchable and viewable anywhere. Each one also has a

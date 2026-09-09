@@ -134,7 +134,7 @@
 
 <nav class="toc"><div class="wrap">
   <a href="#symptom">Symptom</a>
-  <a href="#wire">Wire evidence</a>
+  <a href="#wire">Driver evidence</a>
   <a href="#why">Why it matters</a>
   <a href="#repro">Reproduce</a>
   <a href="#fix">The fix</a>
@@ -162,15 +162,28 @@
       <div class="stat r">~11<span class="u">%</span></div>
       <p>the loader left ~90% of the drive on the floor</p></div>
   </div>
-  <p>The device is not the bottleneck — the software path is. The only way to know that for sure is to
-    look at the actual NVMe commands on the wire.</p>
+  <p>The device is not the bottleneck — the software path is. Establish that by examining the
+    commands built and completed by the Linux NVMe driver.</p>
 </section>
 
 <section id="wire">
-  <h2><span class="n">02</span>The wire evidence</h2>
-  <p>The eBPF tracer <code>nvme_uring_cmd_monitor</code> records every NVMe command on the
-    io_uring_cmd path — opcode, LBA, byte count, the issuing thread, the io_uring <code>user_data</code>,
-    and a nanosecond timestamp. Replaying a real 70B/TP4 load and reading the trace back:</p>
+  <h2><span class="n">02</span>The driver evidence</h2>
+  <p>The eBPF tracer <code>nvme_uring_cmd_monitor</code> records every NVMe passthrough command
+    seen by its Linux-driver hooks — opcode, LBA, byte count, the issuing thread, the io_uring
+    <code>user_data</code>, and a nanosecond timestamp. Replaying a real 70B/TP4 load and reading
+    the trace back:</p>
+  <div class="note info"><b class="tag">below syscall batching</b> Do not infer this command count
+    from system calls. Userspace can put 160 SQEs for one object into the shared ring and submit
+    them with one <code>io_uring_enter()</code>; SQPOLL can consume SQEs without another call while
+    it is awake. The tracer hooks the <code>nvme_ns_chr_uring_cmd</code> issue path and
+    <code>nvme_uring_cmd_end_io</code> completion path below that batching boundary. That is why a mild syscall rate can
+    still produce a per-command trace; require the final loss count to be zero before calling it
+    complete. This tree's <code>syscall_monitor</code> does not
+    hook <code>io_uring_enter()</code> at all; even a generic tracer that did would see only the
+    batch call.</div>
+  <p class="muted">This is not a PCIe bus capture. It does not observe firmware, the FTL, NAND
+    operations, or a userspace driver such as SPDK/VFIO. <code>user_data</code> is an SQE/CQE
+    cookie that the tracer reads in the kernel; it is not transmitted to the NVMe device.</p>
   <div class="note bug"><b class="tag">serial</b> <b>72,960 read commands, all from one process / one
     kernel thread.</b> <code>max concurrent in-flight objects = 1</code>; consecutive commands belong to
     the same object 99.4% of the time. Each 20&nbsp;MiB object's 160 reads fire back-to-back, then the
@@ -222,7 +235,7 @@ make LIBBPF_SYSTEM=yes nvme_uring_cmd_monitor</code></pre>
 KVIO_SRC=~/LMCache <span class="k">python</span> kvio_parallel_probe.py \
     --device <span class="v">/dev/ng1n1</span> --obj-mib <span class="v">20</span> --nobj <span class="v">128</span> \
     --workers <span class="v">1,2,4,8,16,32</span> --qd <span class="v">8</span></code></pre>
-  <h3>3 · Confirm the wire behavior</h3>
+  <h3>3 · Confirm the driver behavior</h3>
   <pre><div class="bar"><span class="dot"></span>analyze_load_path.py</div><code><span class="c"># run the tracer around a load, then attribute commands to objects/ranks</span>
 sudo nvme_uring_cmd_monitor --jsonl <span class="v">trace.jsonl</span> --lba-size <span class="v">4096</span> &
 <span class="c"># ... issue the load ...</span>

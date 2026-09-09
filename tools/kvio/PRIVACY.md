@@ -9,12 +9,16 @@ build, and the claims that remain out of scope.
 
 Implemented today:
 
-- `nvme_tp_monitor` records NVMe command metadata without reading payloads.
+- `nvme_tp_monitor` records metadata at Linux NVMe driver setup and completion
+  hooks without reading payloads. It sees each driver request even when one
+  `io_uring_enter()` submits many SQEs, but it does not see firmware, FTL/NAND,
+  or userspace-controller paths that bypass the Linux driver.
 - Capture schema v1 binds replay input to one selected device/namespace and a
   terminal drop count.
 - `kvio iolog` translates a captured requested stream into a fio bundle.
 - `kvio fio-certify` checks that finite file translation independently.
-- `kvio compare` measures what a re-recorded fio run issued to the device.
+- `kvio compare` measures what the Linux NVMe driver built and completed for a
+  re-recorded fio run.
 - `kvio bench` provides workloads designed from public information and labels
   their evidence.
 - `kvio release-build` emits a bounded, unsigned results-only candidate.

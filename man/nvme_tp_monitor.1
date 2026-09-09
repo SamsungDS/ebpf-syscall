@@ -19,6 +19,39 @@ This is the device witness used by
 .BR "kvio record" .
 It sees commands from every submission API that reaches the selected NVMe
 driver, including IO not issued by kvio.
+.SH OBSERVATION POINT
+This monitor attaches to
+.B nvme_setup_cmd
+and
+.B nvme_complete_rq
+inside the Linux NVMe driver.  These hooks are below syscall and io_uring
+batching.  If an application fills the shared ring with 64 SQEs and submits
+them with one
+.BR io_uring_enter (2)
+call, a generic syscall monitor sees one call while the driver hooks run for 64
+requests and 64 completions.  A loss-free capture records all 64.  This tree's
+.BR syscall_monitor (1)
+does not hook that enter call at all.  SQPOLL may consume SQEs without any new
+system call while its kernel poll thread remains awake.
+.PP
+The captured command is the command Linux built for the namespace.  This is
+not a PCIe-wire capture and does not expose controller firmware, FTL or NAND
+operations.  It also cannot see SPDK/VFIO or another userspace-owned controller
+path that bypasses the Linux NVMe driver.
+.PP
+At setup, the BPF program emits command metadata and stores the issue timestamp
+in a hash keyed by
+.BR "struct request *" .
+The completion hook looks up and deletes that entry, computes latency in the
+kernel, and emits the completion record through the ring buffer.  Require the
+final loss record to be zero before calling the stream complete.
+.PP
+The tracepoints do not carry an io_uring
+.B user_data
+cookie.  Use kvio's offset-and-time join to attribute a command to an object,
+or use
+.BR nvme_uring_cmd_monitor (1)
+when passthrough-cookie correlation is required.
 .SH OPTIONS
 .TP
 .BI \-\-dur " seconds"
@@ -79,5 +112,6 @@ namespaces with different formats, and kvio rejects that capture as replay
 input.
 .SH SEE ALSO
 .BR kvio (1),
+.BR syscall_monitor (1),
 .BR nvme_uring_cmd_monitor (1),
 .BR iouring_monitor (1)

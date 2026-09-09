@@ -14,7 +14,28 @@ Convert kvio's cross-layer traces — LMCache semantic object ops, eBPF NVMe pas
 Why a converter is the only way in
 ----------------------------------
 
-kvio IO is ``io_uring_cmd`` NVMe passthrough on ``/dev/ng*``, which bypasses the block layer — Perfetto's stock ftrace/block ingestion (and ``iostat``) see none of it. The kernel's nvme driver tracepoints do fire for passthrough, but carry no ``user_data`` — so they cannot be joined to KV objects. The eBPF tracer ``nvme_uring_cmd_monitor`` is **the only source that carries trace_id** (``user_data >> 32``, planted by LMCache's raw_block engine), and ``kvio2perfetto.py`` is the bridge from it to a semantically-joined timeline.
+kvio IO can use ``io_uring_cmd`` NVMe passthrough on ``/dev/ng*``, which
+bypasses the block layer — Perfetto's stock ftrace/block ingestion (and
+``iostat``) see none of it.  ``nvme_uring_cmd_monitor`` hooks the passthrough
+entry and completion functions and can carry ``trace_id`` as
+``user_data >> 32`` when the raw-block engine plants that cookie.
+``kvio2perfetto.py`` turns that capture into a semantically joined timeline.
+
+Do not use syscall frequency to judge whether this trace is complete.  One
+``io_uring_enter()`` can submit many SQEs from the shared ring, and SQPOLL can
+consume more SQEs without another system call.  The passthrough issue and
+completion hooks run below that boundary.  Every io_uring SQE has
+``user_data``; the useful property here is that this monitor can associate the
+cookie with the NVMe command.  The cookie itself is never sent to the device.
+This tree's ``syscall_monitor`` does not hook ``io_uring_enter()`` and sees
+none of those SQEs.
+
+For a namespace-wide capture, ``kvio record`` instead uses
+``nvme_tp_monitor`` at ``nvme_setup_cmd`` and ``nvme_complete_rq``.  Those
+tracepoints cover POSIX, ordinary io_uring, and passthrough IO handled by the
+Linux NVMe driver, but carry no ``user_data``.  kvio can join those events to
+objects by offset range and monotonic time.  Neither monitor is a PCIe bus
+analyzer or sees SPDK/VFIO paths that bypass the Linux driver.
 
 **found visually**
 

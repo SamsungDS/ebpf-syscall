@@ -144,12 +144,18 @@
     <div class="card"><h4><span class="ic">◱</span>intent witness</h4><p>The driver emits its useful
       feature bytes on a <code>CLOCK_MONOTONIC</code> axis — what the GNN actually consumes.</p></div>
     <div class="card"><h4><span class="ic">▣</span>mechanism witness</h4><p><code>nvme_tp_monitor</code>
-      records every device command on the same clock — slba, bytes, completion latency. No
+      records every request built and completed by the Linux NVMe driver on the same clock — slba, bytes, completion latency. No
       <code>user_data</code> needed; this is plain O_DIRECT block IO.</p></div>
     <div class="card"><h4><span class="ic">⚲</span>the gap is the story</h4><p>Lay the two on one
       timeline and the read amplification is not a statistic — it is the visible distance between two
       curves.</p></div>
   </div>
+  <div class="note info"><b class="tag">observation point</b> Do not compare a count of
+    <code>read()</code> or <code>io_uring_enter()</code> calls with this command count. Filesystems
+    and the block layer may split, merge, or reorder requests, and one <code>io_uring_enter()</code>
+    can submit many SQEs. <code>nvme_tp_monitor</code> hooks <code>nvme_setup_cmd</code> and
+    <code>nvme_complete_rq</code> once per Linux-driver request and completion. It is not a PCIe bus
+    analyzer and does not observe firmware, FTL, or NAND work.</div>
 </section>
 
 <section id="ab">

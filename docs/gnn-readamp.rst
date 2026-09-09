@@ -28,12 +28,22 @@ The driver emits its useful feature bytes on a ``CLOCK_MONOTONIC`` axis — what
 **mechanism witness**
 
 
-``nvme_tp_monitor`` records every device command on the same clock — slba, bytes, completion latency. No ``user_data`` needed; this is plain O_DIRECT block IO.
+``nvme_tp_monitor`` records every request built and completed by the Linux NVMe
+driver on the same clock — slba, bytes, completion latency. No ``user_data`` is
+needed; this is plain O_DIRECT block IO.
 
 **the gap is the story**
 
 
 Lay the two on one timeline and the read amplification is not a statistic — it is the visible distance between two curves.
+
+The mechanism witness is below the system-call boundary.  Do not compare a
+count of ``read()`` or ``io_uring_enter()`` calls with its command count:
+filesystems and the block layer may split, merge, or reorder requests, and one
+``io_uring_enter()`` can submit many SQEs.  ``nvme_tp_monitor`` attaches at
+``nvme_setup_cmd`` and ``nvme_complete_rq`` once per Linux-driver request and
+completion.  It is not a PCIe bus analyzer and does not observe firmware, FTL,
+or NAND work.
 
 The A/B: naive access vs the architectural fix
 ----------------------------------------------

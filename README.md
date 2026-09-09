@@ -221,6 +221,48 @@ cat /tmp/test.txt
 rm /tmp/test.txt
 ```
 
+### Do not treat syscall counts as NVMe command counts
+
+`syscall_monitor` records the application-facing call boundary. It does not
+record every io_uring SQE or every NVMe command. An application can queue 64
+SQEs in shared memory and submit them with one call:
+
+```text
+userspace:  SQE 0 ... SQE 63
+                      |
+            one io_uring_enter(fd, 64, ...)
+                      v
+kernel:     nvme_ns_chr_uring_cmd() x 64
+            nvme_setup_cmd          x 64
+                      v
+completion: 64 NVMe completions
+```
+
+A generic syscall tracer that hooks `io_uring_enter()` contains one enter call;
+it cannot infer the 64 commands. This repository's `syscall_monitor` does not
+hook `io_uring_enter()`, so it records none of those SQEs or commands. With
+`IORING_SETUP_SQPOLL`, the kernel poll thread can consume SQEs without another
+system call while it remains awake.
+
+Choose the observation point explicitly:
+
+- Use `syscall_monitor` for the selected read/write and filesystem syscalls it
+  supports, not io_uring activity.
+- Use `iouring_monitor` for accepted io_uring read/write intent and its
+  completions; it does not cover `IORING_OP_URING_CMD`.
+- Use `nvme_uring_cmd_monitor` for NVMe passthrough commands and correlation
+  through the SQE's `user_data` field.
+- Use `nvme_tp_monitor` or `kvio record` for requests built and completed by
+  the Linux NVMe driver, independent of whether they began as POSIX I/O,
+  ordinary io_uring I/O, or passthrough.
+
+The NVMe monitors observe Linux-driver requests, not traffic on the PCIe wire.
+They do not see firmware execution, FTL/NAND operations, SPDK/VFIO controller
+ownership, or other paths that bypass the Linux NVMe driver. They record
+metadata rather than I/O payloads. Every io_uring SQE has `user_data`, but that
+cookie is returned to the application in the CQE and is never sent to the
+device.
+
 ## Sample Output from monitoring
 ```
 ssgroot@test82:~/ProfilingTools/syscall_tool$ sudo ./syscall_monitor

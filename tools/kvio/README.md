@@ -11,7 +11,7 @@ storage tier sustain it?":
   (`kvio workload`, `kvio sweep`);
 - **compile real agent traces** into chunk-level cache plans with explicit
   evidence and assumptions (`kvio trace`, then `kvio workload --agent-plan`);
-- **record** what the device really received (`kvio record`, the
+- **record** what the Linux NVMe driver built and completed (`kvio record`, the
   `nvme_tp_monitor` eBPF tracer);
 - **attribute** each device command to the KV object that caused it — the
   offset-join: device offset + time window, zero engine cookies
@@ -130,6 +130,66 @@ The exact-replay path is therefore `record` → `iolog` → `fio-certify` → ru
 fio while recording again → `compare`. The agent path begins one level above
 that: `trace` → `workload`, with `record` running alongside it. `bench` and
 `bench-compare` are a separate controlled-load path.
+
+## Capture below the io_uring batching boundary
+
+Do not use the number of `io_uring_enter()` calls as the number of storage
+commands. An application can place 64 SQEs in the shared submission ring and
+submit all 64 with one call:
+
+```text
+userspace:  SQE 0 ... SQE 63
+                      |
+            one io_uring_enter(fd, 64, ...)
+                      v
+kernel:     nvme_ns_chr_uring_cmd() x 64
+            nvme_setup_cmd          x 64
+                      v
+completion: 64 NVMe completions
+```
+
+A generic syscall tracer that hooks `io_uring_enter()` sees the one call, not
+the 64 SQEs. This repository's `syscall_monitor` does not hook
+`io_uring_enter()`, so it sees none of those SQEs or commands.
+`IORING_SETUP_SQPOLL` can make the gap larger because the kernel poll thread
+may consume new SQEs without another system call while it remains awake.
+
+Use the tracer at the layer whose behavior you need:
+
+| Tool | Observation point | Use it for |
+|---|---|---|
+| `syscall_monitor` | Selected read/write and filesystem calls; not `io_uring_enter()` | Supported application-facing calls; no io_uring or device command counts |
+| `iouring_monitor` | Accepted io_uring read/write preparation and completion | Read/write intent before lower layers transform requests; not `IORING_OP_URING_CMD` |
+| `nvme_uring_cmd_monitor` | NVMe passthrough entry/completion | `IORING_OP_URING_CMD` commands and SQE `user_data` correlation |
+| `nvme_tp_monitor` | `nvme_setup_cmd`/`nvme_complete_rq` | Every request handled by the selected Linux NVMe namespace |
+
+The attachment sites are ordinary eBPF section declarations in the source:
+
+```c
+SEC("tp_btf/nvme_setup_cmd")        /* namespace-wide submission */
+SEC("tp_btf/nvme_complete_rq")      /* namespace-wide completion */
+SEC("fentry/nvme_ns_chr_uring_cmd") /* passthrough SQE */
+SEC("fentry/nvme_uring_cmd_end_io") /* passthrough completion */
+```
+
+On setup, `nvme_tp_monitor` emits the command metadata and stores the issue
+timestamp in a BPF hash keyed by `struct request *`. Its completion hook looks
+up and deletes that entry, computes latency in the kernel, and emits the
+completion. The passthrough monitor uses the same pattern keyed by
+`struct io_uring_cmd *` and copies `user_data` from the embedded SQE. Require
+the final loss record to be zero before calling either stream complete.
+
+`kvio record` uses `nvme_tp_monitor`. These are driver-visible NVMe commands,
+not a PCIe-wire capture: the tracer does not observe firmware work, the FTL,
+NAND operations, or SPDK/VFIO paths that bypass the Linux NVMe driver. It
+records metadata, not payload bytes.
+
+Every io_uring SQE has a `user_data` field, and the kernel returns it with the
+CQE. It is never transmitted to the NVMe device. The passthrough monitor can
+associate that SQE cookie with its NVMe command because it hooks the
+passthrough path. The namespace-wide tracepoints cannot, so kvio attributes
+their commands to semantic objects with the object's disjoint device range and
+monotonic operation window.
 
 ## Build a results-only candidate
 

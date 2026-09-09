@@ -18,6 +18,12 @@ captured two buffered fio workloads at the device level with
 `nvme_tp_monitor`, then replayed each two ways and refereed all runs
 with the same monitor:
 
+`nvme_tp_monitor` attaches at `nvme_setup_cmd` and `nvme_complete_rq` inside
+the Linux NVMe driver. It captures below syscall and io_uring batching: one
+`io_uring_enter()` can submit many SQEs, but the monitor records each resulting
+driver request and completion. The capture is not a PCIe bus trace and cannot
+see firmware, FTL/NAND work, or SPDK/VFIO paths that bypass the Linux driver.
+
 - **Replay A (file level)**: fio's own `write_iolog` — a *perfect*
   file-level operation log, better than any capture tool can produce —
   replayed under identical filesystem conditions.
@@ -45,7 +51,7 @@ device commands.
 
 - **`mk_dev_iolog.py`** — capture → replay. Converts an
   `nvme_tp_monitor` JSONL capture into a fio version-3 iolog: one
-  entry per captured NVMe command, with its byte offset, length, and
+  entry per captured Linux-driver NVMe request, with its byte offset, length, and
   relative timestamp. It requires a versioned, single-device/namespace capture
   with capture-time LBA metadata, rejects drops and unknown operations, uses
   fio's microsecond timestamp unit, and reparses the result to certify ordered

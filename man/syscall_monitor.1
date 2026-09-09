@@ -16,6 +16,24 @@ The program normally offers interactive choices.  Use
 and
 .B \-\-no-prompt
 for an unattended capture.
+.SH OBSERVATION LIMIT
+This tool traces selected read/write and filesystem system calls.  It does not
+hook
+.BR io_uring_enter (2)
+and therefore records no io_uring SQEs or NVMe commands.  Even a generic tracer
+that did hook that call would see only the batching boundary: an application
+can place 64 SQEs in a shared submission ring and submit them with one enter
+call.  With SQPOLL, the kernel poll thread can consume more SQEs without
+another system call while it remains awake.
+.PP
+Use
+.BR iouring_monitor (1)
+to observe accepted io_uring read/write intent and its completions.  It does
+not cover
+.BR IORING_OP_URING_CMD .
+Use
+.BR nvme_tp_monitor (1)
+to observe requests built and completed by the Linux NVMe driver.
 .SH OPTIONS
 .TP
 .BI \-\-max-events " number"
@@ -48,4 +66,6 @@ sizes, and timing.  It does not copy file payloads, but this metadata can still
 identify users, files, and access patterns.  Review it before sharing.
 .SH SEE ALSO
 .BR syscall_replayer (1),
+.BR iouring_monitor (1),
+.BR nvme_tp_monitor (1),
 .BR kvio (1)

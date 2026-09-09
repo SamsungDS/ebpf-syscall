@@ -34,17 +34,28 @@ Use the legacy single-worker path.  This changes concurrency and is useful for
 controlled comparisons, not for preserving a concurrent workload.
 .SH FIDELITY
 This tool reproduces application-facing calls.  It cannot guarantee the same
-device command stream because the page cache, readahead, writeback, filesystem,
-block layer, and scheduler can transform those calls.  When device fidelity is
+Linux NVMe driver request stream because the page cache, readahead, writeback,
+filesystem, block layer, and scheduler can transform those calls.  When
+device fidelity is
 the claim, capture with
 .BR nvme_tp_monitor (1),
 export with
 .BR "kvio iolog" ,
 and re-record the replay.
+.PP
+The source
+.BR syscall_monitor (1)
+does not hook
+.BR io_uring_enter (2)
+and does not capture SQEs written into a shared io_uring submission ring.  Even
+a generic syscall capture of one enter call could represent many SQEs, and
+SQPOLL may consume more without another system call.  The replayer therefore
+cannot reconstruct an io_uring or NVMe command stream from this input.
 .SH SAFETY
 Replay can create, overwrite, map, and modify files named in the capture.  Run
 only after reviewing the JSON and redirecting paths to disposable storage.
 .SH SEE ALSO
 .BR syscall_monitor (1),
+.BR iouring_monitor (1),
 .BR kvio (1),
 .BR nvme_tp_monitor (1)
