@@ -38,7 +38,7 @@ import time
 from kv_geometry import kv_cache_bytes, shard_kv_bytes, load_hf_config
 from agent_trace import TraceError, validate_plan
 from run_kv_offload_io import (
-    make_memory_obj, make_empty_obj, project, pct, SemanticTrace,
+    alloc_kv_buffer, make_kv_obj, project, pct, SemanticTrace,
 )
 from lmcache.v1.distributed.api import ObjectKey
 from lmcache.v1.storage_backend.raw_block import RawBlockCore, RawBlockCoreConfig
@@ -107,6 +107,8 @@ def main():
     ap.add_argument("--header-bytes", type=int, default=4096)
     ap.add_argument("--capacity-gb", type=int, default=32)
     ap.add_argument("--odirect", action="store_true")
+    ap.add_argument("--hugepage", action="store_true",
+                    help="back the KV buffers with 2 MiB THP (see run_kv_offload_io.py)")
     # workload shape
     ap.add_argument("--trace", help="JSONL request trace (numeric token count per line)")
     ap.add_argument("--agent-plan", help="plan JSON produced by `kvio trace`")
@@ -205,7 +207,10 @@ def main():
         io_engine=io_engine, iouring_queue_depth=16,
         use_uring_cmd=(args.engine == "uring_cmd"))
     core = RawBlockCore(cfg, key_namespace="object")
-    buf = bytes(obj_bytes)
+    # One source and one destination buffer, allocated and pre-faulted once,
+    # as a real engine's pinned pool; content is zeros, geometry is content-free.
+    src = make_kv_obj(alloc_kv_buffer(obj_bytes, hugepage=args.hugepage))
+    dst = make_kv_obj(alloc_kv_buffer(obj_bytes, hugepage=args.hugepage))
     sem = SemanticTrace(args.sem_out, header_bytes=args.header_bytes,
                         mdts_bytes=args.mdts_bytes) if args.sem_out else None
 
@@ -228,7 +233,7 @@ def main():
         # Materialize those logical chunks before starting timing or metrics.
         for chunk_key in agent_plan.get("warm_keys", []):
             for key in rank_keys(chunk_key):
-                result = core.put_many([key], [make_memory_obj(buf)])
+                result = core.put_many([key], [src])
                 if not result.results[0]:
                     raise RuntimeError("failed to precondition an agent-plan warm chunk")
 
@@ -262,7 +267,7 @@ def main():
                         encoded = key.encoded
                         t0 = time.perf_counter()
                         sem_t0 = time.monotonic() if sem else 0.0
-                        result = core.put_many([key], [make_memory_obj(buf)])
+                        result = core.put_many([key], [src])
                         if not result.results[0]:
                             raise RuntimeError(
                                 f"agent plan store failed at request "
@@ -278,7 +283,7 @@ def main():
                 for encoded in encoded_keys:
                     t0 = time.perf_counter()
                     sem_t0 = time.monotonic() if sem else 0.0
-                    result = core.load_many_into([encoded], [make_empty_obj(obj_bytes)])
+                    result = core.load_many_into([encoded], [dst])
                     load_ms.append((time.perf_counter() - t0) * 1e3)
                     if not result or not result[0]:
                         raise RuntimeError(
@@ -313,6 +318,7 @@ def main():
     next_hash = 0
     store_ms, load_ms = [], []
     n_hit = n_miss = 0
+    fails = {"store": 0, "load": 0}  # a failed op is counted, never timed
     t_start = time.perf_counter()
     for nchunks in chunks_per_req:
         want_hit = stored_keys and rng.random() < args.hit_rate
@@ -324,9 +330,12 @@ def main():
                 for enc in stored_keys[base]:
                     t0 = time.perf_counter()
                     sem_t0 = time.monotonic() if sem else 0.0
-                    core.load_many_into([enc], [make_empty_obj(obj_bytes)])
-                    load_ms.append((time.perf_counter() - t0) * 1e3)
-                    if sem:
+                    ok = bool(core.load_many_into([enc], [dst])[0])
+                    if ok:
+                        load_ms.append((time.perf_counter() - t0) * 1e3)
+                    else:
+                        fails["load"] += 1
+                    if sem and ok:
                         off = core.entry_offset(enc)
                         if off is not None:
                             sem.emit("load", enc, obj_bytes, off, sem_t0)
@@ -340,9 +349,12 @@ def main():
                         model_name="kvoffload", kv_rank=r))
                     t0 = time.perf_counter()
                     sem_t0 = time.monotonic() if sem else 0.0
-                    core.put_many([key], [make_memory_obj(buf)])
-                    store_ms.append((time.perf_counter() - t0) * 1e3)
-                    if sem:
+                    ok = bool(core.put_many([key], [src]).results[0])
+                    if ok:
+                        store_ms.append((time.perf_counter() - t0) * 1e3)
+                    else:
+                        fails["store"] += 1
+                    if sem and ok:
                         off = core.entry_offset(key.encoded)
                         if off is not None:
                             sem.emit("store", key.encoded, obj_bytes, off, sem_t0)
@@ -366,6 +378,10 @@ def main():
           f"p99 {pct(load_ms,.99):7.3f} ms  ({loaded_gb:.2f} GiB)")
     print(f"  wall {wall:.2f}s  aggregate {(stored_gb+loaded_gb)/wall:.2f} GiB/s "
           f"({(len(store_ms)+len(load_ms))/wall:.0f} objects/s)")
+    if fails["store"] or fails["load"]:
+        print(f"  !!! {fails['store']} store / {fails['load']} load operations FAILED "
+              f"(engine errors above); the numbers cover only the successful ones")
+        raise SystemExit(2)
 
 
 if __name__ == "__main__":

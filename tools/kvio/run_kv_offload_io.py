@@ -28,6 +28,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import mmap
 import os
 import time
 
@@ -102,21 +103,80 @@ class SemanticTrace:
         self._f.close()
 
 
-def make_memory_obj(payload: bytes) -> TensorMemoryObj:
-    data = bytearray(payload)
-    raw = torch.frombuffer(data, dtype=torch.uint8)
+HUGEPAGE_BYTES = 2 << 20
+
+
+def alloc_kv_buffer(size_bytes: int, *, hugepage: bool = False) -> torch.Tensor:
+    """Zero-filled, pre-faulted uint8 buffer for one KV object.
+
+    With ``hugepage`` the buffer is a 2 MiB-aligned anonymous mapping under
+    MADV_HUGEPAGE, so the kernel backs it with 2 MiB folios wherever
+    ``/sys/kernel/mm/transparent_hugepage/enabled`` is ``always`` or ``madvise``.
+    That is what lets one io_uring_cmd passthrough command carry more than
+    ``max_segments`` pages: the kernel maps a user buffer one segment per
+    physically contiguous run, so N MiB on 4 KiB pages needs N*256 segments and
+    is rejected with EINVAL past ``max_segments``, while the same N MiB on
+    2 MiB folios needs N/2. Pre-faulting keeps the page faults out of the timed
+    region, like the pinned buffer pool a real engine stores from and restores
+    into.
+    """
+    if hugepage:
+        # MAP_PRIVATE matters: Python's default for an anonymous mmap is
+        # MAP_SHARED, which is shmem and follows shmem_enabled (never, by
+        # default) instead of the anonymous THP policy.
+        mm = mmap.mmap(-1, size_bytes + HUGEPAGE_BYTES,
+                       flags=mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS)
+        mm.madvise(mmap.MADV_HUGEPAGE)
+        whole = torch.frombuffer(mm, dtype=torch.uint8)
+        off = (-whole.data_ptr()) % HUGEPAGE_BYTES
+        raw = whole[off:off + size_bytes]
+    else:
+        raw = torch.empty(size_bytes, dtype=torch.uint8)
+    raw.fill_(0)
+    return raw
+
+
+def make_kv_obj(raw: torch.Tensor) -> TensorMemoryObj:
     meta = MemoryObjMetadata(
-        shape=torch.Size([len(data)]), dtype=torch.uint8, address=0,
-        phy_size=len(data), fmt=MemoryFormat.BINARY, ref_count=1)
+        shape=torch.Size([raw.numel()]), dtype=torch.uint8, address=0,
+        phy_size=raw.numel(), fmt=MemoryFormat.BINARY, ref_count=1)
     return TensorMemoryObj(raw, meta, parent_allocator=None)
 
 
-def make_empty_obj(size_bytes: int) -> TensorMemoryObj:
-    raw = torch.zeros(size_bytes, dtype=torch.uint8)
-    meta = MemoryObjMetadata(
-        shape=torch.Size([size_bytes]), dtype=torch.uint8, address=0,
-        phy_size=size_bytes, fmt=MemoryFormat.BINARY, ref_count=1)
-    return TensorMemoryObj(raw, meta, parent_allocator=None)
+def anon_hugepages_kb() -> int:
+    """This process's THP-backed anonymous memory (proof that --hugepage took)."""
+    try:
+        with open("/proc/self/smaps_rollup") as f:
+            for ln in f:
+                if ln.startswith("AnonHugePages:"):
+                    return int(ln.split()[1])
+    except OSError:
+        pass
+    return 0
+
+
+def kernel_passthrough_cap(device_path: str):
+    """What this kernel lets one NVMe passthrough command carry on ``device_path``.
+
+    Returns ``max_hw_sectors_kb`` and ``max_segments`` from the namespace's
+    sysfs queue, plus ``page_cap`` = min(max_hw_sectors_kb, max_segments * page):
+    the largest command the kernel maps from ordinary 4 KiB pages. ``None`` when
+    the path is not an NVMe device (a plain file) -- there is no cap to check.
+    """
+    from lmcache.v1.storage_backend.raw_block.core import (
+        _read_sysfs_int,
+        _resolve_sysfs_queue_dir,
+    )
+    queue_dir = _resolve_sysfs_queue_dir(device_path)
+    if queue_dir is None:
+        return None
+    hw_kb = _read_sysfs_int(f"{queue_dir}/max_hw_sectors_kb")
+    segs = _read_sysfs_int(f"{queue_dir}/max_segments")
+    if not hw_kb or not segs:
+        return None
+    page = os.sysconf("SC_PAGE_SIZE")
+    return {"max_hw_sectors_kb": hw_kb, "max_segments": segs,
+            "hw_cap": hw_kb * 1024, "page_cap": min(hw_kb * 1024, segs * page)}
 
 
 def split_commands(nbytes, xfer, lba):
@@ -180,7 +240,15 @@ def main():
     ap.add_argument("--mdts-bytes", type=int, default=131072,
                     help="bytes per NVMe command: LMCache's "
                          "max_data_transfer_size knob, <= the device's MDTS "
-                         "(the engine does the splitting, not the device)")
+                         "(the engine does the splitting, not the device). "
+                         "0 = auto: the largest command this kernel maps from "
+                         "4 KiB pages, min(max_hw_sectors_kb, max_segments*page)")
+    ap.add_argument("--hugepage", action="store_true",
+                    help="back the KV buffers with 2 MiB THP so one passthrough "
+                         "command can exceed max_segments*4 KiB")
+    ap.add_argument("--allow-io-errors", action="store_true",
+                    help="exit 0 even when some store/load operations failed "
+                         "(failed operations are never counted in the numbers)")
     ap.add_argument("--block-align", type=int, default=4096)
     ap.add_argument("--header-bytes", type=int, default=4096)
     ap.add_argument("--iters", type=int, default=1, help="passes over the chunk set")
@@ -190,6 +258,31 @@ def main():
     ap.add_argument("--record", help="write a kvio_record.json replay manifest here")
     ap.add_argument("--trace", help="LMCACHE_KVIO_TRACE path (semantic trace)")
     args = ap.parse_args()
+
+    # The engine splits every object into --mdts-bytes commands and hands each
+    # to the kernel as one user buffer. On 4 KiB pages the kernel needs one
+    # segment per page, so a command above max_segments*4 KiB never reaches the
+    # device: the passthrough rejects it with EINVAL, the engine logs the failed
+    # write, and nothing is stored. Say so up front rather than let a sweep run
+    # every point past the cap against a device it never touches.
+    cap = kernel_passthrough_cap(args.device) if args.engine == "uring_cmd" else None
+    if args.mdts_bytes <= 0:
+        if cap is None:
+            sys.exit("--mdts-bytes 0 (auto) needs an NVMe device path and "
+                     "--engine uring_cmd")
+        args.mdts_bytes = cap["page_cap"]
+        print(f"  mdts auto: {args.mdts_bytes // 1024} KiB/cmd "
+              f"(max_hw_sectors_kb={cap['max_hw_sectors_kb']}, "
+              f"max_segments={cap['max_segments']})")
+    elif cap is not None:
+        limit = cap["hw_cap"] if args.hugepage else cap["page_cap"]
+        if args.mdts_bytes > limit:
+            print(f"  WARNING: --mdts-bytes {args.mdts_bytes // 1024} KiB is above "
+                  f"what this kernel maps per command "
+                  f"({limit // 1024} KiB: max_hw_sectors_kb="
+                  f"{cap['max_hw_sectors_kb']}, max_segments={cap['max_segments']}"
+                  f"{'' if args.hugepage else ', 4 KiB pages; --hugepage lifts the segment part'}"
+                  f"); expect every command to fail with EINVAL", file=sys.stderr)
 
     if args.trace:
         os.environ["LMCACHE_KVIO_TRACE"] = args.trace
@@ -254,9 +347,42 @@ def main():
             use_uring_cmd=(args.engine == "uring_cmd"))
         core = RawBlockCore(cfg, key_namespace="object")
 
-    buf = bytes(obj_bytes)  # zeros; geometry is content-free
+    # One source and one destination buffer, allocated and pre-faulted once and
+    # reused for every object: a real engine stores from and restores into a
+    # pinned buffer pool, so allocating per object would time page faults and
+    # garbage collection as offload cost. Content is zeros; geometry is
+    # content-free.
+    src = make_kv_obj(alloc_kv_buffer(obj_bytes, hugepage=args.hugepage))
+    dst = make_kv_obj(alloc_kv_buffer(obj_bytes, hugepage=args.hugepage))
+    if args.hugepage:
+        print(f"  buffers: 2 x {obj_bytes} B on THP; AnonHugePages now "
+              f"{anon_hugepages_kb() // 1024} MiB")
+
+    # Every operation's result is checked. The engine logs a failed write and
+    # returns False instead of raising, and a load of a key that never landed
+    # is a no-op that returns False without touching the device -- so timing an
+    # unchecked call reports the cost of doing nothing as device throughput.
+    def do_store(key, idx):
+        try:
+            if gds:
+                return core.store(key.encoded, idx) is not False
+            return bool(core.put_many([key], [src]).results[0])
+        except Exception as e:
+            print(f"  store {key.encoded} raised: {e}", file=sys.stderr)
+            return False
+
+    def do_load(key, idx):
+        try:
+            if gds:
+                return core.load(key.encoded, idx) is not False
+            return bool(core.load_many_into([key.encoded], [dst])[0])
+        except Exception as e:
+            print(f"  load {key.encoded} raised: {e}", file=sys.stderr)
+            return False
+
     n_obj = args.num_chunks * ranks
     store_ms, load_ms = [], []
+    fails = {"store": 0, "load": 0}
     for it in range(args.warmup + args.iters):
         # fresh keys per pass so every store is a real write (not an index hit).
         # Under TP the `ranks` objects of a chunk share the chunk hash and differ
@@ -265,36 +391,47 @@ def main():
                     chunk_hash=ObjectKey.IntHash2Bytes(it * args.num_chunks + i),
                     model_name="kvoffload", kv_rank=r))
                 for i in range(args.num_chunks) for r in range(ranks)]
-        st = [0.0] * n_obj
+        st = [None] * n_obj
         for j in range(n_obj):
             t0 = time.perf_counter()
-            if gds:
-                core.store(keys[j].encoded, it * n_obj + j)
-            else:
-                core.put_many([keys[j]], [make_memory_obj(buf)])
-            st[j] = (time.perf_counter() - t0) * 1e3
+            ok = do_store(keys[j], it * n_obj + j)
+            st[j] = (time.perf_counter() - t0) * 1e3 if ok else None
+        ld = [None] * n_obj
         for j in range(n_obj):
             t2 = time.perf_counter()
-            if gds:
-                core.load(keys[j].encoded, it * n_obj + j)
-            else:
-                core.load_many_into([keys[j].encoded], [make_empty_obj(obj_bytes)])
-            dt = (time.perf_counter() - t2) * 1e3
-            if it >= args.warmup:
-                store_ms.append(st[j]); load_ms.append(dt)
+            ok = do_load(keys[j], it * n_obj + j)
+            ld[j] = (time.perf_counter() - t2) * 1e3 if ok else None
+        fails["store"] += st.count(None)
+        fails["load"] += ld.count(None)
+        if it >= args.warmup:
+            store_ms += [x for x in st if x is not None]
+            load_ms += [x for x in ld if x is not None]
     try:
         core.close()
     except Exception:
         pass
 
-    def line(name, ms, cmds, tbytes):
+    n_ops = n_obj * (args.warmup + args.iters)
+
+    def line(name, ms, cmds):
+        nfail = fails[name]
+        if not ms:
+            print(f"  {name:5s}: NO successful operations "
+                  f"({nfail}/{n_ops} failed) -- nothing measured")
+            return
         mean = sum(ms) / len(ms)
         print(f"  {name:5s}: p50 {pct(ms, .5):7.3f} ms  p99 {pct(ms, .99):7.3f} ms | "
               f"{(obj_bytes / (mean / 1e3)) / 1e6:8.1f} MB/s | "
-              f"{cmds / (mean / 1e3):9.0f} NVMe cmd/s")
-    print("  --- measured (real device I/O) ---")
-    line("store", store_ms, geom["store_cmds"], geom["store_bytes"])
-    line("load", load_ms, geom["load_cmds"], geom["load_bytes"])
+              f"{cmds / (mean / 1e3):9.0f} NVMe cmd/s | "
+              f"{len(ms)} timed, {nfail}/{n_ops} failed")
+    print("  --- measured (real device I/O; failed operations excluded) ---")
+    line("store", store_ms, geom["store_cmds"])
+    line("load", load_ms, geom["load_cmds"])
+    failed = fails["store"] + fails["load"]
+    if failed:
+        print(f"  !!! {fails['store']} store / {fails['load']} load operations "
+              f"FAILED (engine errors above); the numbers cover only the "
+              f"successful ones", file=sys.stderr)
 
     if args.record:
         rec = {
@@ -306,10 +443,12 @@ def main():
                 "mdts_bytes": args.mdts_bytes, "block_align": args.block_align,
                 "header_bytes": args.header_bytes, "slot_bytes": slot,
                 "capacity_bytes": args.capacity_gb * 1024 * 1024 * 1024,
+                "hugepage_buffers": args.hugepage,
             },
             "tp": args.tp, "ranks_per_chunk": ranks, "shard": shard_note,
             "chunk_block_bytes": block_bytes,
             "access_pattern": "store-all-then-load-all",
+            "io_errors": dict(fails), "operations_attempted": n_ops,
             # Under TP the objects of a chunk share chunk_index and differ by
             # kv_rank -- matching the per-rank LMCache workers.
             "objects": [{"index": i * ranks + r, "chunk_index": i, "kv_rank": r,
@@ -320,6 +459,9 @@ def main():
         with open(args.record, "w") as f:
             json.dump(rec, f, indent=2)
         print(f"  wrote replay manifest: {args.record}")
+
+    if failed and not args.allow_io_errors:
+        sys.exit(2)
 
 
 if __name__ == "__main__":
