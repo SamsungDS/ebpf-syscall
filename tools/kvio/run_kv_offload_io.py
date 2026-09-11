@@ -31,6 +31,19 @@ import math
 import os
 import time
 
+# Pin BLAS/OpenMP thread pools BEFORE importing anything that loads torch/numpy.
+# This is an I/O benchmark, not a compute one: it does no matrix math, but torch
+# and numpy drag in OpenBLAS, whose worker threads BUSY-WAIT (spin) when idle.
+# During the offload's I/O waits those spinning threads burn cycles and retire
+# instructions doing nothing, so an unpinned run's measured CPU tracks wall time,
+# not work -- profiling showed ~70% of "CPU cost" was `blas_thread_server` spin,
+# which fabricated a difference between object sizes that vanished once pinned.
+# Default to 1; KVIO_CPU_THREADS overrides for anyone who wants BLAS parallelism.
+_threads = os.environ.get("KVIO_CPU_THREADS", "1")
+for _v in ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS",
+           "NUMEXPR_NUM_THREADS", "VECLIB_MAXIMUM_THREADS"):
+    os.environ.setdefault(_v, _threads)
+
 from kv_geometry import kv_cache_bytes, shard_kv_bytes, load_hf_config
 
 # LMCache public API (no dependency on the test suite).
