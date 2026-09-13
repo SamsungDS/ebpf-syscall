@@ -26,10 +26,13 @@ Example (real NVMe passthrough):
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import json
 import math
 import mmap
 import os
+import sys
+import threading
 import time
 
 # Pin BLAS/OpenMP thread pools BEFORE importing anything that loads torch/numpy.
@@ -48,6 +51,7 @@ for _v in ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS",
 from kv_geometry import kv_cache_bytes, shard_kv_bytes, load_hf_config
 
 # LMCache public API (no dependency on the test suite).
+import lmcache
 from lmcache.v1.distributed.api import ObjectKey
 from lmcache.v1.memory_management import (
     MemoryFormat,
@@ -249,6 +253,18 @@ def main():
     ap.add_argument("--allow-io-errors", action="store_true",
                     help="exit 0 even when some store/load operations failed "
                          "(failed operations are never counted in the numbers)")
+    ap.add_argument("--concurrency", type=int, default=1,
+                    help="streams (threads) storing, then loading, their own "
+                         "objects at the same time: N requests restoring at "
+                         "once, or N TP ranks loading their shards")
+    ap.add_argument("--load-parallelism", type=int, default=0,
+                    help="engine-internal cross-object load threads "
+                         "(RawBlockCoreConfig.load_parallelism, LMCache PR "
+                         "#4697); 0 = engine default; refused by an engine "
+                         "without it")
+    ap.add_argument("--ring-depth", type=int, default=0,
+                    help="io_uring ring depth handed to the engine "
+                         "(iouring_queue_depth); 0 = engine default")
     ap.add_argument("--block-align", type=int, default=4096)
     ap.add_argument("--header-bytes", type=int, default=4096)
     ap.add_argument("--iters", type=int, default=1, help="passes over the chunk set")
@@ -336,33 +352,55 @@ def main():
             mdts=args.mdts_bytes, trace_path=args.trace or None)
     if not gds:
         io_engine = "posix" if args.engine == "posix" else "io_uring"
-        cfg = RawBlockCoreConfig(
+        cfg_kwargs = dict(
             device_path=args.device, capacity_bytes=args.capacity_gb * 1024 * 1024 * 1024,
             block_align=args.block_align, header_bytes=args.header_bytes, slot_bytes=slot,
             use_odirect=args.odirect, enable_zero_copy=False, meta_total_bytes=1 * 1024 * 1024,
             meta_magic=b"LMCIDX01", meta_version=1, meta_checkpoint_interval_sec=60,
             meta_idle_quiet_ms=0, meta_enable_periodic=False, meta_verify_on_load=False,
             max_data_transfer_size=args.mdts_bytes, load_checkpoint_on_init=False,
-            io_engine=io_engine, iouring_queue_depth=8,
-            use_uring_cmd=(args.engine == "uring_cmd"))
-        core = RawBlockCore(cfg, key_namespace="object")
+            io_engine=io_engine, use_uring_cmd=(args.engine == "uring_cmd"))
+        if args.ring_depth > 0:
+            cfg_kwargs["iouring_queue_depth"] = args.ring_depth
+        # The engine's read path decides what a load's queue depth can be: the
+        # pre-#4697 raw_block issues one command at a time per object, PR #4697
+        # batches an object's chunk reads and adds a cross-object load pool
+        # (load_parallelism). Say which one this run drives.
+        cfg_fields = {f.name for f in dataclasses.fields(RawBlockCoreConfig)}
+        batched_reads = "load_parallelism" in cfg_fields
+        if args.load_parallelism > 0:
+            if not batched_reads:
+                sys.exit("--load-parallelism: this engine has no load_parallelism "
+                         "(raw_block before LMCache PR #4697)")
+            cfg_kwargs["load_parallelism"] = args.load_parallelism
+        core = RawBlockCore(RawBlockCoreConfig(**cfg_kwargs), key_namespace="object")
+        print(f"  engine: raw_block from {os.path.dirname(lmcache.__file__)}; loads "
+              f"{'batched per object + load_parallelism=' + str(cfg_kwargs.get('load_parallelism', 1)) + ' (PR #4697)' if batched_reads else 'one command at a time (before PR #4697)'}; "
+              f"ring depth {core.iouring_queue_depth}; streams {args.concurrency}")
 
-    # One source and one destination buffer, allocated and pre-faulted once and
-    # reused for every object: a real engine stores from and restores into a
-    # pinned buffer pool, so allocating per object would time page faults and
-    # garbage collection as offload cost. Content is zeros; geometry is
-    # content-free.
-    src = make_kv_obj(alloc_kv_buffer(obj_bytes, hugepage=args.hugepage))
-    dst = make_kv_obj(alloc_kv_buffer(obj_bytes, hugepage=args.hugepage))
+    # One source and one destination buffer per stream, allocated and
+    # pre-faulted once and reused for every object: a real engine stores from
+    # and restores into a pinned buffer pool, so allocating per object would
+    # time page faults and garbage collection as offload cost. Content is zeros;
+    # geometry is content-free. --concurrency N runs N streams (threads), each
+    # with its own objects and buffers, at the same time: N requests restoring
+    # at once, or N TP ranks loading their shards. The engine drops the GIL
+    # while it waits on the ring, so the streams' commands overlap on the
+    # device; the per-object Python bookkeeping stays serialised, as it is in
+    # LMCache itself.
+    nstreams = max(1, args.concurrency)
+    bufs = [(make_kv_obj(alloc_kv_buffer(obj_bytes, hugepage=args.hugepage)),
+             make_kv_obj(alloc_kv_buffer(obj_bytes, hugepage=args.hugepage)))
+            for _ in range(nstreams)]
     if args.hugepage:
-        print(f"  buffers: 2 x {obj_bytes} B on THP; AnonHugePages now "
+        print(f"  buffers: {2 * nstreams} x {obj_bytes} B on THP; AnonHugePages now "
               f"{anon_hugepages_kb() // 1024} MiB")
 
     # Every operation's result is checked. The engine logs a failed write and
     # returns False instead of raising, and a load of a key that never landed
     # is a no-op that returns False without touching the device -- so timing an
     # unchecked call reports the cost of doing nothing as device throughput.
-    def do_store(key, idx):
+    def do_store(key, idx, src):
         try:
             if gds:
                 return core.store(key.encoded, idx) is not False
@@ -371,7 +409,7 @@ def main():
             print(f"  store {key.encoded} raised: {e}", file=sys.stderr)
             return False
 
-    def do_load(key, idx):
+    def do_load(key, idx, dst):
         try:
             if gds:
                 return core.load(key.encoded, idx) is not False
@@ -380,38 +418,74 @@ def main():
             print(f"  load {key.encoded} raised: {e}", file=sys.stderr)
             return False
 
-    n_obj = args.num_chunks * ranks
-    store_ms, load_ms = [], []
-    fails = {"store": 0, "load": 0}
-    for it in range(args.warmup + args.iters):
-        # fresh keys per pass so every store is a real write (not an index hit).
-        # Under TP the `ranks` objects of a chunk share the chunk hash and differ
-        # only by kv_rank -- exactly what the per-rank LMCache workers emit.
-        keys = [encode_object_key(ObjectKey(
-                    chunk_hash=ObjectKey.IntHash2Bytes(it * args.num_chunks + i),
+    n_obj = args.num_chunks * ranks  # objects per stream per pass
+
+    def stream_keys(it, s):
+        # fresh keys per pass and per stream so every store is a real write
+        # (not an index hit). Under TP the `ranks` objects of a chunk share the
+        # chunk hash and differ only by kv_rank -- exactly what the per-rank
+        # LMCache workers emit.
+        base = (it * nstreams + s) * args.num_chunks
+        return [encode_object_key(ObjectKey(
+                    chunk_hash=ObjectKey.IntHash2Bytes(base + i),
                     model_name="kvoffload", kv_rank=r))
                 for i in range(args.num_chunks) for r in range(ranks)]
-        st = [None] * n_obj
-        for j in range(n_obj):
-            t0 = time.perf_counter()
-            ok = do_store(keys[j], it * n_obj + j)
-            st[j] = (time.perf_counter() - t0) * 1e3 if ok else None
-        ld = [None] * n_obj
-        for j in range(n_obj):
-            t2 = time.perf_counter()
-            ok = do_load(keys[j], it * n_obj + j)
-            ld[j] = (time.perf_counter() - t2) * 1e3 if ok else None
-        fails["store"] += st.count(None)
-        fails["load"] += ld.count(None)
+
+    def run_phase(name, it, fn):
+        """Every stream runs `fn` over its objects at once; returns the per-stream
+        latency lists (None = failed operation) and the phase wall time.
+
+        The phase window is printed as CLOCK_MONOTONIC nanoseconds -- the clock
+        nvme_tp_monitor stamps device commands with -- so a capture taken during
+        the run can be cut per phase (tools/reproduce/kv-offload-io/qdepth.py).
+        """
+        stamp = {}
+        barrier = threading.Barrier(
+            nstreams, action=lambda: stamp.__setitem__("start", time.monotonic_ns()))
+        out = [None] * nstreams
+
+        def worker(s):
+            keys = stream_keys(it, s)
+            buf = bufs[s][0] if name == "store" else bufs[s][1]
+            lat = [None] * n_obj
+            barrier.wait()
+            for j in range(n_obj):
+                t0 = time.perf_counter()
+                ok = fn(keys[j], (it * nstreams + s) * n_obj + j, buf)
+                lat[j] = (time.perf_counter() - t0) * 1e3 if ok else None
+            out[s] = lat
+
+        threads = [threading.Thread(target=worker, args=(s,), name=f"{name}-{s}")
+                   for s in range(nstreams)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        end = time.monotonic_ns()
+        print(f"  @@@ PHASE {name} pass={it} start_ns={stamp['start']} end_ns={end}",
+              flush=True)
+        return out, (end - stamp["start"]) / 1e9
+
+    store_ms, load_ms = [], []
+    fails = {"store": 0, "load": 0}
+    phase_wall = {"store": 0.0, "load": 0.0}
+    for it in range(args.warmup + args.iters):
+        st, wall_s = run_phase("store", it, do_store)
+        ld, wall_l = run_phase("load", it, do_load)
+        fails["store"] += sum(x.count(None) for x in st)
+        fails["load"] += sum(x.count(None) for x in ld)
         if it >= args.warmup:
-            store_ms += [x for x in st if x is not None]
-            load_ms += [x for x in ld if x is not None]
+            store_ms += [v for x in st for v in x if v is not None]
+            load_ms += [v for x in ld for v in x if v is not None]
+            phase_wall["store"] += wall_s
+            phase_wall["load"] += wall_l
     try:
         core.close()
     except Exception:
         pass
 
-    n_ops = n_obj * (args.warmup + args.iters)
+    n_ops = n_obj * nstreams * (args.warmup + args.iters)
+    aggregate = {}
 
     def line(name, ms, cmds):
         nfail = fails[name]
@@ -420,10 +494,16 @@ def main():
                   f"({nfail}/{n_ops} failed) -- nothing measured")
             return
         mean = sum(ms) / len(ms)
+        # per-stream rate from the per-operation mean; aggregate rate = every
+        # stream's successful bytes over the phase wall time (what the device
+        # delivered with all streams in flight)
+        agg = (len(ms) * obj_bytes / phase_wall[name] / 1e6) if phase_wall[name] else 0.0
+        aggregate[name] = agg
         print(f"  {name:5s}: p50 {pct(ms, .5):7.3f} ms  p99 {pct(ms, .99):7.3f} ms | "
               f"{(obj_bytes / (mean / 1e3)) / 1e6:8.1f} MB/s | "
               f"{cmds / (mean / 1e3):9.0f} NVMe cmd/s | "
-              f"{len(ms)} timed, {nfail}/{n_ops} failed")
+              f"{len(ms)} timed, {nfail}/{n_ops} failed | "
+              f"aggregate {agg:8.1f} MB/s x{nstreams}")
     print("  --- measured (real device I/O; failed operations excluded) ---")
     line("store", store_ms, geom["store_cmds"])
     line("load", load_ms, geom["load_cmds"])
@@ -449,6 +529,9 @@ def main():
             "chunk_block_bytes": block_bytes,
             "access_pattern": "store-all-then-load-all",
             "io_errors": dict(fails), "operations_attempted": n_ops,
+            "concurrency": nstreams, "aggregate_MBps": aggregate,
+            "engine_batched_reads": (not gds) and batched_reads,
+            "load_parallelism": args.load_parallelism, "ring_depth": args.ring_depth,
             # Under TP the objects of a chunk share chunk_index and differ by
             # kv_rank -- matching the per-rank LMCache workers.
             "objects": [{"index": i * ranks + r, "chunk_index": i, "kv_rank": r,
