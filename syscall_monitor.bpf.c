@@ -61,6 +61,9 @@
 
 #define MAX_COMM_LEN 16
 #define MAX_ENTRIES 8192
+#define MAX_MMAP_REGIONS 1024
+#define PAGE_SIZE  4096
+#define EVENT_NR_PAGE_FAULT 1024
 
 /* file access modes */
 #define O_ACCMODE   00000003
@@ -85,6 +88,8 @@
 #define O_SYNC      04000000
 #define O_PATH      010000000
 
+#define MAP_ANONYMOUS 0x20
+
 enum io_direction {
 	READ,
 	WRITE,
@@ -108,6 +113,121 @@ struct syscall_event {
     long ret;  /* holds the number of bytes transferred */
     long error_code;  /* holds the error code returned by the syscall */
 };
+
+struct mmap_region_slot {
+    u64 start;
+    u64 len;
+    u64 file_offset; // byte offset into the backing file at `start`
+};
+
+struct mmap_region_table {
+    u32 next;
+    struct mmap_region_slot slots[MAX_MMAP_REGIONS];
+};
+
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, MAX_ENTRIES);
+    __type(key, u32);   // tgid
+    __type(value, struct mmap_region_table);
+} mmap_region_table_map SEC(".maps");
+
+/*
+ * Initialize single-entry per cpu array as scratch map
+ * for first entry insertion into a new per-tgid table
+ * entry in mmap_region_table_map to avoid large stack usage
+ */
+struct {
+    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, u32);
+    __type(value, struct mmap_region_table);
+} mmap_region_table_scratch SEC(".maps");
+
+struct mmap_pending {
+    u64 length;
+    u64 file_offset;
+    int fd;
+    int map_flags;
+};
+
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, MAX_ENTRIES);
+    __type(key, u64);   // bpf_get_current_pid_tgid() (tid)
+    __type(value, struct mmap_pending);
+} mmap_pending_map SEC(".maps");
+
+static __always_inline struct mmap_region_slot *mmap_region_find(struct mmap_region_table *t, u64 addr)
+{
+    for (int i = 0; i < MAX_MMAP_REGIONS; i++) {
+        struct mmap_region_slot *s = &t->slots[i];
+        if (s->len && addr >= s->start && addr < s->start + s->len)
+            return s;
+    }
+    return NULL;
+}
+
+static __always_inline void encode_filename(char filename[256], u64 addr)
+{
+    const char hex[] = "0123456789abcdef";
+    filename[0] = '0';
+    filename[1] = 'x';
+    #pragma unroll
+    for (int i = 0; i < 16; i++)
+        filename[2 + i] = hex[(addr >> ((15 - i) * 4)) & 0xF];
+    filename[18] = '\0';
+}
+
+static __always_inline u32 tgid_from_tid(u64 tid)
+{
+    return tid >> 32;
+}
+
+static __always_inline void mmap_region_insert(u32 tgid, u64 start, u64 len, u64 file_offset)
+{
+    struct mmap_region_table *t = bpf_map_lookup_elem(&mmap_region_table_map, &tgid);
+
+    if (t) {
+        u32 idx = t->next % MAX_MMAP_REGIONS;
+        t->slots[idx].start = start;
+        t->slots[idx].len = len;
+        t->slots[idx].file_offset = file_offset;
+        t->next = idx + 1;
+        return;
+    }
+
+    u32 zero = 0;
+    struct mmap_region_table *scratch = bpf_map_lookup_elem(&mmap_region_table_scratch, &zero);
+    if (!scratch)
+        return;
+
+    scratch->next = 1;
+    scratch->slots[0].start = start;
+    scratch->slots[0].len = len;
+    scratch->slots[0].file_offset = file_offset;
+
+    /* BPF_NOEXIST: if another thread of the same tgid raced us and already
+     * created the table, drop this region */
+    bpf_map_update_elem(&mmap_region_table_map, &tgid, scratch, BPF_NOEXIST);
+}
+
+static __always_inline void mmap_region_remove(u32 tgid, u64 addr, u64 length)
+{
+    struct mmap_region_table *t = bpf_map_lookup_elem(&mmap_region_table_map, &tgid);
+    if (!t)
+        return;
+
+    u64 end = addr + length;
+    for (int i = 0; i < MAX_MMAP_REGIONS; i++) {
+        struct mmap_region_slot *s = &t->slots[i];
+        if (s->len && s->start < end && addr < s->start + s->len) {
+            s->start = 0;
+            s->len = 0;
+            s->file_offset = 0;
+        }
+    }
+}
 
 // Maps for syscall statistics
 struct {
@@ -490,21 +610,22 @@ int trace_mmap_entry(struct pt_regs *ctx)
 {
     u32 syscall_nr = 9; // mmap syscall
     /*
-     * Safely read the inner pt_regs pointer via bpf_probe_read_kernel.
-     * Direct cast of PT_REGS_PARM1(ctx) gives a scalar the verifier
-     * won't allow dereferencing — read it through the helper instead.
+     * Read six registers mmap needs directly from inner_ptr
+     * to save BPF stack memory.
      */
-    struct pt_regs inner = {};
     struct pt_regs *inner_ptr = (struct pt_regs *)PT_REGS_PARM1(ctx);
-    if (bpf_probe_read_kernel(&inner, sizeof(inner), inner_ptr) < 0)
-        return 0;
+    unsigned long si = 0, dx = 0, r10 = 0, r8 = 0, r9 = 0;
+    bpf_probe_read_kernel(&si,  sizeof(si),  &inner_ptr->si);
+    bpf_probe_read_kernel(&dx,  sizeof(dx),  &inner_ptr->dx);
+    bpf_probe_read_kernel(&r10, sizeof(r10), &inner_ptr->r10);
+    bpf_probe_read_kernel(&r8,  sizeof(r8),  &inner_ptr->r8);
+    bpf_probe_read_kernel(&r9,  sizeof(r9),  &inner_ptr->r9);
 
-    /* now read args from the local copy — all lvalues, verifier happy */
-    unsigned int fd        = (unsigned int)PT_REGS_PARM5(&inner);
-    size_t       length    = (size_t)PT_REGS_PARM2(&inner);
-    loff_t       offset    = (loff_t)PT_REGS_PARM6(&inner);
-    int          prot      = (int)PT_REGS_PARM3(&inner);
-    int          map_flags = (int)inner.r10;
+    unsigned int fd        = (unsigned int)r8;
+    size_t       length    = (size_t)si;
+    loff_t       offset    = (loff_t)r9;
+    int          prot      = (int)dx;
+    int          map_flags = (int)r10;
     char open_flags_str[128] = {};
     __u32 pos    = 0;
     int   need_sep = 0;
@@ -537,6 +658,15 @@ int trace_mmap_entry(struct pt_regs *ctx)
 
     open_flags_str[pos] = '\0';
 
+    u64 tid = bpf_get_current_pid_tgid();
+    struct mmap_pending pending = {
+        .length = length,
+        .file_offset = (u64)offset,
+        .fd = (int)fd,
+        .map_flags = map_flags,
+    };
+    bpf_map_update_elem(&mmap_pending_map, &tid, &pending, BPF_ANY);
+
     update_stats(syscall_nr, length);
     log_event(syscall_nr, fd, length, offset, "", 0, open_flags_str, -1, -1);
 
@@ -549,6 +679,16 @@ int trace_mmap_exit(struct pt_regs *ctx)
 {
     u32 syscall_nr = 9; // mmap syscall
     unsigned long ret_addr = (unsigned long)PT_REGS_RC(ctx);
+
+    u64 tid = bpf_get_current_pid_tgid();
+    struct mmap_pending *pending = bpf_map_lookup_elem(&mmap_pending_map, &tid);
+    if (pending && ret_addr != (unsigned long)-1UL) {
+
+        if (!(pending->map_flags & MAP_ANONYMOUS))
+            mmap_region_insert(tgid_from_tid(tid), (u64)ret_addr, pending->length, pending->file_offset);
+    }
+    if (pending)
+        bpf_map_delete_elem(&mmap_pending_map, &tid);
 
     char filename[256] = {};
     if (ret_addr == (unsigned long)-1UL) {
@@ -583,6 +723,8 @@ int trace_munmap_entry(struct pt_regs *ctx)
     /* read addr (rdi = offset 112) and length (rsi = offset 104) directly */
     bpf_probe_read_kernel(&addr,   sizeof(addr),   &inner_ptr->di);
     bpf_probe_read_kernel(&length, sizeof(length),  &inner_ptr->si);
+
+    mmap_region_remove(tgid_from_tid(bpf_get_current_pid_tgid()), (u64)addr, (u64)length);
 
     /* encode addr as hex into filename[] — replayer uses it as cap_addr key */
     char filename[256] = {};
@@ -648,6 +790,32 @@ int trace_fsync_entry(struct trace_event_raw_sys_enter *ctx)
 
     update_stats(syscall_nr, 1);
     log_event(syscall_nr, fd, 1, 0, "", 0, "", -1, -1);
+
+    return 0;
+}
+
+SEC("tp_btf/page_fault_user")
+int BPF_PROG(trace_page_fault_user, unsigned long address, struct pt_regs *regs, unsigned long error_code)
+{
+    u64 fault_addr = (u64)address;
+    u32 tgid = bpf_get_current_pid_tgid() >> 32;
+    struct mmap_region_table *t;
+
+    t = bpf_map_lookup_elem(&mmap_region_table_map, &tgid);
+    if (!t)
+        return 0;
+
+    struct mmap_region_slot *slot = mmap_region_find(t, fault_addr);
+    if (!slot)
+        return 0;
+
+    s64 fault_offset = (s64)(slot->file_offset + (fault_addr - slot->start));
+
+    char filename[256] = {};
+    encode_filename(filename, fault_addr);
+
+    update_stats(EVENT_NR_PAGE_FAULT, PAGE_SIZE);
+    log_event(EVENT_NR_PAGE_FAULT, -1, PAGE_SIZE, fault_offset, filename, (int)error_code, "", -1, -1);
 
     return 0;
 }
