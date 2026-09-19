@@ -219,6 +219,14 @@ fn round_up(x: usize, align: usize) -> usize {
     (x + align - 1) / align * align
 }
 
+/// A regular read/write can be retried only after making positive progress.
+///
+/// A zero completion has no remaining-range advance. Retrying it would
+/// resubmit the same request indefinitely.
+fn is_retryable_regular_short_io(cqe_result: i32, len: usize, is_uring_cmd: bool) -> bool {
+    cqe_result > 0 && (cqe_result as usize) < len && !is_uring_cmd
+}
+
 // Fetch errno for the last libc call on this thread.
 fn errno() -> i32 {
     // SAFETY: libc call.
@@ -1040,15 +1048,11 @@ struct IoSubmission {
     nvme_cmd_data: Option<NvmeCmdData>, // NVMe command data for io_uring_cmd
 }
 
-/// Find the fixed-buffer registration covering one I/O range.
-///
-/// Ordinary fixed buffers preserve their exact-pointer behavior. A dma-buf
-/// slot, however, represents its entire exported mapping, so a bounded
-/// transfer may begin at a slice inside the registered Python buffer. In that
-/// case the SQE must retain the slot and use the slice's byte offset within the
-/// dma-buf.
+type FixedBufferRange = (u16, usize, Option<usize>);
+type FixedBufferMap = HashMap<usize, FixedBufferRange>;
+
 fn fixed_buffer_for_range(
-    registrations: &HashMap<usize, (u16, usize, Option<usize>)>,
+    registrations: &FixedBufferMap,
     ptr_addr: usize,
     len: usize,
 ) -> (Option<u16>, Option<usize>) {
@@ -1062,6 +1066,7 @@ fn fixed_buffer_for_range(
     let Some(range_end) = ptr_addr.checked_add(len) else {
         return (None, None);
     };
+
     for (base, (index, size, dmabuf_offset)) in registrations {
         let Some(base_offset) = *dmabuf_offset else {
             continue;
@@ -1073,6 +1078,7 @@ fn fixed_buffer_for_range(
             return (Some(*index), Some(base_offset + (ptr_addr - *base)));
         }
     }
+
     (None, None)
 }
 
@@ -1081,13 +1087,13 @@ mod fixed_buffer_range_tests {
     use super::*;
 
     #[test]
-    fn dma_buf_slice_keeps_slot_and_adjusts_offset() {
+    fn dmabuf_slice_keeps_slot_and_adjusts_offset() {
         let mut registrations = HashMap::new();
         registrations.insert(0x1000, (3, 0x4000, Some(0x8000)));
 
         assert_eq!(
             fixed_buffer_for_range(&registrations, 0x3000, 0x1000),
-            (Some(3), Some(0xa000)),
+            (Some(3), Some(0xa000))
         );
     }
 
@@ -1097,19 +1103,19 @@ mod fixed_buffer_range_tests {
         registrations.insert(0x1000, (3, 0x4000, None));
 
         assert_eq!(
-            fixed_buffer_for_range(&registrations, 0x3000, 0x1000),
-            (None, None),
+            fixed_buffer_for_range(&registrations, 0x2000, 0x1000),
+            (None, None)
         );
     }
 
     #[test]
-    fn range_cannot_extend_beyond_the_registered_buffer() {
+    fn range_cannot_extend_beyond_registered_buffer() {
         let mut registrations = HashMap::new();
         registrations.insert(0x1000, (3, 0x4000, Some(0x8000)));
 
         assert_eq!(
             fixed_buffer_for_range(&registrations, 0x4000, 0x2000),
-            (None, None),
+            (None, None)
         );
     }
 }
@@ -1239,7 +1245,7 @@ struct RawBlockDevice {
     // buffer registered through register_fixed_dmabufs(), and is the byte
     // offset of this buffer inside the registered dma-buf, which the SQE
     // carries in place of a user address.
-    fixed_buffer_map: Arc<Mutex<HashMap<usize, (u16, usize, Option<usize>)>>>,
+    fixed_buffer_map: Arc<Mutex<FixedBufferMap>>,
     // Flag indicating if fixed buffers have been registered
     fixed_buffers_registered: Arc<AtomicBool>,
     // Count of currently in-flight I/O operations (global)
@@ -1733,10 +1739,11 @@ impl RawBlockDevice {
                                         let cqe_result = cqe.result();
 
                                         // Handle short I/O with resubmission (only for regular I/O, not io_uring_cmd)
-                                        if cqe_result >= 0
-                                            && (cqe_result as usize) < sub.len
-                                            && sub.nvme_cmd_data.is_none()
-                                        {
+                                        if is_retryable_regular_short_io(
+                                            cqe_result,
+                                            sub.len,
+                                            sub.nvme_cmd_data.is_some(),
+                                        ) {
                                             let bytes_transferred = cqe_result as usize;
                                             // Update offset and length for resubmission
                                             sub.offset += bytes_transferred as u64;
@@ -1814,10 +1821,11 @@ impl RawBlockDevice {
                                         let cqe_result = cqe.result();
 
                                         // Handle short I/O with resubmission (only for regular I/O, not io_uring_cmd)
-                                        if cqe_result >= 0
-                                            && (cqe_result as usize) < sub.len
-                                            && sub.nvme_cmd_data.is_none()
-                                        {
+                                        if is_retryable_regular_short_io(
+                                            cqe_result,
+                                            sub.len,
+                                            sub.nvme_cmd_data.is_some(),
+                                        ) {
                                             let bytes_transferred = cqe_result as usize;
                                             // Update offset and length for resubmission
                                             sub.offset += bytes_transferred as u64;
@@ -2433,12 +2441,16 @@ impl RawBlockDevice {
 
         // A sparse table of the right size, then one extended update per slot.
         let sparse = match ring {
-            IoUringWrapper::Standard(ring) => {
-                ring.lock().unwrap().submitter().register_buffers_sparse(fds_in_order.len() as u32)
-            }
-            IoUringWrapper::Big(ring) => {
-                ring.lock().unwrap().submitter().register_buffers_sparse(fds_in_order.len() as u32)
-            }
+            IoUringWrapper::Standard(ring) => ring
+                .lock()
+                .unwrap()
+                .submitter()
+                .register_buffers_sparse(fds_in_order.len() as u32),
+            IoUringWrapper::Big(ring) => ring
+                .lock()
+                .unwrap()
+                .submitter()
+                .register_buffers_sparse(fds_in_order.len() as u32),
         };
         if let Err(e) = sparse {
             return Err(PyRuntimeError::new_err(format!(
@@ -2472,7 +2484,11 @@ impl RawBlockDevice {
                 let slot = slot_of_fd[&dmabuf_fds[i]];
                 map.insert(
                     buffer_ptrs[i],
-                    (slot, buffer_sizes[i], Some(buffer_ptrs[i] - dmabuf_bases[i])),
+                    (
+                        slot,
+                        buffer_sizes[i],
+                        Some(buffer_ptrs[i] - dmabuf_bases[i]),
+                    ),
                 );
             }
         }
@@ -2576,7 +2592,7 @@ impl RawBlockDevice {
         let use_uring_cmd = self.use_uring_cmd;
         let fixed_buffers_registered = self.fixed_buffers_registered.load(Ordering::Relaxed);
         // Clone the fixed buffer map before releasing GIL to avoid lock contention
-        let fixed_buffer_map: HashMap<usize, (u16, usize, Option<usize>)> = if fixed_buffers_registered {
+        let fixed_buffer_map: FixedBufferMap = if fixed_buffers_registered {
             let map = self.fixed_buffer_map.lock().unwrap();
             map.clone()
         } else {
@@ -2889,8 +2905,7 @@ impl RawBlockDevice {
         let use_fixed = self.fixed_buffers_registered.load(Ordering::Relaxed);
         let (fixed_idx, fixed_dmabuf) = if use_fixed && ptr_aligned {
             let map = self.fixed_buffer_map.lock().unwrap();
-            let ptr_addr = ptr as usize;
-            fixed_buffer_for_range(&map, ptr_addr, total_len)
+            fixed_buffer_for_range(&map, ptr as usize, total_len)
         } else {
             (None, None)
         };
@@ -3035,8 +3050,7 @@ impl RawBlockDevice {
         let use_fixed = self.fixed_buffers_registered.load(Ordering::Relaxed);
         let (fixed_idx, fixed_dmabuf) = if use_fixed && ptr_aligned {
             let map = self.fixed_buffer_map.lock().unwrap();
-            let ptr_addr = ptr as usize;
-            fixed_buffer_for_range(&map, ptr_addr, total_len)
+            fixed_buffer_for_range(&map, ptr as usize, total_len)
         } else {
             (None, None)
         };
@@ -3222,7 +3236,7 @@ impl RawBlockDevice {
         let alignment = self.alignment;
         let fixed_buffers_registered = self.fixed_buffers_registered.load(Ordering::Relaxed);
         // Clone the fixed buffer map before releasing GIL to avoid lock contention
-        let fixed_buffer_map: HashMap<usize, (u16, usize, Option<usize>)> = if fixed_buffers_registered {
+        let fixed_buffer_map: FixedBufferMap = if fixed_buffers_registered {
             let map = self.fixed_buffer_map.lock().unwrap();
             map.clone()
         } else {
@@ -3277,12 +3291,11 @@ impl RawBlockDevice {
                     true
                 };
                 let use_bounce = !ptr_aligned || cap < total_len;
-                let fixed_range = fixed_buffer_for_range(
-                    &fixed_buffer_map,
-                    ptrs[i],
-                    total_len,
-                );
-                if use_bounce && fixed_range.1.is_some() {
+                if use_bounce
+                    && fixed_buffer_for_range(&fixed_buffer_map, ptrs[i], total_len)
+                        .1
+                        .is_some()
+                {
                     return Err(PyValueError::new_err(
                         "dma-buf registered buffer must be aligned and at least total_len bytes",
                     ));
@@ -3290,27 +3303,34 @@ impl RawBlockDevice {
 
                 let comp = Arc::new(IoCompletion::new());
 
-                let (ptr_addr, fixed_idx, fixed_dmabuf, bounce_opt, original_ptr_opt, payload_len_opt) =
-                    if use_bounce {
-                        let bounce = AlignedBuf::new(total_len, alignment)?;
-                        let bounce_arc = Arc::new(bounce);
-                        let bounce_ptr = bounce_arc.as_mut_ptr() as usize;
-                        // Copy-back bounded by caller capacity.
-                        let payload_len = std::cmp::min(cap, total_len);
-                        (
-                            bounce_ptr,
-                            None,
-                            None,
-                            Some(bounce_arc),
-                            Some(ptrs[i]),
-                            Some(payload_len),
-                        )
-                    } else {
-                        // Fixed buffers are pre-registered with io_uring,
-                        // enabling true zero-copy I/O.
-                        let (fixed_idx, fixed_dmabuf) = fixed_range;
-                        (ptrs[i], fixed_idx, fixed_dmabuf, None, None, None)
-                    };
+                let (
+                    ptr_addr,
+                    fixed_idx,
+                    fixed_dmabuf,
+                    bounce_opt,
+                    original_ptr_opt,
+                    payload_len_opt,
+                ) = if use_bounce {
+                    let bounce = AlignedBuf::new(total_len, alignment)?;
+                    let bounce_arc = Arc::new(bounce);
+                    let bounce_ptr = bounce_arc.as_mut_ptr() as usize;
+                    // Copy-back bounded by caller capacity.
+                    let payload_len = std::cmp::min(cap, total_len);
+                    (
+                        bounce_ptr,
+                        None,
+                        None,
+                        Some(bounce_arc),
+                        Some(ptrs[i]),
+                        Some(payload_len),
+                    )
+                } else {
+                    // Fixed buffers are pre-registered with io_uring,
+                    // enabling true zero-copy I/O.
+                    let (fixed_idx, fixed_dmabuf) =
+                        fixed_buffer_for_range(&fixed_buffer_map, ptrs[i], total_len);
+                    (ptrs[i], fixed_idx, fixed_dmabuf, None, None, None)
+                };
 
                 let sub = IoSubmission {
                     fd,

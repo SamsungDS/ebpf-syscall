@@ -400,12 +400,9 @@ class RawBlockCore:
                     f"got {self.device_path!r}"
                 )
 
-        # Maximum data transfer size for a single I/O request.  io_uring_cmd
-        # resolves zero as an opt-in device-limit probe; regular io_uring
-        # keeps zero as its historic unsplit behavior, but must honor an
-        # explicitly configured ceiling too.  dma-buf fixed buffers use the
-        # regular io_uring path, so leaving that ceiling at zero would make a
-        # target plan disagree with the requests actually submitted.
+        # io_uring_cmd resolves zero as an opt-in device-limit probe. Regular
+        # io_uring keeps zero as its historic unsplit behavior, but honors an
+        # explicitly configured transfer ceiling.
         if self.use_uring_cmd or config.max_data_transfer_size > 0:
             self.max_data_transfer_size = self._resolve_max_data_transfer_size(
                 config.max_data_transfer_size

@@ -1,12 +1,12 @@
 # vendored LMCache surface -- regenerate with sync-lmcache.sh, never hand-edit
 
-- synced_commit: f0e81197c6f5c9d77536dc9862fe8edfceaba4b3
-- synced_ref: f0e81197c6f5c9d77536dc9862fe8edfceaba4b3 (f0e81197, 2026-09-19)
+- synced_commit: 8033182519cf20ad7601cd5ade9ea1cbf76659ae
+- synced_ref: 8033182519cf20ad7601cd5ade9ea1cbf76659ae (80331825, 2026-09-19)
 - upstream: https://github.com/LMCache/LMCache (Apache-2.0; text vendored as LICENSE alongside this file)
 
 ## what is vendored
 
-- `rust/raw_block/` -- the Rust raw_block engine (pyo3); `make kvio` builds it. Last upstream change: f0e81197 2026-09-19 raw_block: bound dma-buf io_uring transfers
+- `rust/raw_block/` -- the Rust raw_block engine (pyo3); `make kvio` builds it. Last upstream change: a8a5fa43 2026-09-19 raw_block: accept pointer buffers for dma-buf slots
 - `csrc/lmcache_native/` -- the lmcache_native torch CppExtension (device_ops backend needs it); `make kvio` builds it via build_native.py. Last upstream change: f01d527b 2026-09-18 [MP][Ascend][KV format] Add NL_X_NP_X_NB_BS_ONE_HS for vLLM-Ascend MLA/DSA plane tuples (#5138)
 - 121 Python files -- the runtime import closure of the modules kvio
   uses (static walk + empirical import-probe refinement; the on-disk tree
