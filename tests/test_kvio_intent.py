@@ -150,6 +150,7 @@ class KvioIntentTest(unittest.TestCase):
                 "--target-plan", str(plan_path), "--target-manifest",
                 str(manifest_path), "--phase-gate-dir", str(Path(directory)),
                 "--phase-gate-timeout-seconds", "15", "--phase-gate-close",
+                "--phase-rapl-out", str(Path(directory) / "phase-rapl.json"),
             ]
             with patch.dict(os.environ, {"PYTHONPATH": "/tmp/shadow"}):
                 with patch.object(intent_module.subprocess, "run") as run:
@@ -167,6 +168,8 @@ class KvioIntentTest(unittest.TestCase):
             self.assertIn("--phase-gate-timeout-seconds", command)
             self.assertIn("15.0", command)
             self.assertIn("--phase-gate-close", command)
+            self.assertIn("--phase-rapl-out", command)
+            self.assertIn(str(Path(directory) / "phase-rapl.json"), command)
 
 
 if __name__ == "__main__":

@@ -76,6 +76,27 @@ from intent import (
 )
 
 
+def read_rapl_energy() -> dict[str, object]:
+    """Return Linux RAPL counters with a timestamp per counter read."""
+    domains = []
+    directories = Path("/sys/class/powercap").glob("intel-rapl:[0-9]*")
+    for directory in sorted(directories):
+        energy = directory / "energy_uj"
+        if not energy.is_file():
+            continue
+        domains.append({
+            "id": directory.name,
+            "name": (directory / "name").read_text().strip(),
+            "energy_uj": int(energy.read_text()),
+            "max_energy_range_uj": int(
+                (directory / "max_energy_range_uj").read_text()),
+            "sample_ns": time.time_ns(),
+        })
+    if not domains:
+        raise RuntimeError("no readable Linux RAPL energy counters")
+    return {"schema": "kvio.rapl.v1", "domains": domains}
+
+
 class SemanticTrace:
     """Tool-side semantic JSONL emitter for the offset-join.
 
@@ -404,6 +425,10 @@ def main():
         "--phase-gate-close", action="store_true",
         help="after timing, create DONE and wait for CLOSE before teardown",
     )
+    ap.add_argument(
+        "--phase-rapl-out",
+        help="write Linux RAPL readings immediately before and after timed phases",
+    )
     ap.add_argument("--odirect", action="store_true")
     ap.add_argument("--capacity-gb", type=int, default=8)
     ap.add_argument("--record", help="write a kvio_record.json replay manifest here")
@@ -446,6 +471,10 @@ def main():
                 ap.error(f"phase gate marker already exists: {phase_gate / marker}")
     elif args.phase_gate_close:
         ap.error("--phase-gate-close requires --phase-gate-dir")
+    if args.phase_rapl_out and not args.phase_gate_close:
+        ap.error("--phase-rapl-out requires --phase-gate-close")
+    if args.phase_rapl_out and Path(args.phase_rapl_out).exists():
+        ap.error(f"refusing to overwrite phase RAPL artifact: {args.phase_rapl_out}")
 
     if args.intent_only and not args.intent_out:
         ap.error("--intent-only requires --intent-out")
@@ -807,6 +836,7 @@ def main():
     store_ms, load_ms = [], []
     fails = {"store": 0, "load": 0}
     phase_wall = {"store": 0.0, "load": 0.0}
+    phase_rapl_before = None
     for it in range(args.warmup + args.iters):
         if phase_gate is not None and it == args.warmup:
             ready = phase_gate / "READY"
@@ -819,6 +849,8 @@ def main():
                     sys.exit(f"phase gate timed out waiting for {go}")
                 time.sleep(0.005)
             print("  @@@ PHASE_GATE go", flush=True)
+            if args.phase_rapl_out:
+                phase_rapl_before = read_rapl_energy()
         phase_results = {}
         for name, fn in (("store", do_store), ("load", do_load)):
             phase_results[name] = run_phase(name, it, fn)
@@ -834,6 +866,12 @@ def main():
     if args.phase_gate_close:
         done = phase_gate / "DONE"
         close = phase_gate / "CLOSE"
+        if args.phase_rapl_out:
+            Path(args.phase_rapl_out).write_text(json.dumps({
+                "schema": "kvio.phase-rapl.v1",
+                "before": phase_rapl_before,
+                "after": read_rapl_energy(),
+            }, indent=2, sort_keys=True) + "\n")
         done.touch(exist_ok=False)
         print(f"  @@@ PHASE_GATE done={done}; waiting for {close}", flush=True)
         deadline = time.monotonic() + args.phase_gate_timeout_seconds

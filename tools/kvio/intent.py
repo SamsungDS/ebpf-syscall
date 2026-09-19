@@ -358,6 +358,7 @@ def main(argv=None):
     )
     replay.add_argument("--phase-gate-timeout-seconds", type=float)
     replay.add_argument("--phase-gate-close", action="store_true")
+    replay.add_argument("--phase-rapl-out")
     replay.add_argument("--allow-io-errors", action="store_true")
     replay.add_argument(
         "--advertised-mdts-bytes",
@@ -419,6 +420,7 @@ def main(argv=None):
             ("--phase-gate-dir", args.phase_gate_dir),
             ("--phase-gate-timeout-seconds",
              args.phase_gate_timeout_seconds),
+            ("--phase-rapl-out", args.phase_rapl_out),
         )
         for option, value in option_values:
             if value is not None:
