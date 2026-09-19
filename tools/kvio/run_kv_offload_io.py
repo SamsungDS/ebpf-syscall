@@ -140,6 +140,59 @@ def alloc_kv_buffer(size_bytes: int, *, hugepage: bool = False) -> torch.Tensor:
     return raw
 
 
+class DmabufPool:
+    """One dma-buf backed staging region, sliced into per-stream buffers.
+
+    The raw_block engine registers its staging buffers with io_uring once,
+    through an allocator that reports both the buffers themselves and the
+    dma-buf that exports the memory they live in. LMCache's own allocator does
+    that; kvio allocates its own buffers, so this is the same report in the
+    smallest form the engine accepts. With the registration in place each
+    fixed read or write is one command up to the device's dma-buf ceiling,
+    instead of being DMA-mapped per command and clamped at 128 KiB behind a
+    translating IOMMU.
+    """
+
+    def __init__(self, kind: str, nbuffers: int, buf_bytes: int,
+                 *, hugepage: bool = False):
+        # First Party
+        from lmcache.v1.memory_management import (
+            _DMABUF_REGIONS,
+            _allocate_dmabuf_cpu_memory,
+        )
+
+        # Slices must start on a page boundary: the engine hands the kernel a
+        # byte offset into the dma-buf, and an unaligned O_DIRECT address is
+        # rejected long before the dma-buf matters.
+        self.stride = (buf_bytes + HUGEPAGE_BYTES - 1) // HUGEPAGE_BYTES * HUGEPAGE_BYTES
+        self.pool = _allocate_dmabuf_cpu_memory(
+            self.stride * nbuffers, kind, hugepage
+        )
+        base = self.pool.data_ptr()
+        region = _DMABUF_REGIONS.get(base)
+        if region is None:
+            raise RuntimeError(
+                f"dma-buf allocation of kind {kind!r} reported no region; "
+                "the engine cannot register it map-once"
+            )
+        self.fd = region[0]
+        self.base = base
+        self.kind = kind
+        self.buffers = [
+            self.pool[i * self.stride:i * self.stride + buf_bytes]
+            for i in range(nbuffers)
+        ]
+        for buf in self.buffers:
+            buf.fill_(0)
+
+    def get_paged_buffers(self):
+        return self.buffers
+
+    def get_paged_dmabuf_regions(self):
+        # Every slice lives in the one dma-buf, mapped at self.base.
+        return [(self.fd, self.base) for _ in self.buffers]
+
+
 def make_kv_obj(raw: torch.Tensor) -> TensorMemoryObj:
     meta = MemoryObjMetadata(
         shape=torch.Size([raw.numel()]), dtype=torch.uint8, address=0,
@@ -250,6 +303,16 @@ def main():
     ap.add_argument("--hugepage", action="store_true",
                     help="back the KV buffers with 2 MiB THP so one passthrough "
                          "command can exceed max_segments*4 KiB")
+    ap.add_argument("--dmabuf", metavar="KIND", default=None,
+                    help="stage through one dma-buf and register it with "
+                         "io_uring map-once, so a fixed read or write is one "
+                         "command up to the device's dma-buf ceiling instead "
+                         "of being DMA-mapped per command. KIND is udmabuf (a "
+                         "memfd, 2 MiB hugetlb folios with --hugepage), "
+                         "system_heap, cma_heap, or a /dev/dma_heap name. "
+                         "Needs a kernel with io_uring dma-buf registered "
+                         "buffers; refused with --use-uring-cmd, which cannot "
+                         "import one")
     ap.add_argument("--allow-io-errors", action="store_true",
                     help="exit 0 even when some store/load operations failed "
                          "(failed operations are never counted in the numbers)")
@@ -389,10 +452,28 @@ def main():
     # device; the per-object Python bookkeeping stays serialised, as it is in
     # LMCache itself.
     nstreams = max(1, args.concurrency)
-    bufs = [(make_kv_obj(alloc_kv_buffer(obj_bytes, hugepage=args.hugepage)),
-             make_kv_obj(alloc_kv_buffer(obj_bytes, hugepage=args.hugepage)))
-            for _ in range(nstreams)]
-    if args.hugepage:
+    dmabuf_pool = None
+    if args.dmabuf and args.engine != "io_uring":
+        sys.exit(f"--dmabuf needs --engine io_uring; {args.engine} either has "
+                 "no fixed buffers or, for uring_cmd, cannot import a dma-buf")
+    if args.dmabuf:
+        # Both buffers of every stream come out of one dma-buf, which is what
+        # the engine registers; a second region would cost a second sparse
+        # registered-buffer slot for no gain.
+        dmabuf_pool = DmabufPool(args.dmabuf, 2 * nstreams, obj_bytes,
+                                 hugepage=args.hugepage)
+        bufs = [(make_kv_obj(dmabuf_pool.buffers[2 * i]),
+                 make_kv_obj(dmabuf_pool.buffers[2 * i + 1]))
+                for i in range(nstreams)]
+        core.register_fixed_buffers_from_allocator(dmabuf_pool)
+        print(f"  buffers: {2 * nstreams} x {obj_bytes} B in one "
+              f"{dmabuf_pool.kind} dma-buf (fd {dmabuf_pool.fd}), registered "
+              f"map-once with io_uring")
+    else:
+        bufs = [(make_kv_obj(alloc_kv_buffer(obj_bytes, hugepage=args.hugepage)),
+                 make_kv_obj(alloc_kv_buffer(obj_bytes, hugepage=args.hugepage)))
+                for _ in range(nstreams)]
+    if args.hugepage and not args.dmabuf:
         print(f"  buffers: {2 * nstreams} x {obj_bytes} B on THP; AnonHugePages now "
               f"{anon_hugepages_kb() // 1024} MiB")
 
@@ -524,6 +605,7 @@ def main():
                 "header_bytes": args.header_bytes, "slot_bytes": slot,
                 "capacity_bytes": args.capacity_gb * 1024 * 1024 * 1024,
                 "hugepage_buffers": args.hugepage,
+                "dmabuf": args.dmabuf,
             },
             "tp": args.tp, "ranks_per_chunk": ranks, "shard": shard_note,
             "chunk_block_bytes": block_bytes,
