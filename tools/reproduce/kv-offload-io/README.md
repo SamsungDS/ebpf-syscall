@@ -148,6 +148,36 @@ from the premap pool). Read it as:
   one-at-a-time engine at either command size, and 1.2–2.2 for the batched one,
   whose `wait_iouring` polls every 10 µs.
 
+## The dma-buf arm: map the staging buffer once
+
+The sweep above drives NVMe passthrough, where the kernel maps every command
+for DMA at submission time. Behind a translating IOMMU that mapping, not the
+drive, is what bounds a command, and on ordinary pages the segment count bounds
+it further. `--hugepage` raises the segment bound; it does not remove the
+per-command mapping.
+
+`--dmabuf KIND` removes it. The staging buffer is allocated as memory that is
+also a dma-buf, registered with io_uring once, and each fixed read or write is
+then issued from that mapping, so one command can be as large as the ceiling
+the drive publishes in `max_hw_dmabuf_sectors_kb`. KIND is `udmabuf` (a memfd,
+2 MiB hugetlb folios when `--hugepage` is also given), `system_heap`,
+`cma_heap`, or any name under `/dev/dma_heap`.
+
+This needs `--engine io_uring` on the block device, because NVMe passthrough
+cannot import a dma-buf registration, so it is a separate script:
+
+```sh
+DEV=/dev/nvme1n1 bash tools/reproduce/kv-offload-io/sweep_dmabuf.sh
+```
+
+It runs each point with no dma-buf and with each exporter, so the comparison is
+against the classic path on the same drive in the same session. It needs a
+kernel carrying io_uring dma-buf registered buffers and the dma-buf size
+ceiling; without them the engine reports the registration refused and falls
+back, which shows up as the classic arm's numbers under a dma-buf label.
+
+No reference run is shipped for this arm yet.
+
 ## Replay
 
 A device capture (`kvio record`, i.e. `nvme_tp_monitor`) of any of these runs
