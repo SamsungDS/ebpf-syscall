@@ -1,4 +1,5 @@
 CC = gcc
+PYTHON ?= python3
 ARCH = $(shell uname -m | sed 's/x86_64/x86/' | sed 's/aarch64/arm64/')
 
 prefix      ?= /usr/local
@@ -185,7 +186,7 @@ kvio: kvio-ir
 	CARGO_TARGET_DIR=$(KVIO_CRATE)/target cargo build --release --manifest-path $(KVIO_CRATE)/Cargo.toml
 	@mkdir -p $(KVIO_DIR)/build
 	cp $(KVIO_CRATE)/target/release/liblmcache_rust_raw_block_io.so $(KVIO_SO)
-	python3 $(KVIO_DIR)/build_native.py
+	$(PYTHON) $(KVIO_DIR)/build_native.py
 	@ln -sf $(KVIO_DIR)/kvio kvio
 	@echo "kvio built: ./kvio -- try './kvio doctor' then './kvio --help'"
 
@@ -227,8 +228,8 @@ kvio-ir-kani:
 	cargo kani --output-format=terse --manifest-path $(KVIO_IR_CRATE)/Cargo.toml
 
 kvio-test: kvio-ir kvio-ir-test
-	@python3 -m py_compile tools/kvio/*.py
-	@python3 -m unittest discover -s tests -p 'test_kvio*.py' -v
+	@$(PYTHON) -m py_compile tools/kvio/*.py
+	@$(PYTHON) -m unittest discover -s tests -p 'test_kvio*.py' -v
 
 # kvio resolves its helpers relative to its launcher. Keep that source-like
 # layout under libexec and expose only the launcher through bindir.
