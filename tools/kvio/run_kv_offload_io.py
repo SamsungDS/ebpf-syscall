@@ -390,6 +390,16 @@ def main():
     ap.add_argument("--header-bytes", type=int, default=4096)
     ap.add_argument("--iters", type=int, default=1, help="passes over the chunk set")
     ap.add_argument("--warmup", type=int, default=0)
+    ap.add_argument(
+        "--phase-gate-dir",
+        help="after warmup, create READY in this existing directory and wait "
+        "for GO before the first timed store; lets an external counter attach "
+        "without charging setup or warmup to the measured phase",
+    )
+    ap.add_argument(
+        "--phase-gate-timeout-seconds", type=float, default=60.0,
+        help="maximum wait for GO with --phase-gate-dir (default: 60)",
+    )
     ap.add_argument("--odirect", action="store_true")
     ap.add_argument("--capacity-gb", type=int, default=8)
     ap.add_argument("--record", help="write a kvio_record.json replay manifest here")
@@ -420,6 +430,16 @@ def main():
         help="recorded controller MDTS in bytes; 0 means no controller limit",
     )
     args = ap.parse_args()
+
+    phase_gate = Path(args.phase_gate_dir) if args.phase_gate_dir else None
+    if phase_gate is not None:
+        if not phase_gate.is_dir():
+            ap.error("--phase-gate-dir must name an existing directory")
+        if args.phase_gate_timeout_seconds <= 0:
+            ap.error("--phase-gate-timeout-seconds must be positive")
+        for marker in ("READY", "GO"):
+            if (phase_gate / marker).exists():
+                ap.error(f"phase gate marker already exists: {phase_gate / marker}")
 
     if args.intent_only and not args.intent_out:
         ap.error("--intent-only requires --intent-out")
@@ -782,6 +802,17 @@ def main():
     fails = {"store": 0, "load": 0}
     phase_wall = {"store": 0.0, "load": 0.0}
     for it in range(args.warmup + args.iters):
+        if phase_gate is not None and it == args.warmup:
+            ready = phase_gate / "READY"
+            go = phase_gate / "GO"
+            ready.touch(exist_ok=False)
+            print(f"  @@@ PHASE_GATE ready={ready}; waiting for {go}", flush=True)
+            deadline = time.monotonic() + args.phase_gate_timeout_seconds
+            while not go.exists():
+                if time.monotonic() >= deadline:
+                    sys.exit(f"phase gate timed out waiting for {go}")
+                time.sleep(0.005)
+            print("  @@@ PHASE_GATE go", flush=True)
         phase_results = {}
         for name, fn in (("store", do_store), ("load", do_load)):
             phase_results[name] = run_phase(name, it, fn)

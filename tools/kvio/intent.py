@@ -352,6 +352,11 @@ def main(argv=None):
     replay.add_argument("--capacity-gb", type=int, default=8)
     replay.add_argument("--ring-depth", type=int, default=0)
     replay.add_argument("--load-parallelism", type=int, default=0)
+    replay.add_argument(
+        "--phase-gate-dir",
+        help="after warmup, create READY here and wait for GO before timing",
+    )
+    replay.add_argument("--phase-gate-timeout-seconds", type=float)
     replay.add_argument("--allow-io-errors", action="store_true")
     replay.add_argument(
         "--advertised-mdts-bytes",
@@ -410,6 +415,9 @@ def main(argv=None):
             ("--dmabuf", args.dmabuf),
             ("--record", args.record),
             ("--trace", args.trace),
+            ("--phase-gate-dir", args.phase_gate_dir),
+            ("--phase-gate-timeout-seconds",
+             args.phase_gate_timeout_seconds),
         )
         for option, value in option_values:
             if value is not None:

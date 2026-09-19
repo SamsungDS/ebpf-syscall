@@ -148,7 +148,8 @@ class KvioIntentTest(unittest.TestCase):
                 "--engine", "io_uring", "--mdts-bytes", "8", "--dmabuf",
                 "udmabuf", "--dma-ceiling-bytes", "8", "--odirect",
                 "--target-plan", str(plan_path), "--target-manifest",
-                str(manifest_path),
+                str(manifest_path), "--phase-gate-dir", str(Path(directory)),
+                "--phase-gate-timeout-seconds", "15",
             ]
             with patch.dict(os.environ, {"PYTHONPATH": "/tmp/shadow"}):
                 with patch.object(intent_module.subprocess, "run") as run:
@@ -160,6 +161,11 @@ class KvioIntentTest(unittest.TestCase):
             self.assertEqual(prefix[1], str(ROOT / "tools/kvio/build"))
             self.assertEqual(prefix[2], str(ROOT / "tools/kvio"))
             self.assertEqual(prefix[3], "/tmp/shadow")
+            command = run.call_args.args[0]
+            self.assertIn("--phase-gate-dir", command)
+            self.assertIn(str(Path(directory)), command)
+            self.assertIn("--phase-gate-timeout-seconds", command)
+            self.assertIn("15.0", command)
 
 
 if __name__ == "__main__":
