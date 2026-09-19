@@ -312,6 +312,18 @@ def _write(value, path):
         Path(path).write_text(output, encoding="utf-8")
 
 
+def _engine_env():
+    """Return an environment that resolves kvio's vendored engine first."""
+    env = dict(os.environ)
+    if env.get("KVIO_USE_SYSTEM_LMCACHE") == "1":
+        return env
+    here = Path(__file__).resolve().parent
+    prepend = [str(here / "vendor" / "lmcache"), str(here / "build"), str(here)]
+    old = env.get("PYTHONPATH")
+    env["PYTHONPATH"] = os.pathsep.join(prepend + ([old] if old else []))
+    return env
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
@@ -369,6 +381,8 @@ def main(argv=None):
             _nonnegative(args.advertised_mdts_bytes, "advertised_mdts_bytes")
         if args.dmabuf and args.engine != "io_uring":
             raise IntentError("dma-buf replay requires --engine io_uring")
+        if args.dmabuf and not args.odirect:
+            raise IntentError("dma-buf replay requires --odirect")
         if args.dmabuf and args.dma_ceiling_bytes is None:
             raise IntentError("dma-buf replay requires --dma-ceiling-bytes")
         for path in (args.target_plan, args.target_manifest):
@@ -405,7 +419,7 @@ def main(argv=None):
                                 ("--allow-io-errors", args.allow_io_errors)):
             if enabled:
                 command.append(option)
-        return subprocess.run(command, env=os.environ, check=False).returncode
+        return subprocess.run(command, env=_engine_env(), check=False).returncode
     except IntentError as error:
         parser.error(str(error))
 

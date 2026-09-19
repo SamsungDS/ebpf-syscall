@@ -7,7 +7,9 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
+from tools.kvio import intent as intent_module
 from tools.kvio.intent import (
     IntentError,
     build_kv_offload_intent,
@@ -117,6 +119,47 @@ class KvioIntentTest(unittest.TestCase):
             validate_intent(json.loads(files[0].read_text(encoding="utf-8")))
             self.assertIn("@@@ INTENT model=meta-llama/Llama-3.1-8B-Instruct",
                           output.read_text(encoding="utf-8"))
+
+    def test_dmabuf_replay_requires_odirect(self):
+        with tempfile.TemporaryDirectory() as directory:
+            intent_path = Path(directory) / "workload.intent.json"
+            intent_path.write_text(json.dumps(sample()), encoding="utf-8")
+            command = [
+                sys.executable, str(ROOT / "tools/kvio/intent.py"), "replay",
+                str(intent_path), "--device", "/dev/example", "--engine",
+                "io_uring", "--mdts-bytes", "8", "--dmabuf", "udmabuf",
+                "--dma-ceiling-bytes", "8", "--target-plan",
+                str(Path(directory) / "target-plan.json"), "--target-manifest",
+                str(Path(directory) / "target-manifest.json"),
+            ]
+            result = subprocess.run(command, cwd=ROOT, capture_output=True,
+                                    text=True, check=False)
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("dma-buf replay requires --odirect", result.stderr)
+
+    def test_replay_uses_the_vendored_engine_environment(self):
+        with tempfile.TemporaryDirectory() as directory:
+            intent_path = Path(directory) / "workload.intent.json"
+            plan_path = Path(directory) / "target-plan.json"
+            manifest_path = Path(directory) / "target-manifest.json"
+            intent_path.write_text(json.dumps(sample()), encoding="utf-8")
+            argv = [
+                "replay", str(intent_path), "--device", "/dev/example",
+                "--engine", "io_uring", "--mdts-bytes", "8", "--dmabuf",
+                "udmabuf", "--dma-ceiling-bytes", "8", "--odirect",
+                "--target-plan", str(plan_path), "--target-manifest",
+                str(manifest_path),
+            ]
+            with patch.dict(os.environ, {"PYTHONPATH": "/tmp/shadow"}):
+                with patch.object(intent_module.subprocess, "run") as run:
+                    run.return_value.returncode = 0
+                    self.assertEqual(intent_module.main(argv), 0)
+            env = run.call_args.kwargs["env"]
+            prefix = env["PYTHONPATH"].split(os.pathsep)
+            self.assertEqual(prefix[0], str(ROOT / "tools/kvio/vendor/lmcache"))
+            self.assertEqual(prefix[1], str(ROOT / "tools/kvio/build"))
+            self.assertEqual(prefix[2], str(ROOT / "tools/kvio"))
+            self.assertEqual(prefix[3], "/tmp/shadow")
 
 
 if __name__ == "__main__":

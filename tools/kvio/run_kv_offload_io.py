@@ -50,6 +50,21 @@ for _v in ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS",
            "NUMEXPR_NUM_THREADS", "VECLIB_MAXIMUM_THREADS"):
     os.environ.setdefault(_v, _threads)
 
+# ``intent replay`` starts this script with the selected interpreter.  Put the
+# pinned engine ahead of the script directory as well as PYTHONPATH, because a
+# stale ``tools/kvio/lmcache`` directory would otherwise shadow the vendor.
+if os.environ.get("KVIO_USE_SYSTEM_LMCACHE") != "1":
+    _kvio_dir = Path(__file__).resolve().parent
+    for _path in reversed((
+        _kvio_dir / "vendor" / "lmcache",
+        _kvio_dir / "build",
+        _kvio_dir,
+    )):
+        _path_text = str(_path)
+        while _path_text in sys.path:
+            sys.path.remove(_path_text)
+        sys.path.insert(0, _path_text)
+
 from kv_geometry import kv_cache_bytes, shard_kv_bytes, load_hf_config
 from intent import (
     IntentError,
@@ -658,6 +673,8 @@ def main():
     if args.dmabuf and args.engine != "io_uring":
         sys.exit(f"--dmabuf needs --engine io_uring; {args.engine} either has "
                  "no fixed buffers or, for uring_cmd, cannot import a dma-buf")
+    if args.dmabuf and not args.odirect:
+        sys.exit("--dmabuf needs --odirect for io_uring dma-buf registration")
     if args.dmabuf:
         # Both buffers of every stream come out of one dma-buf, which is what
         # the engine registers; a second region would cost a second sparse

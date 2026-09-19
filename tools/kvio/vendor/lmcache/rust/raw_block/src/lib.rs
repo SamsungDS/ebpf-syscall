@@ -1040,6 +1040,80 @@ struct IoSubmission {
     nvme_cmd_data: Option<NvmeCmdData>, // NVMe command data for io_uring_cmd
 }
 
+/// Find the fixed-buffer registration covering one I/O range.
+///
+/// Ordinary fixed buffers preserve their exact-pointer behavior. A dma-buf
+/// slot, however, represents its entire exported mapping, so a bounded
+/// transfer may begin at a slice inside the registered Python buffer. In that
+/// case the SQE must retain the slot and use the slice's byte offset within the
+/// dma-buf.
+fn fixed_buffer_for_range(
+    registrations: &HashMap<usize, (u16, usize, Option<usize>)>,
+    ptr_addr: usize,
+    len: usize,
+) -> (Option<u16>, Option<usize>) {
+    if let Some((index, size, dmabuf_offset)) = registrations.get(&ptr_addr) {
+        if len <= *size {
+            return (Some(*index), *dmabuf_offset);
+        }
+        return (None, None);
+    }
+
+    let Some(range_end) = ptr_addr.checked_add(len) else {
+        return (None, None);
+    };
+    for (base, (index, size, dmabuf_offset)) in registrations {
+        let Some(base_offset) = *dmabuf_offset else {
+            continue;
+        };
+        let Some(buffer_end) = base.checked_add(*size) else {
+            continue;
+        };
+        if ptr_addr >= *base && range_end <= buffer_end {
+            return (Some(*index), Some(base_offset + (ptr_addr - *base)));
+        }
+    }
+    (None, None)
+}
+
+#[cfg(test)]
+mod fixed_buffer_range_tests {
+    use super::*;
+
+    #[test]
+    fn dma_buf_slice_keeps_slot_and_adjusts_offset() {
+        let mut registrations = HashMap::new();
+        registrations.insert(0x1000, (3, 0x4000, Some(0x8000)));
+
+        assert_eq!(
+            fixed_buffer_for_range(&registrations, 0x3000, 0x1000),
+            (Some(3), Some(0xa000)),
+        );
+    }
+
+    #[test]
+    fn ordinary_fixed_buffer_does_not_match_an_interior_slice() {
+        let mut registrations = HashMap::new();
+        registrations.insert(0x1000, (3, 0x4000, None));
+
+        assert_eq!(
+            fixed_buffer_for_range(&registrations, 0x3000, 0x1000),
+            (None, None),
+        );
+    }
+
+    #[test]
+    fn range_cannot_extend_beyond_the_registered_buffer() {
+        let mut registrations = HashMap::new();
+        registrations.insert(0x1000, (3, 0x4000, Some(0x8000)));
+
+        assert_eq!(
+            fixed_buffer_for_range(&registrations, 0x4000, 0x2000),
+            (None, None),
+        );
+    }
+}
+
 impl Default for IoSubmission {
     fn default() -> Self {
         IoSubmission {
@@ -2542,10 +2616,8 @@ impl RawBlockDevice {
                 let comp = Arc::new(IoCompletion::new());
 
                 // Fixed buffers are pre-registered with io_uring, enabling true zero-copy I/O
-                let (fixed_idx, fixed_dmabuf) = match fixed_buffer_map.get(&ptrs[i]) {
-                    Some((idx, _, d)) => (Some(*idx), *d),
-                    None => (None, None),
-                };
+                let (fixed_idx, fixed_dmabuf) =
+                    fixed_buffer_for_range(&fixed_buffer_map, ptrs[i], total_len);
 
                 if use_odirect {
                     #[allow(clippy::manual_is_multiple_of)]
@@ -2818,10 +2890,7 @@ impl RawBlockDevice {
         let (fixed_idx, fixed_dmabuf) = if use_fixed && ptr_aligned {
             let map = self.fixed_buffer_map.lock().unwrap();
             let ptr_addr = ptr as usize;
-            match map.get(&ptr_addr) {
-                Some((idx, _, d)) => (Some(*idx), *d),
-                None => (None, None),
-            }
+            fixed_buffer_for_range(&map, ptr_addr, total_len)
         } else {
             (None, None)
         };
@@ -2967,10 +3036,7 @@ impl RawBlockDevice {
         let (fixed_idx, fixed_dmabuf) = if use_fixed && ptr_aligned {
             let map = self.fixed_buffer_map.lock().unwrap();
             let ptr_addr = ptr as usize;
-            match map.get(&ptr_addr) {
-                Some((idx, _, d)) => (Some(*idx), *d),
-                None => (None, None),
-            }
+            fixed_buffer_for_range(&map, ptr_addr, total_len)
         } else {
             (None, None)
         };
@@ -3211,7 +3277,12 @@ impl RawBlockDevice {
                     true
                 };
                 let use_bounce = !ptr_aligned || cap < total_len;
-                if use_bounce && fixed_buffer_map.get(&ptrs[i]).is_some_and(|(_, _, d)| d.is_some()) {
+                let fixed_range = fixed_buffer_for_range(
+                    &fixed_buffer_map,
+                    ptrs[i],
+                    total_len,
+                );
+                if use_bounce && fixed_range.1.is_some() {
                     return Err(PyValueError::new_err(
                         "dma-buf registered buffer must be aligned and at least total_len bytes",
                     ));
@@ -3237,11 +3308,7 @@ impl RawBlockDevice {
                     } else {
                         // Fixed buffers are pre-registered with io_uring,
                         // enabling true zero-copy I/O.
-                        let (fixed_idx, fixed_dmabuf) =
-                            match fixed_buffer_map.get(&ptrs[i]) {
-                                Some((idx, _, d)) => (Some(*idx), *d),
-                                None => (None, None),
-                            };
+                        let (fixed_idx, fixed_dmabuf) = fixed_range;
                         (ptrs[i], fixed_idx, fixed_dmabuf, None, None, None)
                     };
 

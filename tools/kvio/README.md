@@ -166,6 +166,11 @@ MDTS exponent has been converted to bytes. They may differ: a normal-page
 mapping can impose a smaller effective cap. An advertised MDTS of `0` means the
 controller specifies no transfer limit; it never means zero-byte I/O.
 
+For the dma-buf realization, use `--engine io_uring --odirect --dmabuf KIND`
+and set `--dma-ceiling-bytes`. The kernel imports dma-buf fixed buffers only
+for an `O_DIRECT` target file. The replay refuses the combination without
+`--odirect` instead of falling back to an ordinary registered buffer path.
+
 ## Capture below the io_uring batching boundary
 
 Do not use the number of `io_uring_enter()` calls as the number of storage
