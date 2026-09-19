@@ -50,6 +50,8 @@ COMMANDS = {
                      "compile real agent requests into an evidence-labeled KV plan", False),
     "catalog":      ("tools/kvio/workload_catalog.py",
                      "list and validate pinned workload evidence", False),
+    "intent":       ("tools/kvio/intent.py",
+                     "validate or lower a device-independent KV-offload intent", False),
     # engine-driving (vendored RawBlockCore + built Rust module)
     "workload":     ("tools/kvio/workload.py",
                      "drive the real raw_block engine with a serving-shaped request mix", True),

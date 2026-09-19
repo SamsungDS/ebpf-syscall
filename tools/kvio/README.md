@@ -6,6 +6,8 @@ storage tier sustain it?":
 
 - **project** the NVMe command stream a *GPU model × KV-cache config* would
   issue — GPU-free, no model, no serving stack (`kvio plan`);
+- **preserve and lower** a device-independent logical KV-offload contract for
+  a supplied target ceiling (`kvio intent`);
 - **drive** a real device with that IO using **LMCache's actual raw_block
   engine** — the real thing, vendored and built in this tree, not a mimic
   (`kvio workload`, `kvio sweep`);
@@ -112,6 +114,7 @@ it does not recreate a capture.
 | Command | Input | Result | Device access |
 |---|---|---|---|
 | `kvio plan` | Model and cache geometry | Predict command sizes and counts; no application timing or reuse | No |
+| `kvio intent` | `kvio.intent.v1` | Validate logical intent or model its target-specific command splits | No |
 | `kvio trace` | An application-level agent trace | Compile observed requests into a cache load/store plan | No |
 | `kvio catalog` | Pinned workload metadata | List or validate source, capture, privacy, and hardware evidence | No |
 | `kvio workload` | Model settings or an agent plan | Issue cache loads and stores through LMCache's real storage engine | Yes; may write |

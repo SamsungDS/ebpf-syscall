@@ -147,7 +147,8 @@ KVIO_IR_BIN   = $(KVIO_DIR)/build/kvio-ir
 KVIO_NATIVE_SO = $(firstword $(wildcard \
 	$(KVIO_DIR)/vendor/lmcache/lmcache/lmcache_native*.so))
 KVIO_TRACER = $(NVMETP_TARGET)
-KVIO_OFFLINE_PY = $(KVIO_DIR)/__init__.py $(KVIO_DIR)/release.py
+KVIO_OFFLINE_PY = $(KVIO_DIR)/__init__.py $(KVIO_DIR)/intent.py \
+	$(KVIO_DIR)/release.py
 KVIO_OFFLINE_REPLAY_PY = examples/replay/capture_format.py \
 	examples/replay/mk_dev_iolog.py examples/replay/compare_streams.py
 KVIO_OFFLINE_DOCS = $(KVIO_DIR)/NOTICE $(KVIO_DIR)/README.md \

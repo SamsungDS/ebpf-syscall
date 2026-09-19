@@ -49,19 +49,7 @@ for _v in ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS",
     os.environ.setdefault(_v, _threads)
 
 from kv_geometry import kv_cache_bytes, shard_kv_bytes, load_hf_config
-
-# LMCache public API (no dependency on the test suite).
-import lmcache
-from lmcache.v1.distributed.api import ObjectKey
-from lmcache.v1.memory_management import (
-    MemoryFormat,
-    MemoryObjMetadata,
-    TensorMemoryObj,
-)
-from lmcache.v1.storage_backend.raw_block import RawBlockCore, RawBlockCoreConfig
-from lmcache.v1.storage_backend.raw_block.key_codec import encode_object_key
-
-import torch
+from intent import build_kv_offload_intent
 
 
 class SemanticTrace:
@@ -278,7 +266,7 @@ def main():
                     help="tensor-parallel degree: one LMCache worker per rank, so "
                          "each chunk becomes tp offloaded objects (same chunk, "
                          "distinct kv_rank), sized by the family's KV-head sharding")
-    ap.add_argument("--device", required=True, help="/dev/ngXnY (uring_cmd) or a file path")
+    ap.add_argument("--device", help="/dev/ngXnY (uring_cmd) or a file path")
     ap.add_argument("--engine",
                     choices=["posix", "io_uring", "uring_cmd", "cufile",
                              "opends"],
@@ -336,15 +324,52 @@ def main():
     ap.add_argument("--capacity-gb", type=int, default=8)
     ap.add_argument("--record", help="write a kvio_record.json replay manifest here")
     ap.add_argument("--trace", help="LMCACHE_KVIO_TRACE path (semantic trace)")
+    ap.add_argument("--intent-out", help="write a device-independent kvio.intent.v1 artifact")
+    ap.add_argument("--intent-only", action="store_true",
+                    help="write --intent-out and exit before opening a storage device")
     args = ap.parse_args()
 
+    if args.intent_only and not args.intent_out:
+        ap.error("--intent-only requires --intent-out")
+    if not args.intent_only and not args.device:
+        ap.error("--device is required unless --intent-only is used")
+
+    with open(args.modelconfig) as f:
+        configs = json.load(f)
+    if args.model in configs:
+        config, cfg_src = configs[args.model], "catalog"
+    else:
+        # Not in the calculator catalog: pull the config from HF (config JSON
+        # only -- no weights, no GPU) so any model can be projected.
+        config, cfg_src = load_hf_config(args.model), "HF AutoConfig"
+    block_bytes, detail = kv_cache_bytes(args.model, config,
+                                         args.chunk_tokens, args.dtype)
+    # Under TP, each chunk is offloaded as `ranks` per-rank objects (see
+    # shard_kv_bytes); at tp=1 this is the whole block as one object.
+    obj_bytes, ranks, shard_note = shard_kv_bytes(block_bytes, detail, args.tp)
+    if args.intent_out:
+        intent = build_kv_offload_intent(
+            model=args.model, geometry=detail, dtype=args.dtype,
+            chunk_tokens=args.chunk_tokens, payload_bytes=obj_bytes,
+            ranks_per_chunk=ranks, num_chunks=args.num_chunks,
+            streams=max(1, args.concurrency), iters=args.iters,
+            warmup=args.warmup, store_metadata_bytes=args.header_bytes)
+        with open(args.intent_out, "w", encoding="utf-8") as output:
+            json.dump(intent, output, indent=2, sort_keys=True)
+            output.write("\n")
+        print(f"  wrote device-independent intent: {args.intent_out}")
+    if args.intent_only:
+        return
+
+    if args.trace:
+        os.environ["LMCACHE_KVIO_TRACE"] = args.trace
+        open(args.trace, "w").close()
+
     # The engine splits every object into --mdts-bytes commands and hands each
-    # to the kernel as one user buffer. On 4 KiB pages the kernel needs one
-    # segment per page, so a command above max_segments*4 KiB never reaches the
-    # device: the passthrough rejects it with EINVAL, the engine logs the failed
-    # write, and nothing is stored. Say so up front rather than let a sweep run
-    # every point past the cap against a device it never touches.
-    cap = kernel_passthrough_cap(args.device) if args.engine == "uring_cmd" else None
+    # to the kernel as one user buffer. Intent deliberately does not need this
+    # source realization; validate it only when a real engine run follows.
+    cap = (kernel_passthrough_cap(args.device)
+           if args.engine == "uring_cmd" else None)
     if args.mdts_bytes <= 0:
         if cap is None:
             sys.exit("--mdts-bytes 0 (auto) needs an NVMe device path and "
@@ -362,25 +387,22 @@ def main():
                   f"{cap['max_hw_sectors_kb']}, max_segments={cap['max_segments']}"
                   f"{'' if args.hugepage else ', 4 KiB pages; --hugepage lifts the segment part'}"
                   f"); expect every command to fail with EINVAL", file=sys.stderr)
-
-    if args.trace:
-        os.environ["LMCACHE_KVIO_TRACE"] = args.trace
-        open(args.trace, "w").close()
-
-    with open(args.modelconfig) as f:
-        configs = json.load(f)
-    if args.model in configs:
-        config, cfg_src = configs[args.model], "catalog"
-    else:
-        # Not in the calculator catalog: pull the config from HF (config JSON
-        # only -- no weights, no GPU) so any model can be projected.
-        config, cfg_src = load_hf_config(args.model), "HF AutoConfig"
-    block_bytes, detail = kv_cache_bytes(args.model, config,
-                                         args.chunk_tokens, args.dtype)
-    # Under TP, each chunk is offloaded as `ranks` per-rank objects (see
-    # shard_kv_bytes); at tp=1 this is the whole block as one object.
-    obj_bytes, ranks, shard_note = shard_kv_bytes(block_bytes, detail, args.tp)
     geom = project(obj_bytes, args.mdts_bytes, args.header_bytes, args.block_align)
+
+    # Intent-only deliberately stays below the engine and torch dependency
+    # boundary. The real workload still uses LMCache's public API and torch.
+    global lmcache, ObjectKey, MemoryFormat, MemoryObjMetadata, TensorMemoryObj
+    global RawBlockCore, RawBlockCoreConfig, encode_object_key, torch
+    import lmcache
+    from lmcache.v1.distributed.api import ObjectKey
+    from lmcache.v1.memory_management import (
+        MemoryFormat,
+        MemoryObjMetadata,
+        TensorMemoryObj,
+    )
+    from lmcache.v1.storage_backend.raw_block import RawBlockCore, RawBlockCoreConfig
+    from lmcache.v1.storage_backend.raw_block.key_codec import encode_object_key
+    import torch
 
     print(f"=== KV-offload IO: {args.model} ({detail['family']}, {cfg_src}), "
           f"dtype={args.dtype} ===")

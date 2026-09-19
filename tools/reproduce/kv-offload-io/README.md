@@ -176,6 +176,34 @@ kernel carrying io_uring dma-buf registered buffers and the dma-buf size
 ceiling; without them the engine reports the registration refused and falls
 back, which shows up as the classic arm's numbers under a dma-buf label.
 
+### Portable logical intent before a device run
+
+`--intent-out` writes `kvio.intent.v1`: the logical KV objects, raw-block's
+fixed store metadata, and store/load phase ordering before a drive, DMA
+exporter, physical slot, MDTS, or NVMe command split enters the picture. It is
+deliberately separate from a device capture. `--intent-only` makes this
+artifact on a CPU-only machine without opening a storage device:
+
+```sh
+python3 tools/kvio/run_kv_offload_io.py \
+    --model meta-llama/Llama-3.1-8B-Instruct --chunk-tokens 256 \
+    --num-chunks 4 --intent-out llama.intent.json --intent-only
+./kvio intent validate llama.intent.json
+./kvio intent plan llama.intent.json --mdts-bytes $((8 * 1024 * 1024)) \
+    --dma-ceiling-bytes $((8 * 1024 * 1024)) --out target-8m.plan.json
+```
+
+The target plan's logical-component-relative command fragments are **modeled**, not a
+claim about that system. Run the intent through the real engine and capture the
+result with `nvme_tp_monitor` before claiming what the target drive got. When
+performing the dma-buf sweep, set `INTENT_DIR` to preserve one intent artifact
+per logical model/chunk workload:
+
+```sh
+DEV=/dev/nvme1n1 INTENT_DIR=artifacts/intent \
+    bash tools/reproduce/kv-offload-io/sweep_dmabuf.sh
+```
+
 No reference run is shipped for this arm yet.
 
 ## Replay

@@ -26,6 +26,14 @@ Project command sizes and counts from model and cache geometry.  This needs no
 GPU, application trace, or storage device.  It predicts neither reuse nor
 application timing.
 .TP
+.B intent
+Validate a versioned device-independent KV-offload intent, or lower that
+intent against supplied target command ceilings.  The resulting command plan
+is modeled target geometry, not a recording of a drive.  A real target run
+still needs
+.B kvio record
+to establish device behavior.
+.TP
 .B trace
 Compile timestamped agent requests into a chunk-level cache plan.  Promptful
 LMCache traces can derive content identity with a pinned tokenizer.  Promptless

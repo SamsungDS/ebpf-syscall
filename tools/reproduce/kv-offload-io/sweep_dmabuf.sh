@@ -27,6 +27,7 @@ KVIO=${KVIO:-$(cd "$(dirname "$0")/../../kvio" && pwd)}
 PYTHON=${PYTHON:-python3}
 DEV=${DEV:-/dev/nvme1n1}
 OUT=${OUT:-$PWD/kvio_sweep_dmabuf.txt}
+INTENT_DIR=${INTENT_DIR:-}
 MODELS=${MODELS:-"meta-llama/Llama-3.1-8B-Instruct"}
 CHUNKS=${CHUNKS:-"16 64 256"}
 MDTS=${MDTS:-"131072 2097152 8388608"}
@@ -34,6 +35,23 @@ KINDS=${KINDS:-"none udmabuf system_heap"}
 EXTRA=${HUGEPAGE:+--hugepage}
 PP=$KVIO/build:$KVIO/vendor/lmcache${PYTHONPATH:+:$PYTHONPATH}
 : > "$OUT"
+if [ -n "$INTENT_DIR" ]; then
+  mkdir -p "$INTENT_DIR" || exit 1
+  # Intent is deliberately invariant across target MDTS and exporter. Emit one
+  # artifact for each logical model/chunk workload, not misleading duplicates
+  # labelled with a source arm's device properties.
+  for M in $MODELS; do for C in $CHUNKS; do
+    SAFE_MODEL=${M//\//_}
+    INTENT_PATH="$INTENT_DIR/${SAFE_MODEL}-chunk${C}.intent.json"
+    if ! env PYTHONPATH="$PP" "$PYTHON" "$KVIO/run_kv_offload_io.py" \
+        --model "$M" --dtype bfloat16 --chunk-tokens "$C" --num-chunks 4 \
+        --intent-out "$INTENT_PATH" --intent-only >> "$OUT" 2>&1; then
+      echo "@@@ INTENT_FAIL model=$M chunk=$C" >> "$OUT"
+      exit 1
+    fi
+    echo "@@@ INTENT model=$M chunk=$C path=$INTENT_PATH" >> "$OUT"
+  done; done
+fi
 for M in $MODELS; do for C in $CHUNKS; do for X in $MDTS; do for K in $KINDS; do
   [ "$K" = none ] && DB= || DB="--dmabuf $K"
   echo "@@@ RUN model=$M chunk=$C mdts=$X dmabuf=$K hugepage=${HUGEPAGE:-0}" >> "$OUT"

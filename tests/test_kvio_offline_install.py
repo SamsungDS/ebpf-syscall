@@ -70,9 +70,11 @@ class OfflineInstallTest(unittest.TestCase):
             help_result = self.run_kvio(launcher, "--help", env=env)
             self.assertTrue(guard_marker.exists())
             self.assertIn("iolog", help_result.stdout)
+            self.assertIn("intent", help_result.stdout)
             self.assertNotIn("workload", help_result.stdout)
             self.run_kvio(launcher, "doctor", env=env)
             self.run_kvio(launcher, "record", "--help", env=env)
+            self.run_kvio(launcher, "intent", "--help", env=env)
 
             example = self.run_kvio(launcher, "release-example", env=env)
             result_input = stage / "result.json"
