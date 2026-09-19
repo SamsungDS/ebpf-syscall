@@ -6,8 +6,8 @@ storage tier sustain it?":
 
 - **project** the NVMe command stream a *GPU model × KV-cache config* would
   issue — GPU-free, no model, no serving stack (`kvio plan`);
-- **preserve and lower** a device-independent logical KV-offload contract for
-  a supplied target ceiling (`kvio intent`);
+- **preserve, lower, and execute** a device-independent logical KV-offload
+  contract on a selected target (`kvio intent`);
 - **drive** a real device with that IO using **LMCache's actual raw_block
   engine** — the real thing, vendored and built in this tree, not a mimic
   (`kvio workload`, `kvio sweep`);
@@ -114,7 +114,8 @@ it does not recreate a capture.
 | Command | Input | Result | Device access |
 |---|---|---|---|
 | `kvio plan` | Model and cache geometry | Predict command sizes and counts; no application timing or reuse | No |
-| `kvio intent` | `kvio.intent.v1` | Validate logical intent or model its target-specific command splits | No |
+| `kvio intent validate\|plan` | `kvio.intent.v1` | Validate logical intent or model its target-specific command splits | No |
+| `kvio intent replay` | Validated intent plus target realization options | Execute unchanged logical operations and write a target plan and run manifest | Yes; may write |
 | `kvio trace` | An application-level agent trace | Compile observed requests into a cache load/store plan | No |
 | `kvio catalog` | Pinned workload metadata | List or validate source, capture, privacy, and hardware evidence | No |
 | `kvio workload` | Model settings or an agent plan | Issue cache loads and stores through LMCache's real storage engine | Yes; may write |
@@ -133,6 +134,37 @@ The exact-replay path is therefore `record` → `iolog` → `fio-certify` → ru
 fio while recording again → `compare`. The agent path begins one level above
 that: `trace` → `workload`, with `record` running alongside it. `bench` and
 `bench-compare` are a separate controlled-load path.
+
+### Target-adaptive intent replay
+
+`kvio intent replay` is not fio replay. It consumes a validator-approved
+`kvio.intent.v1` file and reconstructs its canonical pass, phase, stream,
+chunk, and rank operations. Device path, engine, buffer exporter, controller
+limit, and software ceilings are target options, never fields copied from the
+intent. It writes the modeled plan before opening the engine and records the
+intent and plan digests in a target-run manifest.
+
+```sh
+./kvio intent replay llama.intent.json \
+    --device /dev/ng2n1 --engine uring_cmd \
+    --mdts-bytes "$EFFECTIVE_COMMAND_BYTES" \
+    --advertised-mdts-bytes "$CONTROLLER_MDTS_BYTES" \
+    --target-plan target-command-plan.json \
+    --target-manifest target-run.json \
+    --record target-record.json
+```
+
+Use an empty, unmounted target and record it separately with
+`nvme_tp_monitor`. The resulting command capture is the target's measured
+realization; the target plan remains modeled. A fio iolog from another target
+must not be substituted for this logical workload, because it already embeds
+that target's command splitting.
+
+`--mdts-bytes` is the execution cap selected for this target and engine;
+`--advertised-mdts-bytes` records the controller's identify value after its
+MDTS exponent has been converted to bytes. They may differ: a normal-page
+mapping can impose a smaller effective cap. An advertised MDTS of `0` means the
+controller specifies no transfer limit; it never means zero-byte I/O.
 
 ## Capture below the io_uring batching boundary
 

@@ -11,8 +11,10 @@ from pathlib import Path
 from tools.kvio.intent import (
     IntentError,
     build_kv_offload_intent,
+    intent_sha256,
     lower_intent,
     validate_intent,
+    validate_target_plan,
 )
 
 
@@ -63,6 +65,21 @@ class KvioIntentTest(unittest.TestCase):
         intent["operations"][0]["payload_bytes"] = 9
         with self.assertRaisesRegex(IntentError, "payload_bytes"):
             validate_intent(intent)
+
+    def test_validator_rejects_reordered_operations(self):
+        intent = copy.deepcopy(sample())
+        intent["operations"][0]["phase"] = "load"
+        with self.assertRaisesRegex(IntentError, "execution order"):
+            validate_intent(intent)
+
+    def test_target_plan_binds_exactly_to_one_intent(self):
+        intent = sample()
+        plan = lower_intent(intent, mdts_bytes=8, software_limit_bytes=7)
+        validate_target_plan(plan, intent)
+        self.assertEqual(plan["intent_sha256"], intent_sha256(intent))
+        plan["commands"][0]["bytes"] = 3
+        with self.assertRaisesRegex(IntentError, "exact lowering"):
+            validate_target_plan(plan, intent)
 
     def test_intent_only_runs_without_a_device_or_engine_import(self):
         with tempfile.TemporaryDirectory() as directory:

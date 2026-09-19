@@ -51,7 +51,7 @@ COMMANDS = {
     "catalog":      ("tools/kvio/workload_catalog.py",
                      "list and validate pinned workload evidence", False),
     "intent":       ("tools/kvio/intent.py",
-                     "validate or lower a device-independent KV-offload intent", False),
+                     "validate, lower, or execute a KV-offload intent", False),
     # engine-driving (vendored RawBlockCore + built Rust module)
     "workload":     ("tools/kvio/workload.py",
                      "drive the real raw_block engine with a serving-shaped request mix", True),
@@ -265,6 +265,10 @@ def main():
     if not os.path.isfile(target):
         sys.stderr.write(f"kvio {cmd}: missing {rel}\n")
         return 1
+    # ``kvio intent validate|plan`` stays offline, while ``intent replay``
+    # deliberately opens the vendored raw_block engine after validating its
+    # immutable input and emitting a target-side plan.
+    needs_engine = needs_engine or (cmd == "intent" and rest[:1] == ["replay"])
     env = engine_env() if needs_engine else dict(os.environ)
     try:
         os.execvpe(sys.executable, [sys.executable, target] + rest, env)

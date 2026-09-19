@@ -12,6 +12,9 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
+import subprocess
+import sys
 from pathlib import Path
 
 
@@ -164,20 +167,38 @@ def validate_intent(intent):
         where = f"operations[{sequence}]"
         if not isinstance(operation, dict) or operation.get("sequence") != sequence:
             raise IntentError(f"{where}.sequence must be canonical")
-        if operation.get("phase") not in ("store", "load"):
-            raise IntentError(f"{where}.phase must be store or load")
+        expected_pass = sequence // (2 * streams * chunks * ranks)
+        within_pass = sequence % (2 * streams * chunks * ranks)
+        expected_phase = (
+            "store" if within_pass < streams * chunks * ranks else "load"
+        )
+        within_phase = within_pass % (streams * chunks * ranks)
+        expected_stream = within_phase // (chunks * ranks)
+        within_stream = within_phase % (chunks * ranks)
+        expected_chunk = within_stream // ranks
+        expected_rank = within_stream % ranks
+        if operation.get("phase") != expected_phase:
+            raise IntentError(
+                f"{where}.phase is not in the v1 execution order"
+            )
         pass_index = operation.get("pass")
-        if not isinstance(pass_index, int) or not 0 <= pass_index < warmup + iters:
-            raise IntentError(f"{where}.pass is out of range")
+        if pass_index != expected_pass:
+            raise IntentError(f"{where}.pass is not in the v1 execution order")
         stream = operation.get("stream")
-        if not isinstance(stream, int) or not 0 <= stream < streams:
-            raise IntentError(f"{where}.stream is out of range")
+        if stream != expected_stream:
+            raise IntentError(
+                f"{where}.stream is not in the v1 execution order"
+            )
         chunk_index = operation.get("chunk_index")
         rank = operation.get("kv_rank")
-        if not isinstance(chunk_index, int) or not 0 <= chunk_index < chunks:
-            raise IntentError(f"{where}.chunk_index is out of range")
-        if not isinstance(rank, int) or not 0 <= rank < ranks:
-            raise IntentError(f"{where}.kv_rank is out of range")
+        if chunk_index != expected_chunk:
+            raise IntentError(
+                f"{where}.chunk_index is not in the v1 execution order"
+            )
+        if rank != expected_rank:
+            raise IntentError(
+                f"{where}.kv_rank is not in the v1 execution order"
+            )
         if operation.get("stream_sequence") != chunk_index * ranks + rank:
             raise IntentError(f"{where}.stream_sequence disagrees with object identity")
         expected_object = f"pass={pass_index}/stream={stream}/chunk={chunk_index}/rank={rank}"
@@ -223,10 +244,9 @@ def lower_intent(intent, *, mdts_bytes, dma_ceiling_bytes=None,
                 remaining -= size
                 offset += size
                 command_index += 1
-    encoded = json.dumps(intent, sort_keys=True, separators=(",", ":")).encode()
     return {
         "schema": PLAN_SCHEMA,
-        "intent_sha256": hashlib.sha256(encoded).hexdigest(),
+        "intent_sha256": intent_sha256(intent),
         "evidence": "modeled-target-command-plan-not-device-measurement",
         "target_limits": limits,
         "effective_command_bytes": effective,
@@ -239,7 +259,43 @@ def lower_intent(intent, *, mdts_bytes, dma_ceiling_bytes=None,
     }
 
 
-def _load(path):
+def intent_sha256(intent):
+    """Return the canonical digest binding plans and runs to an intent."""
+    validate_intent(intent)
+    encoded = json.dumps(
+        intent, sort_keys=True, separators=(",", ":")
+    ).encode()
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def validate_target_plan(plan, intent):
+    """Reject a modeled plan that does not exactly lower ``intent``."""
+    if not isinstance(plan, dict) or plan.get("schema") != PLAN_SCHEMA:
+        raise IntentError("target plan must use kvio.intent-plan.v1")
+    if plan.get("evidence") != (
+        "modeled-target-command-plan-not-device-measurement"
+    ):
+        raise IntentError(
+            "target plan must preserve the modeled evidence label"
+        )
+    if plan.get("intent_sha256") != intent_sha256(intent):
+        raise IntentError("target plan does not bind to this intent")
+    limits = plan.get("target_limits")
+    if not isinstance(limits, dict) or set(limits) - {
+            "mdts_bytes", "dma_ceiling_bytes", "software_limit_bytes"}:
+        raise IntentError("target plan has invalid target limits")
+    expected = lower_intent(
+        intent, mdts_bytes=limits.get("mdts_bytes"),
+        dma_ceiling_bytes=limits.get("dma_ceiling_bytes"),
+        software_limit_bytes=limits.get("software_limit_bytes"))
+    if plan != expected:
+        raise IntentError(
+            "target plan is not the exact lowering of this intent"
+        )
+
+
+def load_intent(path):
+    """Load and validate an intent from a local file."""
     try:
         value = json.loads(Path(path).read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as error:
@@ -267,17 +323,89 @@ def main(argv=None):
     plan.add_argument("--dma-ceiling-bytes", type=int)
     plan.add_argument("--software-limit-bytes", type=int)
     plan.add_argument("--out", default="-", help="output JSON path, or - for stdout")
+    replay = sub.add_parser(
+        "replay",
+        help="execute a validated intent with target-side realization options",
+    )
+    replay.add_argument("intent")
+    replay.add_argument("--device", required=True)
+    replay.add_argument("--engine", choices=["posix", "io_uring", "uring_cmd"],
+                        required=True)
+    replay.add_argument("--mdts-bytes", type=int, required=True)
+    replay.add_argument("--dma-ceiling-bytes", type=int)
+    replay.add_argument("--software-limit-bytes", type=int)
+    replay.add_argument("--dmabuf")
+    replay.add_argument("--hugepage", action="store_true")
+    replay.add_argument("--odirect", action="store_true")
+    replay.add_argument("--capacity-gb", type=int, default=8)
+    replay.add_argument("--ring-depth", type=int, default=0)
+    replay.add_argument("--load-parallelism", type=int, default=0)
+    replay.add_argument("--allow-io-errors", action="store_true")
+    replay.add_argument(
+        "--advertised-mdts-bytes",
+        type=int,
+        help="controller MDTS in bytes; 0 means no controller limit",
+    )
+    replay.add_argument("--record")
+    replay.add_argument("--trace")
+    replay.add_argument("--target-plan", required=True)
+    replay.add_argument("--target-manifest", required=True)
     args = parser.parse_args(argv)
     try:
-        intent = _load(args.intent)
+        intent = load_intent(args.intent)
         if args.command == "validate":
             print(f"valid {SCHEMA}: {len(intent['operations'])} logical operations")
             return 0
+        if args.command == "plan":
+            result = lower_intent(
+                intent,
+                mdts_bytes=args.mdts_bytes,
+                dma_ceiling_bytes=args.dma_ceiling_bytes,
+                software_limit_bytes=args.software_limit_bytes,
+            )
+            _write(result, args.out)
+            return 0
+        if args.advertised_mdts_bytes is not None:
+            _nonnegative(args.advertised_mdts_bytes, "advertised_mdts_bytes")
+        if args.dmabuf and args.engine != "io_uring":
+            raise IntentError("dma-buf replay requires --engine io_uring")
+        if args.dmabuf and args.dma_ceiling_bytes is None:
+            raise IntentError("dma-buf replay requires --dma-ceiling-bytes")
+        for path in (args.target_plan, args.target_manifest):
+            if Path(path).exists():
+                raise IntentError(
+                    f"refusing to overwrite existing artifact: {path}"
+                )
         result = lower_intent(intent, mdts_bytes=args.mdts_bytes,
                               dma_ceiling_bytes=args.dma_ceiling_bytes,
                               software_limit_bytes=args.software_limit_bytes)
-        _write(result, args.out)
-        return 0
+        _write(result, args.target_plan)
+        runner = Path(__file__).with_name("run_kv_offload_io.py")
+        command = [sys.executable, str(runner), "--intent", args.intent,
+                   "--device", args.device, "--engine", args.engine,
+                   "--mdts-bytes", str(args.mdts_bytes),
+                   "--target-plan", args.target_plan,
+                   "--target-manifest", args.target_manifest,
+                   "--capacity-gb", str(args.capacity_gb),
+                   "--ring-depth", str(args.ring_depth),
+                   "--load-parallelism", str(args.load_parallelism)]
+        option_values = (
+            ("--dma-ceiling-bytes", args.dma_ceiling_bytes),
+            ("--software-limit-bytes", args.software_limit_bytes),
+            ("--advertised-mdts-bytes", args.advertised_mdts_bytes),
+            ("--dmabuf", args.dmabuf),
+            ("--record", args.record),
+            ("--trace", args.trace),
+        )
+        for option, value in option_values:
+            if value is not None:
+                command.extend((option, str(value)))
+        for option, enabled in (("--hugepage", args.hugepage),
+                                ("--odirect", args.odirect),
+                                ("--allow-io-errors", args.allow_io_errors)):
+            if enabled:
+                command.append(option)
+        return subprocess.run(command, env=os.environ, check=False).returncode
     except IntentError as error:
         parser.error(str(error))
 

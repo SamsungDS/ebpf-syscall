@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import hashlib
 import json
 import math
 import mmap
@@ -34,6 +35,7 @@ import os
 import sys
 import threading
 import time
+from pathlib import Path
 
 # Pin BLAS/OpenMP thread pools BEFORE importing anything that loads torch/numpy.
 # This is an I/O benchmark, not a compute one: it does no matrix math, but torch
@@ -49,7 +51,14 @@ for _v in ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS",
     os.environ.setdefault(_v, _threads)
 
 from kv_geometry import kv_cache_bytes, shard_kv_bytes, load_hf_config
-from intent import build_kv_offload_intent
+from intent import (
+    IntentError,
+    build_kv_offload_intent,
+    intent_sha256,
+    load_intent,
+    lower_intent,
+    validate_target_plan,
+)
 
 
 class SemanticTrace:
@@ -246,6 +255,52 @@ def pct(xs, q):
     return xs[min(len(xs) - 1, int(q * len(xs)))] if xs else 0.0
 
 
+def _read_optional(path):
+    try:
+        return Path(path).read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+
+
+def target_descriptor(device_path, advertised_mdts_bytes):
+    """Describe target-side facts without importing source-run realization."""
+    name = os.path.basename(os.path.realpath(device_path))
+    namespace = f"nvme{name[2:]}" if name.startswith("ng") else name
+    controller = (
+        namespace.rsplit("n", 1)[0] if namespace.startswith("nvme") else None
+    )
+    queue = f"/sys/block/{namespace}/queue"
+    queue_fields = (
+        "logical_block_size", "physical_block_size", "max_hw_sectors_kb",
+        "max_sectors_kb", "max_hw_dmabuf_sectors_kb", "max_segments",
+    )
+    return {
+        "device_path": device_path,
+        "namespace": namespace,
+        "controller": controller,
+        "kernel_release": os.uname().release,
+        "kernel_cmdline": _read_optional("/proc/cmdline"),
+        "advertised_mdts_bytes": advertised_mdts_bytes,
+        "advertised_mdts_interpretation": (
+            "not-recorded" if advertised_mdts_bytes is None else
+            "no-controller-transfer-limit" if advertised_mdts_bytes == 0 else
+            "caller-recorded-controller-limit"),
+        "queue": {field: _read_optional(f"{queue}/{field}")
+                  for field in queue_fields},
+        "controller_identity": ({
+            "model": _read_optional(f"/sys/class/nvme/{controller}/model"),
+            "serial": _read_optional(f"/sys/class/nvme/{controller}/serial"),
+            "firmware_rev": _read_optional(
+                f"/sys/class/nvme/{controller}/firmware_rev"),
+        } if controller else None),
+    }
+
+
+def write_json(path, value):
+    Path(path).write_text(json.dumps(value, indent=2, sort_keys=True) + "\n",
+                          encoding="utf-8")
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -253,7 +308,7 @@ def main():
     ap.add_argument("--modelconfig",
                     default=os.path.join(here, "modelconfig.json"),
                     help="modelconfig.json (calculator format)")
-    ap.add_argument("--model", required=True,
+    ap.add_argument("--model",
                     help="model name: a key in modelconfig.json, or ANY Hugging "
                          "Face model id (its config is fetched automatically -- "
                          "config only, no weights, no GPU)")
@@ -327,26 +382,106 @@ def main():
     ap.add_argument("--intent-out", help="write a device-independent kvio.intent.v1 artifact")
     ap.add_argument("--intent-only", action="store_true",
                     help="write --intent-out and exit before opening a storage device")
+    ap.add_argument(
+        "--intent", help="execute this validated kvio.intent.v1 file"
+    )
+    ap.add_argument("--target-plan",
+                    help="modeled target plan bound to --intent")
+    ap.add_argument("--target-manifest",
+                    help="write the target-side intent replay manifest")
+    ap.add_argument(
+        "--dma-ceiling-bytes",
+        type=int,
+        help="target dma-buf ceiling used only to bind --target-plan",
+    )
+    ap.add_argument(
+        "--software-limit-bytes",
+        type=int,
+        help="target software ceiling used only to bind --target-plan",
+    )
+    ap.add_argument(
+        "--advertised-mdts-bytes",
+        type=int,
+        help="recorded controller MDTS in bytes; 0 means no controller limit",
+    )
     args = ap.parse_args()
 
     if args.intent_only and not args.intent_out:
         ap.error("--intent-only requires --intent-out")
+    if args.intent and args.intent_out:
+        ap.error("--intent and --intent-out cannot be used together")
+    if args.intent_only and args.intent:
+        ap.error("--intent-only cannot execute an intent")
+    if args.intent and args.engine not in ("posix", "io_uring", "uring_cmd"):
+        ap.error(
+            "intent replay currently supports only host raw_block engines"
+        )
+    if not args.intent and not args.model:
+        ap.error("--model is required unless --intent is used")
+    if args.intent and (not args.target_plan or not args.target_manifest):
+        ap.error("--intent requires --target-plan and --target-manifest")
     if not args.intent_only and not args.device:
         ap.error("--device is required unless --intent-only is used")
 
-    with open(args.modelconfig) as f:
-        configs = json.load(f)
-    if args.model in configs:
-        config, cfg_src = configs[args.model], "catalog"
+    replay_intent = None
+    replay_plan = None
+    if args.intent:
+        try:
+            replay_intent = load_intent(args.intent)
+            replay_plan = json.loads(
+                Path(args.target_plan).read_text(encoding="utf-8")
+            )
+            validate_target_plan(replay_plan, replay_intent)
+            expected_plan = lower_intent(
+                replay_intent, mdts_bytes=args.mdts_bytes,
+                dma_ceiling_bytes=args.dma_ceiling_bytes,
+                software_limit_bytes=args.software_limit_bytes)
+            if replay_plan != expected_plan:
+                raise IntentError(
+                    "target plan limits disagree with replay options"
+                )
+            if args.dmabuf and args.dma_ceiling_bytes is None:
+                raise IntentError(
+                    "dma-buf replay requires --dma-ceiling-bytes"
+                )
+            if (
+                args.advertised_mdts_bytes is not None
+                and args.advertised_mdts_bytes < 0
+            ):
+                raise IntentError("advertised_mdts_bytes must be non-negative")
+        except (IntentError, OSError, json.JSONDecodeError) as error:
+            ap.error(str(error))
+        args.model = replay_intent["model"]["name"]
+        args.dtype = replay_intent["model"]["dtype"]
+        args.chunk_tokens = replay_intent["model"]["chunk_tokens"]
+        args.num_chunks = replay_intent["execution"]["num_chunks"]
+        args.concurrency = replay_intent["execution"]["streams"]
+        args.iters = replay_intent["execution"]["iters"]
+        args.warmup = replay_intent["execution"]["warmup"]
+        args.header_bytes = replay_intent["object"]["store_metadata_bytes"]
+        obj_bytes = replay_intent["object"]["payload_bytes"]
+        ranks = replay_intent["object"]["ranks_per_chunk"]
+        args.tp = ranks
+        block_bytes = obj_bytes * ranks
+        detail = replay_intent["model"]["geometry"]
+        cfg_src = "intent-v1"
+        shard_note = "reconstructed from intent-v1"
     else:
-        # Not in the calculator catalog: pull the config from HF (config JSON
-        # only -- no weights, no GPU) so any model can be projected.
-        config, cfg_src = load_hf_config(args.model), "HF AutoConfig"
-    block_bytes, detail = kv_cache_bytes(args.model, config,
-                                         args.chunk_tokens, args.dtype)
-    # Under TP, each chunk is offloaded as `ranks` per-rank objects (see
-    # shard_kv_bytes); at tp=1 this is the whole block as one object.
-    obj_bytes, ranks, shard_note = shard_kv_bytes(block_bytes, detail, args.tp)
+        with open(args.modelconfig) as f:
+            configs = json.load(f)
+        if args.model in configs:
+            config, cfg_src = configs[args.model], "catalog"
+        else:
+            # Not in the calculator catalog: pull config JSON from HF (no
+            # weights and no GPU) so any model can be projected.
+            config, cfg_src = load_hf_config(args.model), "HF AutoConfig"
+        block_bytes, detail = kv_cache_bytes(args.model, config,
+                                             args.chunk_tokens, args.dtype)
+        # Under TP, each chunk is offloaded as `ranks` per-rank objects (see
+        # shard_kv_bytes); at tp=1 this is the whole block as one object.
+        obj_bytes, ranks, shard_note = shard_kv_bytes(
+            block_bytes, detail, args.tp
+        )
     if args.intent_out:
         intent = build_kv_offload_intent(
             model=args.model, geometry=detail, dtype=args.dtype,
@@ -389,6 +524,48 @@ def main():
                   f"); expect every command to fail with EINVAL", file=sys.stderr)
     geom = project(obj_bytes, args.mdts_bytes, args.header_bytes, args.block_align)
 
+    target_run = None
+    if replay_intent is not None:
+        manifest_path = Path(args.target_manifest)
+        if manifest_path.exists():
+            ap.error(
+                f"refusing to overwrite existing artifact: {manifest_path}"
+            )
+        plan_bytes = Path(args.target_plan).read_bytes()
+        target_run = {
+            "schema": "kvio.intent-replay-run.v1",
+            "evidence": "target-run-manifest-not-device-measurement",
+            "status": "started",
+            "intent": {
+                "sha256": intent_sha256(replay_intent),
+                "logical_operations": len(replay_intent["operations"]),
+            },
+            "target_plan": {
+                "path": args.target_plan,
+                "sha256": hashlib.sha256(plan_bytes).hexdigest(),
+                "effective_command_bytes": (
+                    replay_plan["effective_command_bytes"]
+                ),
+            },
+            "realization": {
+                "engine": args.engine,
+                "dmabuf": args.dmabuf,
+                "requested_mdts_bytes": args.mdts_bytes,
+                "dma_ceiling_bytes": args.dma_ceiling_bytes,
+                "software_limit_bytes": args.software_limit_bytes,
+                "hugepage_buffers": args.hugepage,
+                "odirect": args.odirect,
+                "ring_depth": args.ring_depth,
+                "load_parallelism": args.load_parallelism,
+                "capacity_gb": args.capacity_gb,
+            },
+            "target": target_descriptor(
+                args.device, args.advertised_mdts_bytes
+            ),
+            "artifacts": {"record": args.record, "semantic_trace": args.trace},
+        }
+        write_json(manifest_path, target_run)
+
     # Intent-only deliberately stays below the engine and torch dependency
     # boundary. The real workload still uses LMCache's public API and torch.
     global lmcache, ObjectKey, MemoryFormat, MemoryObjMetadata, TensorMemoryObj
@@ -404,14 +581,17 @@ def main():
     from lmcache.v1.storage_backend.raw_block.key_codec import encode_object_key
     import torch
 
-    print(f"=== KV-offload IO: {args.model} ({detail['family']}, {cfg_src}), "
+    family = detail.get("family", "recorded geometry")
+    print(f"=== KV-offload IO: {args.model} ({family}, {cfg_src}), "
           f"dtype={args.dtype} ===")
     print(f"  chunk={args.chunk_tokens} tok -> KV block = {block_bytes} B "
-          f"({block_bytes / 1024 / 1024:.2f} MiB)  [{detail['total_elements']} elems]")
+          f"({block_bytes / 1024 / 1024:.2f} MiB)  "
+          f"[{detail.get('total_elements', 'recorded')} elems]")
     if args.tp > 1:
         print(f"  TP={args.tp}: {shard_note} -> {ranks} objects/chunk x "
               f"{obj_bytes} B ({obj_bytes / 1024 / 1024:.2f} MiB) per rank")
-    print(f"  per object: store {geom['store_cmds']} cmds / {geom['store_bytes']} B, "
+    print(f"  per object: store {geom['store_cmds']} cmds / "
+          f"{geom['store_bytes']} B, "
           f"load {geom['load_cmds']} cmds / {geom['load_bytes']} B "
           f"(max_xfer={args.mdts_bytes // 1024} KiB/cmd, align={args.block_align})")
     engine_label = (f"opends:{args.gds_backend}" if args.engine == "opends"
@@ -523,16 +703,27 @@ def main():
 
     n_obj = args.num_chunks * ranks  # objects per stream per pass
 
-    def stream_keys(it, s):
-        # fresh keys per pass and per stream so every store is a real write
-        # (not an index hit). Under TP the `ranks` objects of a chunk share the
-        # chunk hash and differ only by kv_rank -- exactly what the per-rank
-        # LMCache workers emit.
-        base = (it * nstreams + s) * args.num_chunks
-        return [encode_object_key(ObjectKey(
-                    chunk_hash=ObjectKey.IntHash2Bytes(base + i),
-                    model_name="kvoffload", kv_rank=r))
-                for i in range(args.num_chunks) for r in range(ranks)]
+    def key_for_operation(operation):
+        # Key material is a deterministic target implementation detail. The
+        # input's pass/stream/chunk/rank identity, not a source key or offset,
+        # determines it; store and load for one logical object get one key.
+        base = ((operation["pass"] * nstreams + operation["stream"]) *
+                args.num_chunks + operation["chunk_index"])
+        return encode_object_key(ObjectKey(
+            chunk_hash=ObjectKey.IntHash2Bytes(base), model_name="kvoffload",
+            kv_rank=operation["kv_rank"]))
+
+    def phase_operations(it, name, stream):
+        if replay_intent is not None:
+            return [operation for operation in replay_intent["operations"]
+                    if operation["pass"] == it and operation["phase"] == name
+                    and operation["stream"] == stream]
+        return [{
+            "pass": it, "stream": stream, "chunk_index": chunk_index,
+            "kv_rank": rank, "sequence": (
+                ((it * 2 + (name == "load")) * nstreams + stream) *
+                args.num_chunks * ranks + chunk_index * ranks + rank),
+        } for chunk_index in range(args.num_chunks) for rank in range(ranks)]
 
     def run_phase(name, it, fn):
         """Every stream runs `fn` over its objects at once; returns the per-stream
@@ -548,13 +739,14 @@ def main():
         out = [None] * nstreams
 
         def worker(s):
-            keys = stream_keys(it, s)
+            operations = phase_operations(it, name, s)
             buf = bufs[s][0] if name == "store" else bufs[s][1]
-            lat = [None] * n_obj
+            lat = [None] * len(operations)
             barrier.wait()
-            for j in range(n_obj):
+            for j, operation in enumerate(operations):
                 t0 = time.perf_counter()
-                ok = fn(keys[j], (it * nstreams + s) * n_obj + j, buf)
+                key = key_for_operation(operation)
+                ok = fn(key, operation["sequence"], buf)
                 lat[j] = (time.perf_counter() - t0) * 1e3 if ok else None
             out[s] = lat
 
@@ -573,8 +765,11 @@ def main():
     fails = {"store": 0, "load": 0}
     phase_wall = {"store": 0.0, "load": 0.0}
     for it in range(args.warmup + args.iters):
-        st, wall_s = run_phase("store", it, do_store)
-        ld, wall_l = run_phase("load", it, do_load)
+        phase_results = {}
+        for name, fn in (("store", do_store), ("load", do_load)):
+            phase_results[name] = run_phase(name, it, fn)
+        st, wall_s = phase_results["store"]
+        ld, wall_l = phase_results["load"]
         fails["store"] += sum(x.count(None) for x in st)
         fails["load"] += sum(x.count(None) for x in ld)
         if it >= args.warmup:
@@ -643,9 +838,24 @@ def main():
                          "ops": ["store", "load"]}
                         for i in range(args.num_chunks) for r in range(ranks)],
         }
+        if replay_intent is not None:
+            rec["intent_sha256"] = intent_sha256(replay_intent)
         with open(args.record, "w") as f:
             json.dump(rec, f, indent=2)
         print(f"  wrote replay manifest: {args.record}")
+
+    if target_run is not None:
+        target_run["status"] = (
+            "complete" if not failed else "completed-with-io-errors"
+        )
+        target_run["outcomes"] = {
+            "operations_per_phase": n_ops,
+            "store_failures": fails["store"],
+            "load_failures": fails["load"],
+            "all_operations_succeeded": failed == 0,
+            "aggregate_MBps": aggregate,
+        }
+        write_json(args.target_manifest, target_run)
 
     if failed and not args.allow_io_errors:
         sys.exit(2)
