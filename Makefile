@@ -115,8 +115,19 @@ NVMETP_TARGET  = nvme_tp_monitor
 NVMETP_BPF_OBJ = nvme_tp_monitor.bpf.o
 NVMETP_SKEL    = nvme_tp_monitor.skel.h
 
+# nvme_core is commonly modular, so its command types are normally absent
+# from vmlinux.h. Mainline configurations can build it in; avoid declaring
+# those types twice when the running kernel BTF already contains them.
+NVMETP_VMLINUX_HAS_NVME_TYPES := $(shell \
+	$(BPFTOOL) btf dump file /sys/kernel/btf/vmlinux format c 2>/dev/null | \
+	grep -q '^struct nvme_command {' && echo 1)
+NVMETP_BPF_CFLAGS = $(BPF_CFLAGS)
+ifeq ($(NVMETP_VMLINUX_HAS_NVME_TYPES),1)
+NVMETP_BPF_CFLAGS += -DNVMETP_VMLINUX_HAS_NVME_TYPES
+endif
+
 $(NVMETP_BPF_OBJ): nvme_tp_monitor.bpf.c vmlinux.h
-	$(CLANG) $(BPF_CFLAGS) $(INCLUDES) -c nvme_tp_monitor.bpf.c -o $@
+	$(CLANG) $(NVMETP_BPF_CFLAGS) $(INCLUDES) -c nvme_tp_monitor.bpf.c -o $@
 
 $(NVMETP_SKEL): $(NVMETP_BPF_OBJ)
 	$(BPFTOOL) gen skeleton $< > $@

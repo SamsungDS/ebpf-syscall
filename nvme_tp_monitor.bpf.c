@@ -24,10 +24,12 @@
 #define EV_CMD 0
 #define EV_CMP 1
 
-/* nvme driver types live in the nvme_core MODULE BTF, not vmlinux.h — declare
- * minimal local mirrors with preserve_access_index: CO-RE relocates every
- * field access by NAME against the module BTF at load time, so the local
- * layout (and any omitted members) is irrelevant. */
+/* On kernels where nvme_core is a module, its types are absent from
+ * vmlinux.h. Declare minimal CO-RE mirrors in that case. Kernels with
+ * nvme_core built in already provide the real declarations in vmlinux.h.
+ * The Makefile detects that latter case and defines
+ * NVMETP_VMLINUX_HAS_NVME_TYPES. */
+#ifndef NVMETP_VMLINUX_HAS_NVME_TYPES
 struct nvme_common_command {
 	__u8  opcode;
 	__u8  flags;
@@ -52,6 +54,7 @@ struct nvme_request {
 	struct nvme_command *cmd;
 	__u16 status;
 } __attribute__((preserve_access_index));
+#endif
 
 struct tp_cmd_event {
 	__u32 ev_type;      /* EV_CMD */
