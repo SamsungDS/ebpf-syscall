@@ -1,20 +1,19 @@
 # vendored LMCache surface -- regenerate with sync-lmcache.sh, never hand-edit
 
-- synced_commit: 23cca67908e17b193eb8fab08ba1beb0115881cd
-- synced_ref: upstream/dev (23cca67908e1, 2026-08-25)
+- synced_commit: 38d1b74f1bff0fa41b9420c66156c12608065fe4
+- synced_ref: 2026-09-18-raw-block-dmabuf (38d1b74f, 2026-09-18)
 - upstream: https://github.com/LMCache/LMCache (Apache-2.0; text vendored as LICENSE alongside this file)
 
 ## what is vendored
 
-- `rust/raw_block/` -- the Rust raw_block engine (pyo3); `make kvio` builds it. Last upstream change: a976ce09dd98 2026-08-11 [Fix][RawBlock] Bounce unaligned buffers in io_uring uring_cmd read paths (#3891)
-- `csrc/lmcache_native/` -- the lmcache_native torch CppExtension (device_ops backend needs it); `make kvio` builds it via build_native.py. Last upstream change: ab09ffeb72d8 2026-08-19 Move common transfer descriptors into lmcache_native (#4515)
-- 116 Python files -- the runtime import closure of the modules kvio
+- `rust/raw_block/` -- the Rust raw_block engine (pyo3); `make kvio` builds it. Last upstream change: 1825350e 2026-09-18 raw_block: take pointer-shaped buffers and keep dma-buf slots off the bounce path
+- `csrc/lmcache_native/` -- the lmcache_native torch CppExtension (device_ops backend needs it); `make kvio` builds it via build_native.py. Last upstream change: f01d527b 2026-09-18 [MP][Ascend][KV format] Add NL_X_NP_X_NB_BS_ONE_HS for vLLM-Ascend MLA/DSA plane tuples (#5138)
+- 121 Python files -- the runtime import closure of the modules kvio
   uses (static walk + empirical import-probe refinement; the on-disk tree
   additionally holds empty ancestor-package __init__ stubs and the
   stdlib-only tests/.../raw_block_test_utils.py the tools load):
   - `lmcache/__init__.py`
   - `lmcache/connections.py`
-  - `lmcache/integration/vllm/utils.py`
   - `lmcache/logging.py`
   - `lmcache/observability.py`
   - `lmcache/usage_telemetry/__init__.py`
@@ -27,6 +26,7 @@
   - `lmcache/usage_telemetry/mp.py`
   - `lmcache/usage_telemetry/transport.py`
   - `lmcache/utils.py`
+  - `lmcache/v1/__init__.py`
   - `lmcache/v1/compute/attention/metadata.py`
   - `lmcache/v1/compute/blend/blender.py`
   - `lmcache/v1/compute/blend/metadata.py`
@@ -104,6 +104,7 @@
   - `lmcache/v1/platform/event_notifier.py`
   - `lmcache/v1/platform/hpu/__init__.py`
   - `lmcache/v1/platform/hpu/device_ops.py`
+  - `lmcache/v1/platform/ipc_policy.py`
   - `lmcache/v1/platform/kv_wrap.py`
   - `lmcache/v1/platform/musa/__init__.py`
   - `lmcache/v1/platform/musa/cache_context.py`
@@ -113,6 +114,10 @@
   - `lmcache/v1/platform/musa/native_kv_transfer.py`
   - `lmcache/v1/platform/musa/pin_memory.py`
   - `lmcache/v1/platform/musa/tensor_from_ptr.py`
+  - `lmcache/v1/platform/neuron/__init__.py`
+  - `lmcache/v1/platform/npu/__init__.py`
+  - `lmcache/v1/platform/npu/device_ops.py`
+  - `lmcache/v1/platform/npu/pin_memory.py`
   - `lmcache/v1/platform/ops_types.py`
   - `lmcache/v1/platform/rbln/__init__.py`
   - `lmcache/v1/platform/rbln/device_ops.py`

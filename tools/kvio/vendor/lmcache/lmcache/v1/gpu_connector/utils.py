@@ -212,6 +212,43 @@ def normalize_kv_and_discover_format(
     return detect_format(kv_caches, serving_engine, layout_hints)
 
 
+def _layer_structure_key(entry: object) -> Hashable:
+    """Hashable per-layer structure key: recursive ``(shape, dtype)`` leaves.
+
+    Sequence entries produce the tuple of their children's keys; two
+    entries share a key exactly when their shapes *and* dtypes match.
+    """
+    if isinstance(entry, (list, tuple)):
+        return tuple(_layer_structure_key(item) for item in entry)
+    shape = getattr(entry, "shape", None)
+    if shape is None:
+        return None
+    dtype = getattr(entry, "dtype", None)
+    return (tuple(shape), dtype)
+
+
+def get_shape_and_dtype(
+    kv_caches: "DiscoverableKVCache",
+    layer_indices: "Optional[Sequence[int]]" = None,
+) -> list[Hashable]:
+    """Return the shape/dtype structure of each requested layer's entry.
+
+    Equality means "same shapes and dtypes".
+
+    Args:
+        kv_caches: Per-layer KV entries (tensor or nested sequences).
+        layer_indices: 0-based entries to describe; ``None`` selects all.
+
+    Returns:
+        One structure per requested layer, in order.
+    """
+    entries = list(kv_caches)  # type: ignore[arg-type]
+    indices: "Sequence[int]" = (
+        range(len(entries)) if layer_indices is None else layer_indices
+    )
+    return [_layer_structure_key(entries[i]) for i in indices]
+
+
 def normalize_and_discover_per_layer_formats(
     kv_caches: "DiscoverableKVCache",
     layer_index_groups: "Sequence[Sequence[int]]",
@@ -226,8 +263,9 @@ def normalize_and_discover_per_layer_formats(
     model-wide one.
 
     Args:
-        kv_caches: The registered KV caches: a per-layer list, or a single fused
-            tensor for cross-layer formats.
+        kv_caches: The registered KV caches: a per-layer list (entries are
+            bare tensors or per-layer tuples), or a single fused tensor
+            for cross-layer formats.
         layer_index_groups: Layer indices of each engine group (one inner
             sequence per group). Empty means a single non-hybrid group.
         serving_engine: Which serving engine produced the caches.
@@ -251,18 +289,18 @@ def normalize_and_discover_per_layer_formats(
                 whole_normalized, whole_format
             )
 
-    # Per-layer list: re-detect per engine group, split by tensor shape so a group
-    # that mixes layouts gets the right format per layer.
+    # Per-layer list: re-detect per engine group, split by each layer's
+    # shape/dtype structure so a group that mixes layouts gets the
+    # right format per layer.
     groups = layer_index_groups or [range(len(kv_caches))]
+    structure_keys = get_shape_and_dtype(kv_caches)
     detected: dict[
         int, tuple[DiscoverableKVCache, "lmcache_native.EngineKVFormat"]
     ] = {}
     for indices in groups:
         layers_by_shape: dict[Hashable, list[int]] = {}
         for i in indices:
-            shape = getattr(kv_caches[i], "shape", None)
-            key = tuple(shape) if shape is not None else None
-            layers_by_shape.setdefault(key, []).append(i)
+            layers_by_shape.setdefault(structure_keys[i], []).append(i)
         for same_shape_indices in layers_by_shape.values():
             fmt, normalized = detect_format(
                 [kv_caches[i] for i in same_shape_indices],
@@ -366,6 +404,19 @@ def get_head_size(
     return get_spec(kv_caches, engine_kv_format).head_size(layer_idx)
 
 
+def get_kernel_head_size(
+    kv_caches: DiscoverableKVCache,
+    engine_kv_format: "lmcache_native.EngineKVFormat",
+    layer_idx: int = 0,
+) -> int:
+    """Return the head size in the transfer kernel's terms: the real per-head
+    width. Fused formats report the packed K+V content size (2 * head_size),
+    which the kernel halves back out when it splits a KV_2LTD buffer."""
+    spec = get_spec(kv_caches, engine_kv_format)
+    head_size = spec.head_size(layer_idx)
+    return head_size // 2 if getattr(spec, "is_fused_packed", False) else head_size
+
+
 def get_tokens_per_layer(
     kv_caches: DiscoverableKVCache, engine_kv_format: "lmcache_native.EngineKVFormat"
 ) -> int:
@@ -464,12 +515,12 @@ def assert_is_vllm_mla_or_flash_attn_or_flash_infer(
 def get_device(kv_caches: DiscoverableKVCache) -> torch.device:
     """Return the device of the KV cache tensors.
 
-    Descends into any list nesting until a tensor is found; assumes all
-    tensors in *kv_caches* live on the same device (true for every
+    Descends into any list or tuple nesting until a tensor is found; assumes
+    all tensors in *kv_caches* live on the same device (true for every
     current :class:`EngineKVFormat`).
     """
     probe: DiscoverableKVCache = kv_caches
-    while isinstance(probe, list):
+    while isinstance(probe, (list, tuple)):
         probe = probe[0]
     return probe.device
 
@@ -477,8 +528,11 @@ def get_device(kv_caches: DiscoverableKVCache) -> torch.device:
 # Formats whose per-layer tensor dim-0 is the *block* axis AND for
 # which we currently support dim-0 padding (e.g. DeepSeek V4
 # compressor / indexer caches sharing a KV pool with larger attn
-# groups). Today only the MLA layout (``NL_X_NB_BS_HS``, kv_size==1)
-# is exercised by real mixed-compression workloads.
+# groups).
+#
+# ``NL_X_NP_X_NB_BS_ONE_HS`` (vLLM-Ascend MLA/DSA plane tuples; NP
+# means num_planes, NP = 1 latent-only, 2 MLA, 3 DSA, HS possibly
+# differing per plane)
 #
 # ``NL_X_NB_TWO_BS_NH_HS`` *could* in principle also be the block
 # axis on dim-0, but no real serving engine emits a padded layout of
@@ -495,6 +549,12 @@ _BLOCK_AXIS_FORMATS: frozenset = frozenset(
     {
         lmcache_native.EngineKVFormat.NL_X_NB_BS_HS,
         lmcache_native.EngineKVFormat.NL_X_NB_BSV_BSS,
+        lmcache_native.EngineKVFormat.NL_X_NP_X_NB_BS_ONE_HS,
+        # Under vLLM's blocks-first layouts (BLHNC / BLNHC) these views'
+        # stride(0) spans every layer's bytes for the block; when the cache
+        # is layer-compact, stride(0) is simply the tight per-block step.
+        lmcache_native.EngineKVFormat.NL_X_NB_NH_BS_CS,
+        lmcache_native.EngineKVFormat.NL_X_NB_BS_NH_CS,
     }
 )
 
@@ -553,6 +613,8 @@ def resolve_block_stride_and_log_layout(
             return kv_caches
         if lmcache_native.is_kv_list(engine_kv_format):
             return kv_caches[0][layer_idx]  # type: ignore[index,return-value]
+        if lmcache_native.is_kv_second_tuple(engine_kv_format):
+            return kv_caches[layer_idx][0]  # type: ignore[index,return-value]
         return kv_caches[layer_idx]  # type: ignore[index,return-value]
 
     rep = _pick_layout_probe_tensor()

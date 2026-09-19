@@ -10,7 +10,9 @@ import torch
 
 # First Party
 from lmcache import torch_dev, torch_device_type
+from lmcache.logging import init_logger
 from lmcache.utils import _lmcache_nvtx_annotate
+from lmcache.v1 import memory_management
 from lmcache.v1.memory_allocators.paged_tensor_memory_allocator import (
     PagedTensorMemoryAllocator,
 )
@@ -20,6 +22,9 @@ from lmcache.v1.memory_management import (
     MemoryFormat,
     MemoryObj,
 )
+
+
+logger = init_logger(__name__)
 
 
 class GPUMemoryAllocator(MemoryAllocatorInterface):
@@ -40,7 +45,17 @@ class GPUMemoryAllocator(MemoryAllocatorInterface):
         if not torch_dev.is_available():
             device = "cpu"
 
-        self.tensor = torch.empty(size, dtype=torch.uint8, device=device)
+        # The buffer starts and ends on a host page boundary so it can be
+        # exported as a dma-buf (the driver refuses a range that is not page
+        # aligned).  Over-allocate by one page and slice to the first page
+        # boundary; the extra page is the cost of the guarantee.
+        page = 4096
+        aligned_size = (size + page - 1) // page * page
+        self._backing = torch.empty(
+            aligned_size + page, dtype=torch.uint8, device=device
+        )
+        start = (-self._backing.data_ptr()) % page
+        self.tensor = self._backing[start : start + aligned_size]
 
         self.allocator: MemoryAllocatorInterface
         if use_paging:
@@ -64,6 +79,10 @@ class GPUMemoryAllocator(MemoryAllocatorInterface):
             self.allocator = TensorMemoryAllocator(self.tensor, **kwargs)
 
         self.device_mem_lock = threading.Lock() if not use_paging else nullcontext()
+        # dma-buf regions of the GPU buffer, exported on first request; they let
+        # a raw_block backend register the paged buffers with its NVMe device so
+        # loads and stores DMA straight to device memory.
+        self._dmabuf_regions: Optional[list[tuple[int, int, int]]] = None
 
     @_lmcache_nvtx_annotate
     def allocate(
@@ -146,3 +165,39 @@ class GPUMemoryAllocator(MemoryAllocatorInterface):
 
     def __str__(self) -> str:
         return "GPUMemoryAllocator"
+
+    def get_paged_buffers(self) -> Optional[tuple[torch.Tensor, ...]]:
+        """Paged buffers for fixed-buffer registration, when paged."""
+        if isinstance(self.allocator, PagedTensorMemoryAllocator):
+            return self.allocator.get_paged_buffers()
+        return None
+
+    def get_paged_dmabuf_regions(self) -> Optional[list[tuple[int, int]]]:
+        """
+        For each paged buffer, the (dma-buf fd, mapped base) of the dma-buf
+        chunk of the GPU buffer that contains it, exporting the buffer on
+        first use.  None when not paged or when the device cannot export.
+        """
+        buffers = self.get_paged_buffers()
+        if not buffers:
+            return None
+        if self._dmabuf_regions is None:
+            try:
+                self._dmabuf_regions = memory_management.export_device_dmabufs(
+                    self.tensor
+                )
+            except Exception as exc:
+                logger.warning(
+                    "GPUMemoryAllocator: dma-buf export unavailable (%s); "
+                    "device-direct I/O disabled",
+                    exc,
+                )
+                self._dmabuf_regions = []
+        if not self._dmabuf_regions:
+            return None
+        regions = [
+            memory_management.get_dmabuf_region(buf.data_ptr()) for buf in buffers
+        ]
+        if any(r is None for r in regions):
+            return None
+        return regions  # type: ignore[return-value]

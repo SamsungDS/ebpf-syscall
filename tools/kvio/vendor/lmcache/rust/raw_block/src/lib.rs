@@ -15,12 +15,15 @@
 //!   submission/completion loop. All alignment checks are performed before
 //!   enqueuing; violations result in an immediate Python `ValueError`.
 
-use pyo3::exceptions::{PyMemoryError, PyOSError, PyRuntimeError, PyValueError};
+use pyo3::exceptions::{
+    PyDeprecationWarning, PyMemoryError, PyOSError, PyRuntimeError, PyValueError,
+};
 use pyo3::prelude::*;
 use pyo3::types::PyAny;
 use std::collections::HashMap;
 use std::ffi::CString;
 use std::io;
+use std::os::unix::io::AsRawFd;
 use std::os::unix::io::RawFd;
 use std::slice;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -206,6 +209,8 @@ fn parse_use_iouring(io_engine: Option<String>, use_iouring: bool) -> PyResult<b
 
 ///Per batch tracking for in flight I/O operation
 type BatchTracking = (Arc<AtomicU64>, Arc<Condvar>);
+type IoUringCompletionErrors = Vec<(usize, String)>;
+type IoUringBatchResults = (Vec<bool>, IoUringCompletionErrors);
 
 /// Round up to nearest multiple of alignment (required for O_DIRECT).
 #[allow(clippy::manual_div_ceil)]
@@ -544,34 +549,6 @@ fn placement_id_to_u16(pid: i32) -> PyResult<u16> {
     u16::try_from(pid).map_err(|_| PyValueError::new_err("placement_id must be in range 1..=65535"))
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn check_nvme_ioctl_result_accepts_success() {
-        assert!(check_nvme_ioctl_result(0, "NVMe ioctl failed").is_ok());
-    }
-
-    #[test]
-    fn check_nvme_ioctl_result_rejects_nvme_status() {
-        assert!(check_nvme_ioctl_result(1, "NVMe ioctl failed").is_err());
-    }
-
-    #[test]
-    fn placement_id_to_u16_accepts_valid_bounds() {
-        assert_eq!(placement_id_to_u16(1).unwrap(), 1);
-        assert_eq!(placement_id_to_u16(65535).unwrap(), 65535);
-    }
-
-    #[test]
-    fn placement_id_to_u16_rejects_reserved_and_out_of_range_values() {
-        assert!(placement_id_to_u16(0).is_err());
-        assert!(placement_id_to_u16(-1).is_err());
-        assert!(placement_id_to_u16(65536).is_err());
-    }
-}
-
 /// Prepare NVMe uring command for read/write operations
 #[allow(clippy::too_many_arguments)]
 fn nvme_uring_cmd_prep(
@@ -718,12 +695,39 @@ impl Drop for AlignedBuf {
     }
 }
 
-// Acquire a Python buffer view with the requested mutability.
-fn get_pybuffer<'py>(
+/// A borrowed view of the bytes behind a Python object.
+///
+/// Two kinds of object reach the engine: ordinary buffers (bytes, memoryview,
+/// CPU tensors) that implement the buffer protocol, and device tensors that
+/// do not, because their memory is not host-addressable in the buffer
+/// protocol sense.  A device tensor is accepted through the `data_ptr()` /
+/// `nbytes` interface torch exposes: the pointer is only ever used as an
+/// address the kernel resolves through a registered buffer (a dma-buf), never
+/// dereferenced here, so the bounce paths refuse it (see `fixed_dmabuf`).
+struct BufRef {
+    view: Option<pyo3::ffi::Py_buffer>,
+    ptr: *mut u8,
+    len: usize,
+    readonly: bool,
+}
+
+impl BufRef {
+    fn release(self) {
+        if let Some(mut view) = self.view {
+            // SAFETY: view was created by PyObject_GetBuffer.
+            unsafe { pyo3::ffi::PyBuffer_Release(&mut view) };
+        }
+    }
+}
+
+// Acquire the bytes behind `obj`: a buffer-protocol view with the requested
+// mutability, or, for an object without one that has `data_ptr()` and
+// `nbytes` (a torch tensor on any device), the address it reports.
+fn get_buffer<'py>(
     py: Python<'py>,
     obj: &Bound<'py, PyAny>,
     writable: bool,
-) -> Result<pyo3::ffi::Py_buffer, PyErr> {
+) -> Result<BufRef, PyErr> {
     // SAFETY: PyObject_GetBuffer follows CPython buffer protocol.
     unsafe {
         let mut view: pyo3::ffi::Py_buffer = std::mem::zeroed();
@@ -735,18 +739,33 @@ fn get_pybuffer<'py>(
             PYBUF_ANY_CONTIGUOUS
         };
         let rc = pyo3::ffi::PyObject_GetBuffer(obj.as_ptr(), &mut view, flags);
-        if rc != 0 {
-            return Err(PyErr::fetch(py));
+        if rc == 0 {
+            return Ok(BufRef {
+                ptr: view.buf as *mut u8,
+                len: view.len as usize,
+                readonly: view.readonly != 0,
+                view: Some(view),
+            });
         }
-        Ok(view)
-    }
-}
-
-// Release a buffer view previously acquired by get_pybuffer.
-fn release_pybuffer(mut view: pyo3::ffi::Py_buffer) {
-    // SAFETY: view was created by PyObject_GetBuffer.
-    unsafe {
-        pyo3::ffi::PyBuffer_Release(&mut view);
+        let err = PyErr::fetch(py);
+        if !obj.hasattr("data_ptr")? || !obj.hasattr("nbytes")? {
+            return Err(err);
+        }
+        if let Ok(is_contig) = obj.call_method0("is_contiguous") {
+            if !is_contig.extract::<bool>().unwrap_or(true) {
+                return Err(PyValueError::new_err(
+                    "tensor must be contiguous for raw block I/O",
+                ));
+            }
+        }
+        let ptr = obj.call_method0("data_ptr")?.extract::<usize>()?;
+        let len = obj.getattr("nbytes")?.extract::<usize>()?;
+        Ok(BufRef {
+            view: None,
+            ptr: ptr as *mut u8,
+            len,
+            readonly: false,
+        })
     }
 }
 
@@ -792,6 +811,28 @@ impl IoCompletion {
         }
         guard.take().unwrap()
     }
+}
+
+// Convert a batch's completion objects into a success bitmap and sparse errors.
+fn collect_iouring_completion_results(
+    completions: Option<Vec<Arc<IoCompletion>>>,
+) -> IoUringBatchResults {
+    let Some(completions) = completions else {
+        return (Vec::new(), Vec::new());
+    };
+
+    let mut results = Vec::with_capacity(completions.len());
+    let mut errors = Vec::new();
+    for (operation_index, completion) in completions.iter().enumerate() {
+        match completion.wait() {
+            Ok(()) => results.push(true),
+            Err(error) => {
+                results.push(false);
+                errors.push((operation_index, error.to_string()));
+            }
+        }
+    }
+    (results, errors)
 }
 
 /// Manages io_uring worker thread notification, using one `epoll` instance
@@ -989,6 +1030,9 @@ struct IoSubmission {
     is_write: bool,
     completion: Arc<IoCompletion>,
     fixed_buffer_idx: Option<u16>,
+    // The fixed buffer is a dma-buf registration: the SQE carries this byte
+    // offset into the registered dma-buf instead of a user address.
+    fixed_dmabuf: Option<usize>,
     bounce: Option<std::sync::Arc<AlignedBuf>>,
     original_ptr: Option<usize>,        // For bounce buffer reads
     payload_len: Option<usize>,         // For bounce buffer reads
@@ -1006,6 +1050,7 @@ impl Default for IoSubmission {
             is_write: false,
             completion: Arc::new(IoCompletion::new()),
             fixed_buffer_idx: None,
+            fixed_dmabuf: None,
             bounce: None,
             original_ptr: None,
             payload_len: None,
@@ -1013,6 +1058,78 @@ impl Default for IoSubmission {
             nvme_cmd_data: None,
         }
     }
+}
+
+/// io_uring extended buffer update, as introduced by the dma-buf backed
+/// registered buffers series: `struct io_uring_rsrc_update2` gained a flags
+/// word (IORING_RSRC_UPDATE_EXTENDED) and `data` then points at an array of
+/// `struct io_uring_regbuf_desc` instead of iovecs.  The io-uring crate does
+/// not expose this yet, so the structures are spelled out here.
+#[repr(C)]
+struct IoUringRsrcUpdate2 {
+    offset: u32,
+    flags: u32,
+    data: u64,
+    tags: u64,
+    nr: u32,
+    resv2: u32,
+}
+
+#[repr(C)]
+struct IoUringRegbufDesc {
+    type_: u32,
+    flags: u32,
+    size: u64,
+    uaddr: u64,
+    dmabuf_fd: i32,
+    target_fd: i32,
+    resv: [u64; 6],
+}
+
+const IORING_REGISTER_BUFFERS_UPDATE: libc::c_uint = 16;
+const IORING_RSRC_UPDATE_EXTENDED: u32 = 1 << 1;
+const IO_REGBUF_TYPE_DMABUF: u32 = 2;
+
+/// Install `dmabuf_fd`, mapped for I/O on `target_fd`, into sparse
+/// registered-buffer slot `index` of ring `ring_fd`.
+fn io_uring_register_dmabuf(
+    ring_fd: RawFd,
+    index: u32,
+    dmabuf_fd: i32,
+    target_fd: RawFd,
+) -> io::Result<()> {
+    let desc = IoUringRegbufDesc {
+        type_: IO_REGBUF_TYPE_DMABUF,
+        flags: 0,
+        size: 0,
+        uaddr: 0,
+        dmabuf_fd,
+        target_fd,
+        resv: [0; 6],
+    };
+    let up = IoUringRsrcUpdate2 {
+        offset: index,
+        flags: IORING_RSRC_UPDATE_EXTENDED,
+        data: &desc as *const IoUringRegbufDesc as u64,
+        tags: 0,
+        nr: 1,
+        resv2: 0,
+    };
+    // For the *_UPDATE register ops the last argument is the size of the
+    // update structure, not a count; the count is up.nr.
+    let ret = unsafe {
+        libc::syscall(
+            libc::SYS_io_uring_register,
+            ring_fd as libc::c_long,
+            IORING_REGISTER_BUFFERS_UPDATE as libc::c_long,
+            &up as *const IoUringRsrcUpdate2 as libc::c_long,
+            std::mem::size_of::<IoUringRsrcUpdate2>() as libc::c_long,
+        )
+    };
+    if ret < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 /// Raw block device I/O interface for Python.
@@ -1044,7 +1161,11 @@ struct RawBlockDevice {
     shutdown: Option<Arc<AtomicBool>>,
     // Map from buffer pointer address to registered fixed buffer index
     // Used for zero-copy I/O with pre-registered buffers
-    fixed_buffer_map: Arc<Mutex<HashMap<usize, (u16, usize)>>>,
+    // The tuple is (index, size, dmabuf_offset): dmabuf_offset is Some for a
+    // buffer registered through register_fixed_dmabufs(), and is the byte
+    // offset of this buffer inside the registered dma-buf, which the SQE
+    // carries in place of a user address.
+    fixed_buffer_map: Arc<Mutex<HashMap<usize, (u16, usize, Option<usize>)>>>,
     // Flag indicating if fixed buffers have been registered
     fixed_buffers_registered: Arc<AtomicBool>,
     // Count of currently in-flight I/O operations (global)
@@ -1414,7 +1535,10 @@ impl RawBlockDevice {
                     let mut uring_cmd =
                         opcode::UringCmd80::new(Fd(sub.fd), NVME_URING_CMD_IO).cmd(cmd_bytes);
 
-                    // Set buf_index if using fixed buffers
+                    // Set buf_index if using fixed buffers.  A dma-buf
+                    // registration cannot be imported by a passthrough command
+                    // (io_uring_cmd_import_fixed() has no dma-buf support), so
+                    // register_fixed_dmabufs() refuses use_uring_cmd engines.
                     if let Some(idx) = sub.fixed_buffer_idx {
                         uring_cmd = uring_cmd.buf_index(Some(idx));
                     }
@@ -1439,11 +1563,18 @@ impl RawBlockDevice {
                     }
                 } else {
                     // Regular read/write operations
+                    // A dma-buf registered buffer has no user address in the
+                    // kernel's eyes: the SQE address is the byte offset of
+                    // this buffer inside the registered dma-buf.
+                    let fixed_addr: *mut u8 = match sub.fixed_dmabuf {
+                        Some(off) => off as *mut u8,
+                        None => ptr,
+                    };
                     let sqe = if sub.is_write {
                         if let Some(idx) = sub.fixed_buffer_idx {
                             opcode::WriteFixed::new(
                                 Fd(sub.fd),
-                                ptr as *const u8,
+                                fixed_addr as *const u8,
                                 sub.len as u32,
                                 idx,
                             )
@@ -1455,7 +1586,7 @@ impl RawBlockDevice {
                                 .build()
                         }
                     } else if let Some(idx) = sub.fixed_buffer_idx {
-                        opcode::ReadFixed::new(Fd(sub.fd), ptr, sub.len as u32, idx)
+                        opcode::ReadFixed::new(Fd(sub.fd), fixed_addr, sub.len as u32, idx)
                             .offset(sub.offset)
                             .build()
                     } else {
@@ -2105,7 +2236,7 @@ impl RawBlockDevice {
             let mut map = self.fixed_buffer_map.lock().unwrap();
             map.clear();
             for (idx, (ptr, size)) in buffer_ptrs.iter().zip(buffer_sizes.iter()).enumerate() {
-                map.insert(*ptr, (idx as u16, *size));
+                map.insert(*ptr, (idx as u16, *size, None));
             }
         }
 
@@ -2144,12 +2275,145 @@ impl RawBlockDevice {
         Ok(())
     }
 
+    /// Register staging buffers as dma-buf backed fixed buffers.
+    ///
+    /// Each buffer is described by its user address (the key the I/O paths
+    /// look up, exactly as for `register_fixed_buffers`), its size, the
+    /// dma-buf file descriptor that exports the memory it lives in (a
+    /// udmabuf over the buffer's memfd, or the dma-buf system heap
+    /// allocation it was mmap()ed from), and the user address at which that
+    /// dma-buf is mapped.  Many buffers may share one dma-buf: the allocator's
+    /// paged buffers are slices of one big mapping.  Each distinct dma-buf
+    /// takes one registered-buffer slot; each buffer records its byte offset
+    /// inside its dma-buf, which the SQE then carries in place of a user
+    /// address.
+    ///
+    /// The dma-buf is registered against this device's fd, so the kernel maps
+    /// it to the device once, here, and every fixed read or write against it
+    /// is issued from that mapping: no DMA mapping per command, and a command
+    /// size bounded by the device's dma-buf ceiling (its MDTS on nvme-pci)
+    /// rather than the per-command mapping clamp.
+    ///
+    /// Requires a kernel with dma-buf backed registered buffers (the
+    /// io_uring extended buffer update).  On an older kernel the update
+    /// fails with EINVAL; the caller should fall back to
+    /// `register_fixed_buffers`.  Refused on a `use_uring_cmd` engine: NVMe
+    /// passthrough cannot import a dma-buf registration.
+    #[pyo3(signature = (buffer_ptrs, buffer_sizes, dmabuf_fds, dmabuf_bases))]
+    fn register_fixed_dmabufs(
+        &self,
+        buffer_ptrs: Vec<usize>,
+        buffer_sizes: Vec<usize>,
+        dmabuf_fds: Vec<i32>,
+        dmabuf_bases: Vec<usize>,
+    ) -> PyResult<()> {
+        if !self.use_iouring {
+            return Err(PyRuntimeError::new_err("io_uring not enabled"));
+        }
+        if self.use_uring_cmd {
+            return Err(PyRuntimeError::new_err(
+                "dma-buf fixed buffers are not supported with use_uring_cmd",
+            ));
+        }
+        let n = buffer_ptrs.len();
+        if n == 0 {
+            return Err(PyValueError::new_err(
+                "at least one buffer must be provided",
+            ));
+        }
+        if buffer_sizes.len() != n || dmabuf_fds.len() != n || dmabuf_bases.len() != n {
+            return Err(PyValueError::new_err(
+                "buffer_ptrs, buffer_sizes, dmabuf_fds and dmabuf_bases must have same length",
+            ));
+        }
+        for i in 0..n {
+            if buffer_ptrs[i] < dmabuf_bases[i] {
+                return Err(PyValueError::new_err(format!(
+                    "buffer {} lies below its dma-buf base",
+                    i
+                )));
+            }
+        }
+
+        // One slot per distinct dma-buf, in first-seen order.
+        let mut slot_of_fd: HashMap<i32, u16> = HashMap::new();
+        let mut fds_in_order: Vec<i32> = Vec::new();
+        for fd in dmabuf_fds.iter() {
+            if !slot_of_fd.contains_key(fd) {
+                if fds_in_order.len() >= u16::MAX as usize {
+                    return Err(PyValueError::new_err("too many dma-bufs"));
+                }
+                slot_of_fd.insert(*fd, fds_in_order.len() as u16);
+                fds_in_order.push(*fd);
+            }
+        }
+
+        let ring = match &self.ring {
+            Some(ring) => ring,
+            None => return Err(PyRuntimeError::new_err("io_uring ring not available")),
+        };
+        let ring_fd = match ring {
+            IoUringWrapper::Standard(ring) => ring.lock().unwrap().as_raw_fd(),
+            IoUringWrapper::Big(ring) => ring.lock().unwrap().as_raw_fd(),
+        };
+
+        // A sparse table of the right size, then one extended update per slot.
+        let sparse = match ring {
+            IoUringWrapper::Standard(ring) => {
+                ring.lock().unwrap().submitter().register_buffers_sparse(fds_in_order.len() as u32)
+            }
+            IoUringWrapper::Big(ring) => {
+                ring.lock().unwrap().submitter().register_buffers_sparse(fds_in_order.len() as u32)
+            }
+        };
+        if let Err(e) = sparse {
+            return Err(PyRuntimeError::new_err(format!(
+                "register_buffers_sparse failed: {}",
+                e
+            )));
+        }
+
+        for (idx, fd) in fds_in_order.iter().enumerate() {
+            if let Err(e) = io_uring_register_dmabuf(ring_fd, idx as u32, *fd, self.fd) {
+                // Leave no half-registered table behind.
+                let _ = match ring {
+                    IoUringWrapper::Standard(ring) => {
+                        ring.lock().unwrap().submitter().unregister_buffers()
+                    }
+                    IoUringWrapper::Big(ring) => {
+                        ring.lock().unwrap().submitter().unregister_buffers()
+                    }
+                };
+                return Err(PyRuntimeError::new_err(format!(
+                    "dma-buf registration of slot {} (fd {}) failed: {}",
+                    idx, fd, e
+                )));
+            }
+        }
+
+        {
+            let mut map = self.fixed_buffer_map.lock().unwrap();
+            map.clear();
+            for i in 0..n {
+                let slot = slot_of_fd[&dmabuf_fds[i]];
+                map.insert(
+                    buffer_ptrs[i],
+                    (slot, buffer_sizes[i], Some(buffer_ptrs[i] - dmabuf_bases[i])),
+                );
+            }
+        }
+        self.fixed_buffers_registered.store(true, Ordering::Relaxed);
+        Ok(())
+    }
+
     /// Batched write: submit multiple writes at once via io_uring.
     /// All writes are queued to the worker thread, which processes them
     /// in batches to maximize throughput.
     ///
-    /// Returns a batch_id that must be passed to wait_iouring() to wait
-    /// for completions for that batch.
+    /// Returns a batch ID that must be passed to `wait_iouring()` to wait for
+    /// completion and obtain a success bitmap plus sparse completion errors.
+    /// Validation or request-preparation errors are raised instead of returning
+    /// a batch ID.
     #[pyo3(signature = (offsets, buffers, total_lens, placement_ids = None))]
     fn batched_write(
         &self,
@@ -2188,14 +2452,14 @@ impl RawBlockDevice {
         };
 
         // Acquire buffer views to keep them alive until wait_iouring() completes
-        let mut views = Vec::with_capacity(n);
+        let mut views: Vec<BufRef> = Vec::with_capacity(n);
         for buffer in &buffers {
-            let view = get_pybuffer(py, buffer, false)?;
-            if view.buf.is_null() {
+            let view = get_buffer(py, buffer, false)?;
+            if view.ptr.is_null() {
                 for v in views {
-                    release_pybuffer(v);
+                    v.release();
                 }
-                release_pybuffer(view);
+                view.release();
                 return Err(PyValueError::new_err("null buffer pointer"));
             }
             views.push(view);
@@ -2225,11 +2489,11 @@ impl RawBlockDevice {
         // Extract pointers as usize before releasing GIL (raw pointers are not Send)
         let mut ptrs = Vec::with_capacity(n);
         for view in &views {
-            ptrs.push(view.buf as usize);
+            ptrs.push(view.ptr as usize);
         }
 
         for view in views {
-            release_pybuffer(view);
+            view.release();
         }
 
         let fd = self.fd;
@@ -2238,7 +2502,7 @@ impl RawBlockDevice {
         let use_uring_cmd = self.use_uring_cmd;
         let fixed_buffers_registered = self.fixed_buffers_registered.load(Ordering::Relaxed);
         // Clone the fixed buffer map before releasing GIL to avoid lock contention
-        let fixed_buffer_map: HashMap<usize, (u16, usize)> = if fixed_buffers_registered {
+        let fixed_buffer_map: HashMap<usize, (u16, usize, Option<usize>)> = if fixed_buffers_registered {
             let map = self.fixed_buffer_map.lock().unwrap();
             map.clone()
         } else {
@@ -2278,7 +2542,10 @@ impl RawBlockDevice {
                 let comp = Arc::new(IoCompletion::new());
 
                 // Fixed buffers are pre-registered with io_uring, enabling true zero-copy I/O
-                let fixed_idx = fixed_buffer_map.get(&ptrs[i]).map(|(idx, _)| *idx);
+                let (fixed_idx, fixed_dmabuf) = match fixed_buffer_map.get(&ptrs[i]) {
+                    Some((idx, _, d)) => (Some(*idx), *d),
+                    None => (None, None),
+                };
 
                 if use_odirect {
                     #[allow(clippy::manual_is_multiple_of)]
@@ -2292,10 +2559,15 @@ impl RawBlockDevice {
                 }
 
                 // Misaligned pointer is handled via bounce buffer for writes
-                let (final_ptr, bounce_opt, fixed_idx) = if use_odirect {
+                let (final_ptr, bounce_opt, fixed_idx, fixed_dmabuf) = if use_odirect {
                     let align = alignment;
                     #[allow(clippy::manual_is_multiple_of)]
                     if ptrs[i] % align != 0 {
+                        if fixed_dmabuf.is_some() {
+                            return Err(PyValueError::new_err(
+                                "dma-buf registered buffer must be aligned",
+                            ));
+                        }
                         let bounce = AlignedBuf::new(total_len, align)?;
                         unsafe {
                             libc::memcpy(
@@ -2306,12 +2578,12 @@ impl RawBlockDevice {
                         }
                         let bounce_arc = std::sync::Arc::new(bounce);
                         let bounce_ptr = bounce_arc.as_ptr();
-                        (bounce_ptr, Some(bounce_arc), None)
+                        (bounce_ptr, Some(bounce_arc), None, None)
                     } else {
-                        (ptr, None, fixed_idx)
+                        (ptr, None, fixed_idx, fixed_dmabuf)
                     }
                 } else {
-                    (ptr, None, fixed_idx)
+                    (ptr, None, fixed_idx, fixed_dmabuf)
                 };
 
                 // Build NVMe command data
@@ -2339,6 +2611,7 @@ impl RawBlockDevice {
                     is_write: true,
                     completion: comp.clone(),
                     fixed_buffer_idx: fixed_idx,
+                    fixed_dmabuf,
                     bounce: bounce_opt,
                     original_ptr: None,
                     payload_len: None,
@@ -2405,12 +2678,16 @@ impl RawBlockDevice {
     ///     batch_id: The batch ID returned by batched_write() or batched_read().
     ///               Only completions from this batch are checked.
     ///
-    /// Returns an error if any I/O operation in this batch failed. The error message
-    /// includes details about the first failure encountered.
+    /// Returns a success bitmap aligned with the operations submitted in this
+    /// batch and a sparse list of `(operation_index, error_message)` entries.
+    /// `batched_read()` and `batched_write()` can raise validation or
+    /// request-preparation errors instead of returning a batch ID. After a
+    /// batch ID is returned, I/O completion failures are reported in both
+    /// returned collections.
     #[pyo3(signature = (batch_id))]
-    fn wait_iouring(&self, py: Python<'_>, batch_id: u64) -> PyResult<()> {
+    fn wait_iouring(&self, py: Python<'_>, batch_id: u64) -> PyResult<IoUringBatchResults> {
         if !self.use_iouring {
-            return Ok(());
+            return Ok((Vec::new(), Vec::new()));
         }
 
         // Get the per-batch tracking for this batch
@@ -2423,24 +2700,12 @@ impl RawBlockDevice {
                     // Check if there are any completions for this batch
                     let mut completions = self.batched_completions.lock().unwrap();
                     let batch_completions = completions.remove(&batch_id);
-                    let mut first_error: Option<PyErr> = None;
-                    if let Some(comp_vec) = batch_completions {
-                        for comp in comp_vec.iter() {
-                            if let Err(e) = comp.wait() {
-                                if first_error.is_none() {
-                                    first_error = Some(e);
-                                }
-                            }
-                        }
-                    }
+                    drop(completions);
+                    let results = collect_iouring_completion_results(batch_completions);
                     // Clear stored buffer objects for this batch
                     let mut stored_objs = self.batched_buffer_objs.lock().unwrap();
                     stored_objs.remove(&batch_id);
-                    return if let Some(e) = first_error {
-                        Err(e)
-                    } else {
-                        Ok(())
-                    };
+                    return Ok(results);
                 }
             }
         };
@@ -2460,16 +2725,8 @@ impl RawBlockDevice {
         // Check all completion results for errors for this specific batch
         let mut completions = self.batched_completions.lock().unwrap();
         let batch_completions = completions.remove(&batch_id);
-        let mut first_error: Option<PyErr> = None;
-        if let Some(comp_vec) = batch_completions {
-            for comp in comp_vec.iter() {
-                if let Err(e) = comp.wait() {
-                    if first_error.is_none() {
-                        first_error = Some(e);
-                    }
-                }
-            }
-        }
+        drop(completions);
+        let results = collect_iouring_completion_results(batch_completions);
 
         // Clear stored buffer objects for this batch now that I/O is complete
         let mut stored_objs = self.batched_buffer_objs.lock().unwrap();
@@ -2479,14 +2736,12 @@ impl RawBlockDevice {
         let mut batch_map = self.batch_in_flight.lock().unwrap();
         batch_map.remove(&batch_id);
 
-        if let Some(e) = first_error {
-            Err(e)
-        } else {
-            Ok(())
-        }
+        Ok(results)
     }
 
     /// Synchronous read using io_uring.
+    ///
+    /// Deprecated: use ``batched_read()`` followed by ``wait_iouring()`` instead.
     #[pyo3(signature = (offset, data, payload_len, total_len = None))]
     fn read_uring(
         &self,
@@ -2496,6 +2751,14 @@ impl RawBlockDevice {
         payload_len: usize,
         total_len: Option<usize>,
     ) -> PyResult<()> {
+        PyErr::warn(
+            py,
+            &py.get_type::<PyDeprecationWarning>(),
+            c"RawBlockDevice.read_uring() is deprecated; \
+              use batched_read() followed by wait_iouring() instead.",
+            1,
+        )?;
+
         if !self.use_iouring {
             return Err(PyRuntimeError::new_err("io_uring not enabled"));
         }
@@ -2503,27 +2766,27 @@ impl RawBlockDevice {
             return Err(PyRuntimeError::new_err("device is closed"));
         }
 
-        let view = get_pybuffer(py, data, true)?;
-        if view.readonly != 0 {
-            release_pybuffer(view);
+        let view = get_buffer(py, data, true)?;
+        if view.readonly {
+            view.release();
             return Err(PyValueError::new_err("output buffer is readonly"));
         }
-        let ptr = view.buf as *mut u8;
+        let ptr = view.ptr;
         if ptr.is_null() {
-            release_pybuffer(view);
+            view.release();
             return Err(PyValueError::new_err("null buffer pointer"));
         }
 
-        let cap = view.len as usize;
+        let cap = view.len;
         let total_len = total_len.unwrap_or(payload_len);
         if cap < payload_len {
-            release_pybuffer(view);
+            view.release();
             return Err(PyValueError::new_err(format!(
                 "output buffer too small: cap={cap} need={payload_len}"
             )));
         }
         if total_len < payload_len {
-            release_pybuffer(view);
+            view.release();
             return Err(PyValueError::new_err("total_len must be >= payload_len"));
         }
 
@@ -2531,12 +2794,12 @@ impl RawBlockDevice {
         if self.use_odirect {
             #[allow(clippy::manual_is_multiple_of)]
             if (offset as usize) % align != 0 {
-                release_pybuffer(view);
+                view.release();
                 return Err(PyValueError::new_err("O_DIRECT requires aligned offset"));
             }
             #[allow(clippy::manual_is_multiple_of)]
             if total_len % align != 0 {
-                release_pybuffer(view);
+                view.release();
                 return Err(PyValueError::new_err("O_DIRECT requires aligned total_len"));
             }
         }
@@ -2552,18 +2815,29 @@ impl RawBlockDevice {
 
         // Fixed buffers are pre-registered with io_uring, enabling true zero-copy I/O
         let use_fixed = self.fixed_buffers_registered.load(Ordering::Relaxed);
-        let fixed_idx = if use_fixed && ptr_aligned {
+        let (fixed_idx, fixed_dmabuf) = if use_fixed && ptr_aligned {
             let map = self.fixed_buffer_map.lock().unwrap();
             let ptr_addr = ptr as usize;
-            map.get(&ptr_addr).map(|(idx, _)| *idx)
+            match map.get(&ptr_addr) {
+                Some((idx, _, d)) => (Some(*idx), *d),
+                None => (None, None),
+            }
         } else {
-            None
+            (None, None)
         };
 
         // Use bounce buffer if:
         // Buffer is not aligned (O_DIRECT or io_uring_cmd PRP requirement)
         // Buffer capacity is less than total_len
         let use_bounce = !ptr_aligned || cap < total_len;
+        // A dma-buf registered buffer may be device memory the CPU cannot
+        // touch: it is never bounced.  Misalignment or a short buffer is an
+        // error for it, not a copy.
+        if fixed_dmabuf.is_some() && use_bounce {
+            return Err(PyValueError::new_err(
+                "dma-buf registered buffer must be aligned and at least total_len bytes",
+            ));
+        }
 
         let res = if !use_bounce {
             self.in_flight_count.fetch_add(1, Ordering::Relaxed);
@@ -2576,6 +2850,7 @@ impl RawBlockDevice {
                 is_write: false,
                 completion: comp.clone(),
                 fixed_buffer_idx: fixed_idx,
+                fixed_dmabuf,
                 bounce: None,
                 original_ptr: None,
                 payload_len: None,
@@ -2605,6 +2880,7 @@ impl RawBlockDevice {
                 is_write: false,
                 completion: comp.clone(),
                 fixed_buffer_idx: None,
+                fixed_dmabuf: None,
                 bounce: Some(bounce_arc),
                 original_ptr: Some(ptr as usize),
                 payload_len: Some(payload_len),
@@ -2622,7 +2898,7 @@ impl RawBlockDevice {
             py.allow_threads(move || comp.wait())
         };
 
-        release_pybuffer(view);
+        view.release();
         res?;
         Ok(())
     }
@@ -2645,23 +2921,23 @@ impl RawBlockDevice {
             return Err(PyRuntimeError::new_err("device is closed"));
         }
 
-        let view = get_pybuffer(py, data, false)?;
-        let ptr = view.buf as *const u8;
+        let view = get_buffer(py, data, false)?;
+        let ptr = view.ptr as *const u8;
         if ptr.is_null() {
-            release_pybuffer(view);
+            view.release();
             return Err(PyValueError::new_err("null buffer pointer"));
         }
 
-        let cap = view.len as usize;
+        let cap = view.len;
         let total_len = total_len.unwrap_or(payload_len);
         if cap < payload_len {
-            release_pybuffer(view);
+            view.release();
             return Err(PyValueError::new_err(format!(
                 "input buffer too small: cap={cap} need={payload_len}"
             )));
         }
         if total_len < payload_len {
-            release_pybuffer(view);
+            view.release();
             return Err(PyValueError::new_err("total_len must be >= payload_len"));
         }
 
@@ -2669,12 +2945,12 @@ impl RawBlockDevice {
         if self.use_odirect {
             #[allow(clippy::manual_is_multiple_of)]
             if (offset as usize) % align != 0 {
-                release_pybuffer(view);
+                view.release();
                 return Err(PyValueError::new_err("O_DIRECT requires aligned offset"));
             }
             #[allow(clippy::manual_is_multiple_of)]
             if total_len % align != 0 {
-                release_pybuffer(view);
+                view.release();
                 return Err(PyValueError::new_err("O_DIRECT requires aligned total_len"));
             }
         }
@@ -2688,12 +2964,15 @@ impl RawBlockDevice {
 
         // Fixed buffers are pre-registered with io_uring, enabling true zero-copy I/O
         let use_fixed = self.fixed_buffers_registered.load(Ordering::Relaxed);
-        let fixed_idx = if use_fixed && ptr_aligned {
+        let (fixed_idx, fixed_dmabuf) = if use_fixed && ptr_aligned {
             let map = self.fixed_buffer_map.lock().unwrap();
             let ptr_addr = ptr as usize;
-            map.get(&ptr_addr).map(|(idx, _)| *idx)
+            match map.get(&ptr_addr) {
+                Some((idx, _, d)) => (Some(*idx), *d),
+                None => (None, None),
+            }
         } else {
-            None
+            (None, None)
         };
 
         let placement_id_u16 = placement_id.map(placement_id_to_u16).transpose()?;
@@ -2702,6 +2981,14 @@ impl RawBlockDevice {
         // Buffer is not aligned (O_DIRECT requirement)
         // Buffer capacity is less than total_len
         let use_bounce = !ptr_aligned || cap < total_len;
+        // A dma-buf registered buffer may be device memory the CPU cannot
+        // touch: it is never bounced.  Misalignment or a short buffer is an
+        // error for it, not a copy.
+        if fixed_dmabuf.is_some() && use_bounce {
+            return Err(PyValueError::new_err(
+                "dma-buf registered buffer must be aligned and at least total_len bytes",
+            ));
+        }
 
         let res = if !use_bounce {
             self.in_flight_count.fetch_add(1, Ordering::Relaxed);
@@ -2714,6 +3001,7 @@ impl RawBlockDevice {
                 is_write: true,
                 completion: comp.clone(),
                 fixed_buffer_idx: fixed_idx,
+                fixed_dmabuf,
                 bounce: None,
                 original_ptr: None,
                 payload_len: None,
@@ -2750,6 +3038,7 @@ impl RawBlockDevice {
                 is_write: true,
                 completion: comp.clone(),
                 fixed_buffer_idx: None,
+                fixed_dmabuf: None,
                 bounce: Some(bounce_arc),
                 original_ptr: None,
                 payload_len: Some(payload_len),
@@ -2770,7 +3059,7 @@ impl RawBlockDevice {
             py.allow_threads(move || comp.wait())
         };
 
-        release_pybuffer(view);
+        view.release();
         res?;
         Ok(())
     }
@@ -2779,8 +3068,10 @@ impl RawBlockDevice {
     /// All reads are queued to the worker thread, which processes them
     /// in batches to maximize throughput.
     ///
-    /// Returns a batch_id that must be passed to wait_iouring() to wait
-    /// for completions for that batch
+    /// Returns a batch ID that must be passed to `wait_iouring()` to wait for
+    /// completion and obtain a success bitmap plus sparse completion errors.
+    /// Validation or request-preparation errors are raised instead of returning
+    /// a batch ID.
     #[pyo3(signature = (offsets, buffers, total_lens))]
     fn batched_read(
         &self,
@@ -2806,25 +3097,25 @@ impl RawBlockDevice {
         }
 
         // Acquire buffer views to keep them alive until wait_iouring() completes
-        let mut views = Vec::with_capacity(n);
+        let mut views: Vec<BufRef> = Vec::with_capacity(n);
         let mut caps = Vec::with_capacity(n);
         for buffer in &buffers {
-            let view = get_pybuffer(py, buffer, true)?;
-            if view.readonly != 0 {
+            let view = get_buffer(py, buffer, true)?;
+            if view.readonly {
                 for v in views {
-                    release_pybuffer(v);
+                    v.release();
                 }
-                release_pybuffer(view);
+                view.release();
                 return Err(PyValueError::new_err("output buffer is readonly"));
             }
-            if view.buf.is_null() {
+            if view.ptr.is_null() {
                 for v in views {
-                    release_pybuffer(v);
+                    v.release();
                 }
-                release_pybuffer(view);
+                view.release();
                 return Err(PyValueError::new_err("null buffer pointer"));
             }
-            caps.push(view.len as usize);
+            caps.push(view.len);
             views.push(view);
         }
 
@@ -2852,11 +3143,11 @@ impl RawBlockDevice {
         // Extract pointers as usize before releasing GIL (raw pointers are not Send)
         let mut ptrs = Vec::with_capacity(n);
         for view in &views {
-            ptrs.push(view.buf as usize);
+            ptrs.push(view.ptr as usize);
         }
 
         for view in views {
-            release_pybuffer(view);
+            view.release();
         }
 
         let fd = self.fd;
@@ -2865,7 +3156,7 @@ impl RawBlockDevice {
         let alignment = self.alignment;
         let fixed_buffers_registered = self.fixed_buffers_registered.load(Ordering::Relaxed);
         // Clone the fixed buffer map before releasing GIL to avoid lock contention
-        let fixed_buffer_map: HashMap<usize, (u16, usize)> = if fixed_buffers_registered {
+        let fixed_buffer_map: HashMap<usize, (u16, usize, Option<usize>)> = if fixed_buffers_registered {
             let map = self.fixed_buffer_map.lock().unwrap();
             map.clone()
         } else {
@@ -2920,10 +3211,15 @@ impl RawBlockDevice {
                     true
                 };
                 let use_bounce = !ptr_aligned || cap < total_len;
+                if use_bounce && fixed_buffer_map.get(&ptrs[i]).is_some_and(|(_, _, d)| d.is_some()) {
+                    return Err(PyValueError::new_err(
+                        "dma-buf registered buffer must be aligned and at least total_len bytes",
+                    ));
+                }
 
                 let comp = Arc::new(IoCompletion::new());
 
-                let (ptr_addr, fixed_idx, bounce_opt, original_ptr_opt, payload_len_opt) =
+                let (ptr_addr, fixed_idx, fixed_dmabuf, bounce_opt, original_ptr_opt, payload_len_opt) =
                     if use_bounce {
                         let bounce = AlignedBuf::new(total_len, alignment)?;
                         let bounce_arc = Arc::new(bounce);
@@ -2933,6 +3229,7 @@ impl RawBlockDevice {
                         (
                             bounce_ptr,
                             None,
+                            None,
                             Some(bounce_arc),
                             Some(ptrs[i]),
                             Some(payload_len),
@@ -2940,8 +3237,12 @@ impl RawBlockDevice {
                     } else {
                         // Fixed buffers are pre-registered with io_uring,
                         // enabling true zero-copy I/O.
-                        let fixed_idx = fixed_buffer_map.get(&ptrs[i]).map(|(idx, _)| *idx);
-                        (ptrs[i], fixed_idx, None, None, None)
+                        let (fixed_idx, fixed_dmabuf) =
+                            match fixed_buffer_map.get(&ptrs[i]) {
+                                Some((idx, _, d)) => (Some(*idx), *d),
+                                None => (None, None),
+                            };
+                        (ptrs[i], fixed_idx, fixed_dmabuf, None, None, None)
                     };
 
                 let sub = IoSubmission {
@@ -2952,6 +3253,7 @@ impl RawBlockDevice {
                     is_write: false, // read operation
                     completion: comp.clone(),
                     fixed_buffer_idx: fixed_idx,
+                    fixed_dmabuf,
                     bounce: bounce_opt,
                     original_ptr: original_ptr_opt,
                     payload_len: payload_len_opt,
@@ -3028,11 +3330,11 @@ impl RawBlockDevice {
         }
         let fd = self.fd;
 
-        let view = get_pybuffer(py, data, false)?;
-        let ptr = view.buf as *const u8;
-        let buf_len = view.len as usize;
+        let view = get_buffer(py, data, false)?;
+        let ptr = view.ptr as *const u8;
+        let buf_len = view.len;
         if ptr.is_null() {
-            release_pybuffer(view);
+            view.release();
             return Err(PyValueError::new_err("null buffer pointer"));
         }
 
@@ -3041,12 +3343,12 @@ impl RawBlockDevice {
         // Example: payload=4100, align=4096 -> total_len=8192.
         let payload_len = payload_len.unwrap_or(buf_len);
         if payload_len > buf_len {
-            release_pybuffer(view);
+            view.release();
             return Err(PyValueError::new_err("payload_len exceeds buffer length"));
         }
         let total_len = total_len.unwrap_or(payload_len);
         if total_len < payload_len {
-            release_pybuffer(view);
+            view.release();
             return Err(PyValueError::new_err("total_len must be >= payload_len"));
         }
 
@@ -3054,12 +3356,12 @@ impl RawBlockDevice {
         if self.use_odirect {
             #[allow(clippy::manual_is_multiple_of)]
             if (offset as usize) % align != 0 {
-                release_pybuffer(view);
+                view.release();
                 return Err(PyValueError::new_err("O_DIRECT requires aligned offset"));
             }
             #[allow(clippy::manual_is_multiple_of)]
             if total_len % align != 0 {
-                release_pybuffer(view);
+                view.release();
                 return Err(PyValueError::new_err("O_DIRECT requires aligned total_len"));
             }
         }
@@ -3143,7 +3445,7 @@ impl RawBlockDevice {
         });
         // Always release the CPython buffer view once the blocking I/O closure
         // completes. This decrements exporter-side view count correctly.
-        release_pybuffer(view);
+        view.release();
         res?;
         Ok(())
     }
@@ -3164,21 +3466,21 @@ impl RawBlockDevice {
             return Err(PyRuntimeError::new_err("device is closed"));
         }
         let fd = self.fd;
-        let view = get_pybuffer(py, out, true)?;
-        if view.readonly != 0 {
-            release_pybuffer(view);
+        let view = get_buffer(py, out, true)?;
+        if view.readonly {
+            view.release();
             return Err(PyValueError::new_err("output buffer is readonly"));
         }
-        let cap = view.len as usize;
+        let cap = view.len;
         if cap < payload_len {
-            release_pybuffer(view);
+            view.release();
             return Err(PyValueError::new_err(format!(
                 "output buffer too small: cap={cap} need={payload_len}"
             )));
         }
-        let ptr = view.buf as *mut u8;
+        let ptr = view.ptr;
         if ptr.is_null() {
-            release_pybuffer(view);
+            view.release();
             return Err(PyValueError::new_err("null buffer pointer"));
         }
 
@@ -3187,7 +3489,7 @@ impl RawBlockDevice {
         // aligned up and can be larger than payload_len.
         let total_len = total_len.unwrap_or(payload_len);
         if total_len < payload_len {
-            release_pybuffer(view);
+            view.release();
             return Err(PyValueError::new_err("total_len must be >= payload_len"));
         }
 
@@ -3195,12 +3497,12 @@ impl RawBlockDevice {
         if self.use_odirect {
             #[allow(clippy::manual_is_multiple_of)]
             if (offset as usize) % align != 0 {
-                release_pybuffer(view);
+                view.release();
                 return Err(PyValueError::new_err("O_DIRECT requires aligned offset"));
             }
             #[allow(clippy::manual_is_multiple_of)]
             if total_len % align != 0 {
-                release_pybuffer(view);
+                view.release();
                 return Err(PyValueError::new_err("O_DIRECT requires aligned total_len"));
             }
         }
@@ -3267,7 +3569,7 @@ impl RawBlockDevice {
             }
             Ok(())
         });
-        release_pybuffer(view);
+        view.release();
         res?;
         Ok(())
     }
@@ -3344,3 +3646,6 @@ fn lmcache_rust_raw_block_io(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<(
     m.add_class::<RawBlockDevice>()?;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests;

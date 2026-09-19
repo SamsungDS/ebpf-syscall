@@ -16,10 +16,9 @@ import torch
 # First Party
 from lmcache import device_ops, torch_dev
 from lmcache import torch_device_type as torch_device_type  # noqa: F401
-from lmcache.integration.vllm.utils import get_size_bytes
 from lmcache.logging import init_logger
 from lmcache.observability import LMCStatsMonitor
-from lmcache.utils import _lmcache_nvtx_annotate
+from lmcache.utils import _lmcache_nvtx_annotate, get_size_bytes
 from lmcache.v1.pin_monitor import PinMonitor
 from lmcache.v1.platform import current_device_spec as current_device_spec  # noqa: F401
 from lmcache.v1.system_detection import NUMAMapping
@@ -545,14 +544,259 @@ def _read_hugepage_info() -> Optional[Tuple[int, int, int]]:
         return None
 
 
+# Host buffers exported as dma-bufs, keyed by the buffer's base address:
+# (dma-buf fd, mmap object, memfd or heap fd, size).  A dma-buf backed buffer
+# is plain page-backed memory to the CPU and to cudaHostRegister(); the fd is
+# what lets io_uring register it with a block device so the device maps it
+# once instead of per command.  See _allocate_dmabuf_cpu_memory().
+_DMABUF_REGIONS: dict[int, tuple[int, Any, int, int]] = {}
+
+_UDMABUF_CREATE = 0x40187542  # _IOW('u', 0x42, struct udmabuf_create)
+_UDMABUF_FLAGS_CLOEXEC = 0x01
+_DMA_HEAP_IOCTL_ALLOC = 0xC0184800  # _IOWR('H', 0, struct dma_heap_allocation_data)
+_MFD_ALLOW_SEALING = 0x0002
+_MFD_HUGETLB = 0x0004
+_MFD_HUGE_2MB = 21 << 26
+_F_SEAL_SHRINK = 0x0002
+_F_ADD_SEALS = 1033
+
+
+def _allocate_dmabuf_cpu_memory(
+    size: int, kind: str, use_hugepages: bool
+) -> torch.Tensor:
+    """Allocate a host buffer that is also exported as a dma-buf.
+
+    kind is "udmabuf" (a memfd, 2 MiB hugetlb folios when use_hugepages,
+    turned into a dma-buf by /dev/udmabuf), "system_heap" (an allocation
+    from /dev/dma_heap/system, 1 MiB chunks upstream, 2 MiB with the
+    superpage series), "cma_heap" (/dev/dma_heap/reserved, the boot-time
+    cma= area, one contiguous range) or an explicit /dev/dma_heap/<name>.
+    Either way the CPU sees ordinary pages: the buffer is
+    mmap()ed, wrapped as a tensor, and pinned for the GPU with
+    cudaHostRegister() when CUDA is present.  The dma-buf fd is kept in
+    _DMABUF_REGIONS so the raw_block backend can register the buffer with
+    its device through io_uring and get map-once, MDTS-sized commands.
+    """
+    import fcntl
+    import mmap
+    import os
+    import struct
+
+    page = 2 * 1024 * 1024 if use_hugepages else 4096
+    size = (size + page - 1) // page * page
+    if kind == "udmabuf":
+        flags = _MFD_ALLOW_SEALING
+        if use_hugepages:
+            flags |= _MFD_HUGETLB | _MFD_HUGE_2MB
+        memfd = os.memfd_create("lmcache-kv", flags)
+        try:
+            os.ftruncate(memfd, size)
+            fcntl.fcntl(memfd, _F_ADD_SEALS, _F_SEAL_SHRINK)
+            dev = os.open("/dev/udmabuf", os.O_RDWR | os.O_CLOEXEC)
+            try:
+                # struct udmabuf_create { u32 memfd; u32 flags; u64 offset; u64 size; }
+                # a mutable buffer makes fcntl.ioctl() return the ioctl result,
+                # which for UDMABUF_CREATE is the new dma-buf fd
+                req = bytearray(
+                    struct.pack("IIQQ", memfd, _UDMABUF_FLAGS_CLOEXEC, 0, size)
+                )
+                dmabuf_fd = fcntl.ioctl(dev, _UDMABUF_CREATE, req)
+            finally:
+                os.close(dev)
+            mm = mmap.mmap(memfd, size, flags=mmap.MAP_SHARED)
+        except BaseException:
+            os.close(memfd)
+            raise
+        backing_fd = memfd
+    elif (
+        kind == "system_heap" or kind == "cma_heap" or kind.startswith("/dev/dma_heap/")
+    ):
+        # "system_heap" is the buddy-allocator heap (2 MiB chunks with the
+        # 2 MB order, best effort); "cma_heap" is the area reserved at boot
+        # with cma= (heap name "reserved"), one contiguous range per
+        # allocation that fragmentation cannot degrade; any other
+        # /dev/dma_heap/<name> (a per-NUMA CMA area, "pernuma0") is taken
+        # as given.
+        heap_path = {
+            "system_heap": "/dev/dma_heap/system",
+            "cma_heap": "/dev/dma_heap/reserved",
+        }.get(kind, kind)
+        heap = os.open(heap_path, os.O_RDONLY | os.O_CLOEXEC)
+        try:
+            # struct dma_heap_allocation_data
+            #   { u64 len; u32 fd; u32 fd_flags; u64 heap_flags; }
+            req = bytearray(struct.pack("QIIQ", size, 0, os.O_RDWR | os.O_CLOEXEC, 0))
+            fcntl.ioctl(heap, _DMA_HEAP_IOCTL_ALLOC, req)
+            dmabuf_fd = struct.unpack("QIIQ", bytes(req))[1]
+        finally:
+            os.close(heap)
+        mm = mmap.mmap(dmabuf_fd, size, flags=mmap.MAP_SHARED)
+        backing_fd = -1
+    else:
+        raise ValueError(f"unknown dma-buf source {kind!r}")
+
+    buffer = torch.frombuffer(mm, dtype=torch.uint8)
+    ptr = buffer.data_ptr()
+    if torch.cuda.is_available():
+        # Pin the pages for the GPU copy engines; this is the same page-backed
+        # mapping the device will DMA to, just registered with CUDA as well.
+        err = torch.cuda.cudart().cudaHostRegister(ptr, size, 0)
+        if err != 0:
+            logger.warning(
+                "cudaHostRegister on the dma-buf backed host buffer failed (%s); "
+                "GPU copies will not be pinned",
+                err,
+            )
+    _DMABUF_REGIONS[ptr] = (dmabuf_fd, mm, backing_fd, size)
+    logger.info(
+        "Allocated %d MiB of dma-buf backed host memory from %s (fd %d)",
+        size >> 20,
+        kind,
+        dmabuf_fd,
+    )
+    return buffer
+
+
+_DMABUF_CHUNK_BYTES = 1 << 30  # the kernel registers at most 1 GiB per dma-buf
+
+
+def _export_cuda_dmabuf(ptr: int, size: int) -> int:
+    """Export [ptr, ptr+size) of a CUDA allocation as a dma-buf fd.
+
+    cuMemGetHandleForAddressRange(CU_MEM_RANGE_HANDLE_TYPE_DMA_BUF_FD) on the
+    NVIDIA open kernel modules; the range must be host-page aligned.
+    """
+    import ctypes
+
+    lib = ctypes.CDLL("libcuda.so.1")
+    lib.cuMemGetHandleForAddressRange.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_uint64,
+        ctypes.c_size_t,
+        ctypes.c_int,
+        ctypes.c_uint64,
+    ]
+    lib.cuMemGetHandleForAddressRange.restype = ctypes.c_int
+    fd = ctypes.c_int(-1)
+    CU_MEM_RANGE_HANDLE_TYPE_DMA_BUF_FD = 1
+    rc = lib.cuMemGetHandleForAddressRange(
+        ctypes.byref(fd), ptr, size, CU_MEM_RANGE_HANDLE_TYPE_DMA_BUF_FD, 0
+    )
+    if rc != 0:
+        raise RuntimeError(
+            f"cuMemGetHandleForAddressRange failed with CUresult {rc} "
+            "(needs the NVIDIA open kernel modules and a page-aligned range)"
+        )
+    return fd.value
+
+
+def _export_hip_dmabuf(ptr: int, size: int) -> int:
+    """Export [ptr, ptr+size) of a ROCm allocation as a dma-buf fd.
+
+    hsa_amd_portable_export_dmabuf() from libhsa-runtime64; the returned
+    offset is folded into the caller's base so the region math is the same
+    as on CUDA.
+    """
+    import ctypes
+
+    lib = ctypes.CDLL("libhsa-runtime64.so.1")
+    lib.hsa_amd_portable_export_dmabuf.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_size_t,
+        ctypes.POINTER(ctypes.c_int),
+        ctypes.POINTER(ctypes.c_uint64),
+    ]
+    lib.hsa_amd_portable_export_dmabuf.restype = ctypes.c_int
+    fd = ctypes.c_int(-1)
+    off = ctypes.c_uint64(0)
+    rc = lib.hsa_amd_portable_export_dmabuf(
+        ptr, size, ctypes.byref(fd), ctypes.byref(off)
+    )
+    if rc != 0:
+        raise RuntimeError(f"hsa_amd_portable_export_dmabuf failed with status {rc}")
+    if off.value != 0:
+        raise RuntimeError(
+            f"hsa_amd_portable_export_dmabuf returned a non-zero offset {off.value}; "
+            "the region is not addressable from offset 0"
+        )
+    return fd.value
+
+
+def export_device_dmabufs(tensor: torch.Tensor) -> list[tuple[int, int, int]]:
+    """Export a device tensor's memory as dma-bufs of at most 1 GiB each.
+
+    Returns [(fd, base_ptr, size)] and records each region in _DMABUF_REGIONS so
+    get_dmabuf_region() resolves any pointer inside the tensor to (fd, base). The
+    base and size must be host-page aligned, which GPUMemoryAllocator guarantees by
+    over-allocating one page and slicing; any other tensor that is not aligned is
+    refused. Both a CUDA (open kernel modules) and a ROCm export are supported; the
+    fd is what io_uring registers against the block device so the NVMe controller
+    DMAs to and from device memory directly, with no host copy of the payload.
+    """
+    page = 4096
+    base = tensor.data_ptr()
+    size = tensor.numel() * tensor.element_size()
+    if base % page or size % page:
+        raise ValueError(
+            f"device buffer at {base:#x} of {size} bytes is not page aligned; "
+            "allocate it through the aligned GPU allocator"
+        )
+    dev = tensor.device.type
+    export = (
+        _export_hip_dmabuf if torch.version.hip is not None else _export_cuda_dmabuf
+    )
+    if dev not in ("cuda",):
+        raise ValueError(f"export_device_dmabufs: unsupported device {dev}")
+    regions = []
+    off = 0
+    while off < size:
+        chunk = min(_DMABUF_CHUNK_BYTES, size - off)
+        fd = export(base + off, chunk)
+        _DMABUF_REGIONS[base + off] = (fd, None, -1, chunk)
+        regions.append((fd, base + off, chunk))
+        off += chunk
+    logger.info(
+        "Exported %d MiB of %s memory as %d dma-buf(s)", size >> 20, dev, len(regions)
+    )
+    return regions
+
+
+def release_device_dmabufs(tensor: torch.Tensor) -> None:
+    """Close the dma-bufs exported for a device tensor by export_device_dmabufs."""
+    import os
+
+    base = tensor.data_ptr()
+    size = tensor.numel() * tensor.element_size()
+    for ptr in [p for p in list(_DMABUF_REGIONS) if base <= p < base + size]:
+        fd, _mm, _bfd, _sz = _DMABUF_REGIONS.pop(ptr)
+        os.close(fd)
+
+
+def get_dmabuf_region(ptr: int) -> Optional[tuple[int, int]]:
+    """Return (dma-buf fd, base address) for the dma-buf backed buffer that
+    contains ptr, or None when ptr is not inside one."""
+    for base, (fd, _mm, _bfd, size) in _DMABUF_REGIONS.items():
+        if base <= ptr < base + size:
+            return fd, base
+    return None
+
+
 def _allocate_cpu_memory(
     size: int,
     numa_mapping: Optional[NUMAMapping] = None,
     shm_name: Optional[str] = None,
     use_hugepages: bool = False,
+    dmabuf: Optional[str] = None,
 ) -> torch.Tensor:
     if size == 0:
         return torch.empty(0, dtype=torch.uint8)
+
+    if dmabuf:
+        if shm_name or numa_mapping:
+            raise ValueError(
+                "dma-buf backed host memory is not supported with shm or NUMA mapping"
+            )
+        return _allocate_dmabuf_cpu_memory(size, dmabuf, use_hugepages)
 
     resolved = _resolve_pinned_alloc_free(
         numa_mapping,
@@ -605,6 +849,19 @@ def _free_cpu_memory(
 ) -> None:
     if torch_dev.is_available():
         torch_dev.synchronize()
+
+    if buffer.numel() and buffer.data_ptr() in _DMABUF_REGIONS:
+        import os
+
+        fd, mm, backing_fd, region_size = _DMABUF_REGIONS.pop(buffer.data_ptr())
+        if torch.cuda.is_available():
+            torch.cuda.cudart().cudaHostUnregister(buffer.data_ptr())
+        del buffer
+        mm.close()
+        os.close(fd)
+        if backing_fd >= 0:
+            os.close(backing_fd)
+        return
 
     resolved = _resolve_pinned_alloc_free(
         numa_mapping,
@@ -1444,7 +1701,8 @@ class AddressManager:
         Args:
             size: The requested size of the memory block. Should be greater
                 than 0.
-            batch_size: The number of memory blocks to allocate.
+            batch_size: The number of memory blocks to allocate. Must be
+                non-negative; zero returns an empty list.
 
         Returns:
             A list of tuple (address, allocated_size) where address is the starting
@@ -1453,8 +1711,12 @@ class AddressManager:
             Note: the length of the return list is the same as the batch_size.
 
         Raises:
-            RuntimeError: If no memory is available to allocate.
+            RuntimeError: If batch_size is negative or no memory is available
+                to allocate.
         """
+        if batch_size < 0:
+            raise RuntimeError("batch_size must be non-negative")
+
         aligned_size = self.compute_aligned_size(size)
         remaining = batch_size
         allocate_result: list[tuple[int, int]] = []
@@ -1497,21 +1759,6 @@ class AddressManager:
             raise RuntimeError(
                 f"Failed to batched allocate {batch_size} memory blocks "
                 f"of size {size} because no enough memory is available"
-            )
-        if len(allocate_result) != batch_size:
-            # The length of allocate_result is not equal to batch_size;
-            # free list is untouched, no rollback needed
-            logger.warning(
-                "Failed to batched allocate %d memory blocks of size %d "
-                "because the length of allocate_result %d is not equal to batch_size",
-                batch_size,
-                size,
-                len(allocate_result),
-            )
-            raise RuntimeError(
-                f"Failed to batched allocate {batch_size} memory blocks "
-                f"of size {size} because the length of allocate_result "
-                f"{len(allocate_result)} is not equal to batch_size"
             )
 
         # Allocation succeeded; batch-update the free list
