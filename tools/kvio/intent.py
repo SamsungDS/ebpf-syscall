@@ -357,6 +357,7 @@ def main(argv=None):
         help="after warmup, create READY here and wait for GO before timing",
     )
     replay.add_argument("--phase-gate-timeout-seconds", type=float)
+    replay.add_argument("--phase-gate-close", action="store_true")
     replay.add_argument("--allow-io-errors", action="store_true")
     replay.add_argument(
         "--advertised-mdts-bytes",
@@ -424,6 +425,7 @@ def main(argv=None):
                 command.extend((option, str(value)))
         for option, enabled in (("--hugepage", args.hugepage),
                                 ("--odirect", args.odirect),
+                                ("--phase-gate-close", args.phase_gate_close),
                                 ("--allow-io-errors", args.allow_io_errors)):
             if enabled:
                 command.append(option)

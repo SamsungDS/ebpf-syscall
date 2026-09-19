@@ -400,6 +400,10 @@ def main():
         "--phase-gate-timeout-seconds", type=float, default=60.0,
         help="maximum wait for GO with --phase-gate-dir (default: 60)",
     )
+    ap.add_argument(
+        "--phase-gate-close", action="store_true",
+        help="after timing, create DONE and wait for CLOSE before teardown",
+    )
     ap.add_argument("--odirect", action="store_true")
     ap.add_argument("--capacity-gb", type=int, default=8)
     ap.add_argument("--record", help="write a kvio_record.json replay manifest here")
@@ -437,9 +441,11 @@ def main():
             ap.error("--phase-gate-dir must name an existing directory")
         if args.phase_gate_timeout_seconds <= 0:
             ap.error("--phase-gate-timeout-seconds must be positive")
-        for marker in ("READY", "GO"):
+        for marker in ("READY", "GO", "DONE", "CLOSE"):
             if (phase_gate / marker).exists():
                 ap.error(f"phase gate marker already exists: {phase_gate / marker}")
+    elif args.phase_gate_close:
+        ap.error("--phase-gate-close requires --phase-gate-dir")
 
     if args.intent_only and not args.intent_out:
         ap.error("--intent-only requires --intent-out")
@@ -825,6 +831,16 @@ def main():
             load_ms += [v for x in ld for v in x if v is not None]
             phase_wall["store"] += wall_s
             phase_wall["load"] += wall_l
+    if args.phase_gate_close:
+        done = phase_gate / "DONE"
+        close = phase_gate / "CLOSE"
+        done.touch(exist_ok=False)
+        print(f"  @@@ PHASE_GATE done={done}; waiting for {close}", flush=True)
+        deadline = time.monotonic() + args.phase_gate_timeout_seconds
+        while not close.exists():
+            if time.monotonic() >= deadline:
+                sys.exit(f"phase gate timed out waiting for {close}")
+            time.sleep(0.005)
     try:
         core.close()
     except Exception:

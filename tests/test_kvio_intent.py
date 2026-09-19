@@ -149,7 +149,7 @@ class KvioIntentTest(unittest.TestCase):
                 "udmabuf", "--dma-ceiling-bytes", "8", "--odirect",
                 "--target-plan", str(plan_path), "--target-manifest",
                 str(manifest_path), "--phase-gate-dir", str(Path(directory)),
-                "--phase-gate-timeout-seconds", "15",
+                "--phase-gate-timeout-seconds", "15", "--phase-gate-close",
             ]
             with patch.dict(os.environ, {"PYTHONPATH": "/tmp/shadow"}):
                 with patch.object(intent_module.subprocess, "run") as run:
@@ -166,6 +166,7 @@ class KvioIntentTest(unittest.TestCase):
             self.assertIn(str(Path(directory)), command)
             self.assertIn("--phase-gate-timeout-seconds", command)
             self.assertIn("15.0", command)
+            self.assertIn("--phase-gate-close", command)
 
 
 if __name__ == "__main__":
