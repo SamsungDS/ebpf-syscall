@@ -350,6 +350,8 @@ def main(argv=None):
     replay.add_argument("--hugepage", action="store_true")
     replay.add_argument("--odirect", action="store_true")
     replay.add_argument("--capacity-gb", type=int, default=8)
+    replay.add_argument("--block-align", type=int,
+                        help="target namespace physical block size in bytes")
     replay.add_argument("--ring-depth", type=int, default=0)
     replay.add_argument("--load-parallelism", type=int, default=0)
     replay.add_argument(
@@ -421,6 +423,7 @@ def main(argv=None):
             ("--phase-gate-timeout-seconds",
              args.phase_gate_timeout_seconds),
             ("--phase-rapl-out", args.phase_rapl_out),
+            ("--block-align", args.block_align),
         )
         for option, value in option_values:
             if value is not None:

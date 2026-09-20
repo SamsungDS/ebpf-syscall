@@ -206,6 +206,67 @@ DEV=/dev/nvme1n1 INTENT_DIR=artifacts/intent \
 
 No reference run is shipped for this arm yet.
 
+## Three representations of one chunk: BF16 K/V, complete K16/V8, V8-only
+
+LMCache can store the same 256-token chunk three ways: the plain BF16 K/V
+object raw_block writes today; a complete K16/V8 object, where V is FP8 with
+per-object scales and a codec header; or V8-only split-tier, where only the
+encoded V goes to storage and the exact K stays in host memory. They are
+different objects with different byte counts, and comparing them is honest
+only when every one is derived from the same geometry by the arithmetic the
+engine's codec uses.
+
+`kvio representations` derives one `kvio.intent.v1` per representation from
+the model's KV dimensions and LMCache's merged asymmetric codec layout (76-byte
+fixed header, scale shape, three payload lengths, a hash string table, a CRC,
+then `K || V || scales`), plus a manifest binding the intents by digest and
+carrying what an intent cannot say: which planes were stored, in what dtype,
+what stays in host memory and has to come back over the bus on a restore.
+For Llama-3.1-8B at 256 tokens with per-tensor scales:
+
+| representation | stored object | ratio to BF16 | host retained per restore |
+|---|---:|---:|---:|
+| `bf16_kv` | 33,554,432 B | 1.0000 | 0 |
+| `k16_v8` | 25,166,073 B | 0.7500 | 0 |
+| `v8_only` | 8,388,857 B | 0.2500 | 16,777,216 B (K) |
+
+Every number is labelled derived. The header depends on strings the codec
+writes at runtime (`--codec-hash KEY=VALUE` supplies them; unsupplied hashes
+are written empty, as the codec does), MLA models are refused because their
+latent cache has no separable K and V, and the manifest records the padding
+and alignment it charges. Whether the engine writes exactly these bytes is a
+question for a GPU host with the real serde.
+
+`sweep_representations.sh` replays all three on one raw namespace with the
+device's command stream recorded around each timed phase, and
+`parse_representations.py` joins the intent, the engine's manifest and the
+capture into one row per cell, ending with the bytes the device actually
+moved against the bytes the intent said it would:
+
+```sh
+DEV=/dev/disk/by-id/nvme-eui.<id> OUTROOT=out ADVERTISED_MDTS_BYTES=<bytes> \
+    STREAMS="1 4 8" SIZES="524288 1048576 2097152" REPEATS=3 PAD=0 \
+    bash tools/reproduce/kv-offload-io/sweep_representations.sh
+python3 tools/reproduce/kv-offload-io/parse_representations.py out > cells.csv
+```
+
+Two things the first runs of this arm showed, both worth knowing before
+reading any number from it:
+
+- **An encoded object is a few hundred bytes past a block boundary**, because
+  of its header and scales, and an O_DIRECT engine then has an unaligned tail.
+  raw_block moves that through a bounce buffer and, since a dma-buf-registered
+  slot is refused the bounce, the whole object silently leaves the map-once
+  path and lands on per-command mapping at the 128 KiB clamp, while the tool's
+  own projection still reports the map-once command count. `PAD=1` rounds the
+  stored object up to the block size, charged as `padding` in the manifest,
+  which is what an engine has to do to keep the registration. Run both.
+- **A drive's limits are what it has been seen to accept.** Pick `SIZES` at
+  or below command sizes the drive has completed cleanly in a prior run, and
+  treat anything larger as a separate failure probe with a hard timeout and
+  the capture running, so a request the controller refuses stops that cell
+  rather than the sweep.
+
 ## Replay
 
 A device capture (`kvio record`, i.e. `nvme_tp_monitor`) of any of these runs
