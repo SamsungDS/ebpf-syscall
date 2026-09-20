@@ -664,6 +664,16 @@ def main():
           f"{geom['store_bytes']} B, "
           f"load {geom['load_cmds']} cmds / {geom['load_bytes']} B "
           f"(max_xfer={args.mdts_bytes // 1024} KiB/cmd, align={args.block_align})")
+    if args.dmabuf and obj_bytes % args.block_align:
+        # The engine can only move an O_DIRECT tail through a bounce buffer,
+        # and a dma-buf slot is refused the bounce, so the whole object goes
+        # out as regular I/O under the per-command mapping instead. The
+        # counts above assume the map-once path and are then wrong; the
+        # device capture is the only honest count for this case.
+        print(f"  NOTE: object of {obj_bytes} B is not a multiple of "
+              f"{args.block_align}; the dma-buf slot cannot take its O_DIRECT "
+              f"tail, so the engine will bounce it and the projected command "
+              f"counts above do not apply. Pad the object or read the capture.")
     engine_label = (f"opends:{args.gds_backend}" if args.engine == "opends"
                     else args.engine)
     odirect = args.odirect or args.engine in ("cufile", "opends")  # GDS: forced
