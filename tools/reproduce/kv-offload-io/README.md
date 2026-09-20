@@ -267,6 +267,48 @@ reading any number from it:
   the capture running, so a request the controller refuses stops that cell
   rather than the sweep.
 
+### Worked example (measured 2026-09-20, udmabuf)
+
+`example_representations_unpadded.csv` and `example_representations_padded.csv`
+are two full runs of the sweep above on one raw NVMe namespace (4 KiB LBA,
+128 KiB per-command clamp on the regular path, commands of up to 2 MiB on the
+dma-buf path). Three
+representations x {128 KiB classic control, 512 KiB, 1 MiB, 2 MiB udmabuf} x
+streams {1, 4, 8} x 3 repetitions, 8 chunks per stream, 3 timed passes after
+one warm-up; every cell's device stream captured, zero drops, zero non-zero
+NVMe status, and the device's bytes within 0.1 per cent of the intent's in
+every one of the 216 cells (the difference is the 4 KiB store metadata and
+the tail). `summarize_representations.py` produces the tables; at 8 streams
+and 2 MiB commands:
+
+| representation | padded | device read commands | store MB/s | load MB/s |
+|---|---|---|---:|---:|
+| `bf16_kv` | n/a (already aligned) | 3,072 x 2 MiB | 6,870 | 14,147 |
+| `k16_v8` | no | 36,864 x 128 KiB | 2,706 | 2,744 |
+| `k16_v8` | yes | 2,304 x 2 MiB | 6,885 | 14,184 |
+| `v8_only` | no | 12,288 x 128 KiB | 3,517 | 3,971 |
+| `v8_only` | yes | 768 x 2 MiB | 7,065 | 13,504 |
+
+Read it as three statements, each of which the capture supports directly:
+
+- **The byte ratios are physical.** 0.75x and 0.25x of the BF16 object is
+  what the drive wrote and read, header, scales and tail charged.
+- **Unpadded, every encoded object ran at the 128 KiB clamp** regardless of
+  the requested command size and the successful map-once registration, at
+  roughly 2.5 to 4x lower throughput than the aligned BF16 object on the same
+  path. Padded to the physical block, all three representations run at the requested
+  command size and reach the same drive ceiling, about 7 GB/s store and
+  14 GB/s load at 4 or more streams.
+- **No representation moves faster than another once aligned.** At equal
+  offered load the drive is the ceiling for all three; V8-only's value is the
+  bytes it does not move and the host writes it does not incur, not a higher
+  storage-leg rate. At one stream its smaller objects sit closer to the
+  per-object latency floor and load at about 6 GB/s against 11 GB/s for the
+  32 MiB object.
+
+The raw per-cell tree of device captures, 2.3 GB, is not shipped; the CSVs
+here are the parsed rows.
+
 ## Replay
 
 A device capture (`kvio record`, i.e. `nvme_tp_monitor`) of any of these runs
