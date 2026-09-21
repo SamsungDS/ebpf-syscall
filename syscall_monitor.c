@@ -102,6 +102,8 @@ static const char* get_syscall_name(uint32_t nr) {
 	case 20: return "writev";
 	case 74: return "fsync";
         case 257: return "openat";
+        case 1024: return "user_page_fault";
+        case 1025: return "major_page_fault";
         default: {
             static char buf[32];
             snprintf(buf, sizeof(buf), "syscall_%u", nr);

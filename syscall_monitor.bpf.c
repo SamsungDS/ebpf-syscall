@@ -64,6 +64,13 @@
 #define MAX_MMAP_REGIONS 1024
 #define PAGE_SIZE  4096
 #define EVENT_NR_PAGE_FAULT 1024
+// Emitted only when filemap_fault's return value proves the fault was MAJOR (read from storage,
+// not the page cache) -- see trace_filemap_fault_exit. Never inferred from address or error_code.
+#define EVENT_NR_PAGE_FAULT_MAJOR 1025
+// vm_fault_reason bits (include/linux/mm_types.h): MAJOR = page read from storage; RETRY = I/O was
+// initiated and the mmap lock dropped (on most kernels this IS the disk-read path, no second call).
+#define VM_FAULT_MAJOR 0x004
+#define VM_FAULT_RETRY  0x400
 
 /* file access modes */
 #define O_ACCMODE   00000003
@@ -817,6 +824,68 @@ int BPF_PROG(trace_page_fault_user, unsigned long address, struct pt_regs *regs,
     update_stats(EVENT_NR_PAGE_FAULT, PAGE_SIZE);
     log_event(EVENT_NR_PAGE_FAULT, -1, PAGE_SIZE, fault_offset, filename, (int)error_code, "", -1, -1);
 
+    return 0;
+}
+
+struct fault_pending_key {
+    u64 pid_tgid;
+    u64 addr_page;
+};
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, MAX_ENTRIES);
+    __type(key, struct fault_pending_key);
+    __type(value, s64); // fault_offset stashed at entry, consumed at exit
+} fault_pending_map SEC(".maps");
+
+SEC("fentry/filemap_fault")
+int BPF_PROG(trace_filemap_fault_enter, struct vm_fault *vmf)
+{
+    u64 pid_tgid = bpf_get_current_pid_tgid();
+    u32 tgid = tgid_from_tid(pid_tgid);
+
+    struct mmap_region_table *t = bpf_map_lookup_elem(&mmap_region_table_map, &tgid);
+    if (!t)
+        return 0;
+
+    u64 address = BPF_CORE_READ(vmf, address);
+    struct mmap_region_slot *slot = mmap_region_find(t, address);
+    if (!slot)
+        return 0;
+
+    s64 fault_offset = (s64)(slot->file_offset + (address - slot->start));
+    struct fault_pending_key k = {.pid_tgid = pid_tgid, .addr_page = address >> 12};
+    bpf_map_update_elem(&fault_pending_map, &k, &fault_offset, BPF_ANY);
+    return 0;
+}
+
+SEC("fexit/filemap_fault")
+int BPF_PROG(trace_filemap_fault_exit, struct vm_fault *vmf, int ret)
+{
+    u64 pid_tgid = bpf_get_current_pid_tgid();
+    u32 tgid = tgid_from_tid(pid_tgid);
+    u64 address = BPF_CORE_READ(vmf, address);
+    struct fault_pending_key k = {.pid_tgid = pid_tgid, .addr_page = address >> 12};
+
+    s64 *fault_offset = bpf_map_lookup_elem(&fault_pending_map, &k);
+    if (!fault_offset)
+        return 0;
+
+    struct mmap_region_table *t = bpf_map_lookup_elem(&mmap_region_table_map, &tgid);
+    if (!t || !mmap_region_find(t, address)) {
+        bpf_map_delete_elem(&fault_pending_map, &k);
+        return 0;
+    }
+
+    u32 r = (u32)ret;
+    int major = r & (VM_FAULT_MAJOR); // VM_FAULT_RETRY is needed ?
+    if (major) {
+        char filename[256] = {};
+        encode_filename(filename, address);
+        update_stats(EVENT_NR_PAGE_FAULT_MAJOR, PAGE_SIZE);
+        log_event(EVENT_NR_PAGE_FAULT_MAJOR, -1, PAGE_SIZE, *fault_offset, filename, (int)r, "", -1, -1);
+    }
+    bpf_map_delete_elem(&fault_pending_map, &k);
     return 0;
 }
 
