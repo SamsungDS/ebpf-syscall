@@ -164,6 +164,105 @@ class FakeBackend(Backend):
             return Outcome("success", 0)
 
 
+class RawBlockBackend(Backend):
+    """LMCache's vendored raw_block engine as a target, on a CPU.
+
+    The core lays out slots, writes its own headers and pads to its
+    alignment; nothing about that is decided here.  Object ids are encoded
+    raw_block keys.  A ranged load reads the whole object through the
+    engine (it has no ranged read) and copies the range out, which the
+    ledger's completed bytes reflect.  Optionally wrapped in the recording
+    adapter so a replay produces its own capture for comparison.
+    """
+
+    def __init__(self, core, *, record_to=None):
+        self.core = core
+        self.recorder = None
+        if record_to is not None:
+            import lmcache_adapter
+            self.recorder = lmcache_adapter.open_recorder(record_to, core=core)
+            self.core = lmcache_adapter.RecordingRawBlockCore(core, self.recorder)
+        from lmcache.v1.storage_backend.raw_block.key_codec import (  # noqa: E402
+            RawBlockKeySpec, slot_identity_from_encoded_key)
+        namespace = getattr(core, "key_namespace", "object")
+        self._spec = lambda oid: RawBlockKeySpec(
+            encoded=oid, slot_identity=slot_identity_from_encoded_key(oid, namespace))
+        self.lock = threading.Lock()
+
+    @staticmethod
+    def _memory_obj(payload):
+        import torch
+        from lmcache.v1.memory_management import MemoryFormat, MemoryObjMetadata, TensorMemoryObj
+        data = bytearray(payload)
+        raw = torch.frombuffer(data, dtype=torch.uint8) if data else torch.empty(0, dtype=torch.uint8)
+        meta = MemoryObjMetadata(shape=torch.Size([len(data)]), dtype=torch.uint8, address=0,
+                                 phy_size=len(data), fmt=MemoryFormat.BINARY, ref_count=1)
+        obj = TensorMemoryObj(raw, meta, parent_allocator=None)
+        return obj, data
+
+    def initialize(self, intent):
+        for item in intent["initial_state"]["live"]:
+            size = intent["objects"][item["object_id"]]["versions"][str(item["version"])]["bytes"]
+            payload = synthetic_bytes(item["object_id"], item["version"], 0, size)
+            obj, _ = self._memory_obj(payload)
+            self.core.put_many([self._spec(item["object_id"])], [obj])
+
+    def store(self, object_id, version, payload, op_id=None):
+        obj, _ = self._memory_obj(payload)
+        present = self.core.exists_many([object_id])[0]
+        result = self.core.put_many([self._spec(object_id)], [obj])
+        if result.results[0]:
+            return Outcome("already_present" if present else "success", 0 if present else len(payload))
+        return Outcome("error", 0, "put_many returned False")
+
+    def load(self, object_id, version, offset, length, dst, object_bytes=None, op_id=None):
+        # Always ask the engine, so a miss is the engine's answer (and shows in
+        # the replay's own capture), never this backend's guess.
+        present = self.core.exists_many([object_id])[0]
+        size = object_bytes if object_bytes is not None else offset + length
+        if present:
+            meta = self.core.get_metadata_many([object_id])[0]
+            size = int(getattr(meta, "size", 0) or size)
+        obj, data = self._memory_obj(bytes(size))
+        ok = self.core.load_many_into([object_id], [obj])[0]
+        if not ok:
+            return Outcome("miss" if not present else "error", 0,
+                           "" if not present else "load_many_into returned False")
+        chunk = bytes(data[offset:offset + length])
+        dst[:len(chunk)] = chunk
+        if chunk != synthetic_bytes(object_id, version, offset, len(chunk)):
+            return Outcome("error", len(chunk), "content mismatch")
+        return Outcome("success" if len(chunk) == length else "short", len(chunk))
+
+    def release(self, object_id, version, op_id=None):
+        ok = self.core.delete_many([object_id])[0]
+        return Outcome("success" if ok else "miss", 0)
+
+    def close(self):
+        if self.recorder is not None:
+            self.recorder.close()
+        try:
+            self.core.close()
+        except Exception:
+            pass
+
+
+def open_raw_block_core(device, *, capacity_bytes, slot_bytes, block_align=4096,
+                        header_bytes=4096, io_engine="posix", odirect=False,
+                        max_data_transfer_size=0):
+    """A writer core over a file or device, the way the runner builds one."""
+    from lmcache.v1.storage_backend.raw_block.core import RawBlockCore, RawBlockCoreConfig
+    cfg = RawBlockCoreConfig(
+        device_path=str(device), capacity_bytes=capacity_bytes, block_align=block_align,
+        header_bytes=header_bytes, slot_bytes=slot_bytes, use_odirect=odirect,
+        enable_zero_copy=False, meta_total_bytes=1 * 1024 * 1024, meta_magic=b"LMCIDX01",
+        meta_version=1, meta_checkpoint_interval_sec=60, meta_idle_quiet_ms=0,
+        meta_enable_periodic=False, meta_verify_on_load=False,
+        max_data_transfer_size=max_data_transfer_size, load_checkpoint_on_init=False,
+        io_engine=io_engine)
+    return RawBlockCore(cfg, key_namespace="object")
+
+
 # ---------------------------------------------------------------- ledger
 @dataclass
 class Row:
@@ -430,7 +529,16 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("intent")
-    ap.add_argument("--backend", choices=("fake",), default="fake")
+    ap.add_argument("--backend", choices=("fake", "raw_block"), default="fake")
+    ap.add_argument("--device", help="raw_block: a file or block device to lay slots on")
+    ap.add_argument("--capacity-bytes", type=int, default=256 * 1024 * 1024)
+    ap.add_argument("--slot-bytes", type=int, default=0,
+                    help="raw_block slot size; default: the largest object rounded up to 4 KiB")
+    ap.add_argument("--io-engine", choices=("posix", "io_uring"), default="posix")
+    ap.add_argument("--odirect", action="store_true")
+    ap.add_argument("--max-data-transfer-size", type=int, default=0,
+                    help="raw_block: the engine's per-command ceiling in bytes (0: the engine's own resolution)")
+    ap.add_argument("--record-to", help="raw_block: also record the replay's own object operations here")
     ap.add_argument("--profile", choices=PROFILES, default="dependency")
     ap.add_argument("--mode", choices=("simulated", "real"), default="simulated")
     ap.add_argument("--workers", type=int, default=8)
@@ -438,7 +546,17 @@ def main(argv=None):
     ap.add_argument("--out", help="directory for ledger.jsonl and summary.json")
     args = ap.parse_args(argv)
     intent = intent2.load_intent2(args.intent)
-    backend = FakeBackend()
+    if args.backend == "fake":
+        backend = FakeBackend()
+    else:
+        if not args.device:
+            ap.error("--backend raw_block needs --device")
+        largest = max(v["bytes"] for o in intent["objects"].values() for v in o["versions"].values())
+        slot = args.slot_bytes or ((largest + 4095) // 4096) * 4096
+        core = open_raw_block_core(args.device, capacity_bytes=args.capacity_bytes, slot_bytes=slot,
+                                   io_engine=args.io_engine, odirect=args.odirect,
+                                   max_data_transfer_size=args.max_data_transfer_size)
+        backend = RawBlockBackend(core, record_to=args.record_to)
     ex = Executor(intent, backend, profile=args.profile, mode=args.mode,
                   workers=args.workers, declared_delay_ns=args.declared_delay_ns)
     rows, result = ex.run()
