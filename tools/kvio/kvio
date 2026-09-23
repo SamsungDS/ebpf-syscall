@@ -54,6 +54,12 @@ COMMANDS = {
                      "validate, lower, or execute a KV-offload intent", False),
     "representations": ("tools/kvio/kv_representation.py",
                      "one intent per stored representation of the same KV chunk", False),
+    "intent2":      ("tools/kvio/intent2.py",
+                     "validate a kvio.intent.v2 object workload or normalize a v1 intent", False),
+    "capture":      ("tools/kvio/capture_events.py",
+                     "normalize an engine's object-operation capture into kvio.intent.v2", False),
+    "execute":      ("tools/kvio/intent_exec.py",
+                     "execute a kvio.intent.v2 workload against a backend (fake today)", False),
     # engine-driving (vendored RawBlockCore + built Rust module)
     "workload":     ("tools/kvio/workload.py",
                      "drive the real raw_block engine with a serving-shaped request mix", True),
