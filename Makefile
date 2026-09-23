@@ -183,7 +183,8 @@ kvio: kvio-ir
 	@test -f $(KVIO_CRATE)/Cargo.toml || { \
 		echo "ERROR: vendored engine missing -- run $(KVIO_DIR)/sync-lmcache.sh"; \
 		exit 1; }
-	CARGO_TARGET_DIR=$(KVIO_CRATE)/target cargo build --release --manifest-path $(KVIO_CRATE)/Cargo.toml
+	CARGO_TARGET_DIR=$(KVIO_CRATE)/target PYO3_PYTHON=$(PYTHON) \
+		cargo build --release --manifest-path $(KVIO_CRATE)/Cargo.toml
 	@mkdir -p $(KVIO_DIR)/build
 	cp $(KVIO_CRATE)/target/release/liblmcache_rust_raw_block_io.so $(KVIO_SO)
 	$(PYTHON) $(KVIO_DIR)/build_native.py
