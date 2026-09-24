@@ -276,6 +276,337 @@ struct worker_pool {
 	struct flex_barrier write_barrier;   /* active when serial=0           */
         int                  barrier_inited;  /* 1 once barrier is ready to use */
 };
+/* data structure needed for creating fault regions within file backed memory mappings */
+struct fault_event {
+    uint64_t timestamp_ns;
+    uint64_t region_off;      /* offset within the mapping */
+};
+
+struct fault_region{
+    uint32_t      pid;
+    uint64_t      cap_vastart;  /* captured VA   — join key */
+    size_t        size;
+    struct fault_event *events;
+    int           n_events;
+
+    /* filled at mmap dispatch at runtime */
+    void          *replay_addr;
+    int            replay_fd;   /* kept open for fadvise */
+    uint64_t       file_offset;
+    volatile int   cancelled;
+
+    /* thread that will touch for major pf =  lifecycle / accounting */
+    pthread_t      touch_tid;
+    volatile int   touch_active;   /* 1 while the touch thread runs      */
+    volatile int   completed;      /* faults actually touched            */
+};
+
+/*data structure needed for replay major page faults - are populated  at runtime while parsing cpature JSON with syscall_nr =1025 */
+#define EVENT_NR_PAGE_FAULT_MAJOR   1025
+#define FAULT_MAX_REGIONS           1024
+#define FAULT_PAGE_SIZE             4096
+
+struct fault_schedule {
+    struct fault_region regions[FAULT_MAX_REGIONS];
+    int                 count;
+    pthread_mutex_t     lock;       /* for lookup/registration      */
+    int                 enabled;    /* 0 when --fault-replay not given */
+};
+
+static struct fault_schedule g_fault_sched;
+
+/* the touch thread that will create major pf needs to pace with same origin as dispatcher threads*/
+static uint64_t  g_capture_start_ns;
+static uint64_t *g_replay_start_ns;
+
+struct fault_touch_args {
+    struct fault_region *region;
+    uint64_t             replay_start_ns;
+    uint64_t             capture_start_ns;
+};
+
+/*create fault region based on the replayed mmap region , add faulting evnets to that region and define pthread that will touch to generate major page fault */
+static void fault_sched_init(struct fault_schedule *fs)
+{
+    memset(fs, 0, sizeof(*fs));
+    pthread_mutex_init(&fs->lock, NULL);
+}
+
+/*
+ * Register (or find) the region that owns a captured mmap.
+ * Regions are keyed by (pid, captured VA start) exactly like the
+ * mmap_map, so a single .pt file mapped by 8 workers yields 8 rows.
+ */
+static struct fault_region *
+fault_sched_region(struct fault_schedule *fs, uint32_t pid,
+                   uint64_t cap_vastart, size_t size, int create)
+{
+    struct fault_region *r = NULL;
+
+    pthread_mutex_lock(&fs->lock);
+    for (int i = 0; i < fs->count; i++) {
+        if (fs->regions[i].pid == pid &&
+            fs->regions[i].cap_vastart == cap_vastart) {
+            r = &fs->regions[i];
+            break;
+        }
+    }
+    if (!r && create && fs->count < FAULT_MAX_REGIONS) {
+        r = &fs->regions[fs->count++];
+        memset(r, 0, sizeof(*r));
+        r->pid         = pid;
+        r->cap_vastart = cap_vastart;
+        r->size        = size;
+        r->replay_fd   = -1;
+    }
+    pthread_mutex_unlock(&fs->lock);
+    return r;
+}
+
+static int fault_event_cmp(const void *a, const void *b)
+{
+    const struct fault_event *x = a, *y = b;
+    if (x->timestamp_ns < y->timestamp_ns) return -1;
+    if (x->timestamp_ns > y->timestamp_ns) return  1;
+    return 0;
+}
+
+/* one parsed JSON record, minimal fields needed by the fault pre-pass */
+struct fault_rec {
+    uint32_t pid;
+    uint32_t nr;
+    uint64_t ts;
+    uint64_t size;
+    uint64_t offset;
+    char     fname[256];
+};
+
+/* accumulate fields of the record currently being parsed */
+static void fault_rec_field(struct fault_rec *r, const char *line)
+{
+    const char *p;
+    if ((p = strstr(line, "\"pid\""))) {
+        p = strchr(p, ':'); if (p) r->pid = (uint32_t)strtoul(p+1, NULL, 10);
+    } else if ((p = strstr(line, "\"syscall_nr\""))) {
+        p = strchr(p, ':'); if (p) r->nr = (uint32_t)strtoul(p+1, NULL, 10);
+    } else if ((p = strstr(line, "\"timestamp_ns\""))) {
+        p = strchr(p, ':'); if (p) r->ts = strtoull(p+1, NULL, 10);
+    } else if ((p = strstr(line, "\"size\""))) {
+        p = strchr(p, ':'); if (p) r->size = strtoull(p+1, NULL, 10);
+    } else if ((p = strstr(line, "\"offset\""))) {
+        p = strchr(p, ':'); if (p) r->offset = strtoull(p+1, NULL, 10);
+    } else if ((p = strstr(line, "\"filename\""))) {
+        p = strchr(p, ':');
+        if (p) {
+            const char *q = strchr(p, '"');
+            if (q) {
+                q++;                              /* opening quote of value */
+                const char *e = strchr(q, '"');
+                if (e && (size_t)(e - q) < sizeof(r->fname)) {
+                    memcpy(r->fname, q, e - q);
+                    r->fname[e - q] = '\0';
+                }
+            }
+        }
+    }
+}
+
+static int is_hex_addr_str(const char *s)
+{
+    return s[0] == '0' && (s[1] == 'x' || s[1] == 'X');
+}
+
+/* parse the JSON , to combine mmap entry and exit points before runtime since fault schedule and events 
+need to be generated before the actual replay occurs. generate the offset within the captured VA address. */
+
+static int fault_sched_build(struct fault_schedule *fs, const char *json_file)
+{
+    FILE *fp = fopen(json_file, "r");
+    if (!fp) {
+        fprintf(stderr, "[fault] cannot open '%s' for fault pre-pass\n",
+                json_file);
+        return -1;
+    }
+
+    /* ── pass 1: join mmap entry+exit into regions ─────────────────── */
+    struct pend { uint32_t pid; uint64_t ts, size, offset; int used; };
+    static struct pend pend_tab[FAULT_MAX_REGIONS];
+    int pend_n = 0;
+
+    char line[LINE_BUF];
+    struct fault_rec rec;
+    int in_obj = 0;
+    int n_entry = 0, n_exit = 0, n_paired = 0;
+
+    while (fgets(line, sizeof(line), fp)) {
+        if (strchr(line, '{')) { in_obj = 1; memset(&rec, 0, sizeof(rec)); }
+        if (!in_obj) continue;
+        fault_rec_field(&rec, line);
+        if (!strchr(line, '}')) continue;
+        in_obj = 0;
+
+        if (rec.nr != 9) continue;                 /* mmap only */
+
+        if (!is_hex_addr_str(rec.fname)) {
+            /* ENTRY: stash size + file offset keyed by (pid, ts) */
+            n_entry++;
+            if (pend_n < FAULT_MAX_REGIONS) {
+                pend_tab[pend_n].pid    = rec.pid;
+                pend_tab[pend_n].ts     = rec.ts;
+                pend_tab[pend_n].size   = rec.size;
+                pend_tab[pend_n].offset = rec.offset;
+                pend_tab[pend_n].used   = 0;
+                pend_n++;
+            }
+        } else {
+            /* EXIT: look up the matching entry to recover the length */
+            n_exit++;
+            uint64_t va = strtoull(rec.fname, NULL, 16);
+            if (!va) continue;
+
+            for (int i = 0; i < pend_n; i++) {
+                if (pend_tab[i].used) continue;
+                if (pend_tab[i].pid != rec.pid) continue;
+                if (pend_tab[i].ts  != rec.ts)  continue;
+                if (pend_tab[i].size == 0)      continue;
+
+                struct fault_region *r =
+                    fault_sched_region(fs, rec.pid, va,
+                                       (size_t)pend_tab[i].size, /*create=*/1);
+                if (r) {
+                    r->file_offset = pend_tab[i].offset;  /* mmap offset arg */
+                    n_paired++;
+                }
+                pend_tab[i].used = 1;
+                break;
+            }
+        }
+    }
+
+    /* ── pass 2: attach major-fault events to their owning region ──── */
+    rewind(fp);
+    in_obj = 0;
+    int total_events = 0, orphan = 0, mismatch = 0;
+
+    while (fgets(line, sizeof(line), fp)) {
+        if (strchr(line, '{')) { in_obj = 1; memset(&rec, 0, sizeof(rec)); }
+        if (!in_obj) continue;
+        fault_rec_field(&rec, line);
+        if (!strchr(line, '}')) continue;
+        in_obj = 0;
+
+        if (rec.nr != EVENT_NR_PAGE_FAULT_MAJOR) continue;
+
+        uint64_t fault_va = strtoull(rec.fname, NULL, 16);
+        if (!fault_va) { orphan++; continue; }
+
+        /* owning region = the mmap whose captured VA range contains it */
+        struct fault_region *owner = NULL;
+        pthread_mutex_lock(&fs->lock);
+        for (int i = 0; i < fs->count; i++) {
+            struct fault_region *r = &fs->regions[i];
+            if (r->pid == rec.pid &&
+                fault_va >= r->cap_vastart &&
+                fault_va <  r->cap_vastart + r->size) {
+                owner = r;
+                break;
+            }
+        }
+        pthread_mutex_unlock(&fs->lock);
+
+        if (!owner) { orphan++; continue; }
+
+        uint64_t off_va  = fault_va   - owner->cap_vastart;
+
+        struct fault_event *ne =
+            realloc(owner->events,
+                    (owner->n_events + 1) * sizeof(struct fault_event));
+        if (!ne) continue;
+        owner->events = ne;
+        owner->events[owner->n_events].timestamp_ns = rec.ts;
+        owner->events[owner->n_events].region_off   = off_va;
+        owner->n_events++;
+        total_events++;
+    }
+    fclose(fp);
+
+    fprintf(stderr,
+            "[fault] mmap records: %d entry, %d exit, %d paired into regions\n",
+            n_entry, n_exit, n_paired);
+    
+    /* sort each region's events by capture timestamp */
+    int regions_with_faults = 0;
+    for (int i = 0; i < fs->count; i++) {
+        if (fs->regions[i].n_events > 1)
+            qsort(fs->regions[i].events, fs->regions[i].n_events,
+                  sizeof(struct fault_event), fault_event_cmp);
+        if (fs->regions[i].n_events > 0)
+            regions_with_faults++;
+    }
+
+    fprintf(stderr,
+            "[fault] schedule: %d mmap regions, %d with faults, "
+            "%d major-fault events (%d orphaned)\n",
+            fs->count, regions_with_faults, total_events, orphan);
+
+    fs->enabled = (total_events > 0);
+    return total_events;
+}
+
+/*
+ * Touch thread — one per mmap region that has recorded major faults.
+ * For each scheduled fault it paces to the captured timestamp, evicts
+ * that single page from the page cache, then performs a volatile read to replay a major page fault.
+ */
+static void *fault_touch_thread(void *arg)
+{
+    struct fault_touch_args *a  = arg;
+    struct fault_region     *fr = a->region;
+
+    for (int i = 0; i < fr->n_events && !fr->cancelled; i++) {
+        uint64_t off = fr->events[i].region_off;
+        if (off >= fr->size)
+            continue;                      /* corrupt schedule guard   */
+
+        /* pace against the same origin the dispatchers use */
+        if (a->capture_start_ns && a->replay_start_ns) {
+            uint64_t cap = fr->events[i].timestamp_ns - a->capture_start_ns;
+            uint64_t rep = now_ns() - a->replay_start_ns;
+            if (cap > rep) {
+                uint64_t d = cap - rep;
+                if (d > 1000000000ULL) d = 1000000000ULL;
+                struct timespec ts = {
+                    .tv_sec  = (time_t)(d / 1000000000ULL),
+                    .tv_nsec = (long)  (d % 1000000000ULL),
+                };
+                nanosleep(&ts, NULL);
+            }
+        }
+
+        /* re-evict this page so the touch produces a MAJOR fault */
+        if (fr->replay_fd >= 0) {
+            uint64_t page_off = off & ~(uint64_t)(FAULT_PAGE_SIZE - 1);
+            posix_fadvise(fr->replay_fd,
+                          (off_t)(fr->file_offset + page_off),
+                          FAULT_PAGE_SIZE, POSIX_FADV_DONTNEED);
+        }
+
+        /* volatile read -> filemap_fault -> device read -> VM_FAULT_MAJOR */
+        volatile uint8_t *p = (volatile uint8_t *)fr->replay_addr + off;
+        uint8_t v = *p;
+        (void)v;
+
+        fr->completed++;
+    }
+
+    if (fr->replay_fd >= 0) {
+        close(fr->replay_fd);
+        fr->replay_fd = -1;
+    }
+    fr->touch_active = 0;
+    free(a);
+    return NULL;
+}
 
 /* define dispatcher */
 void *dispatcher_thread(void *arg);
