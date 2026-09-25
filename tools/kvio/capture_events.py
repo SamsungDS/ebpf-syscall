@@ -95,12 +95,16 @@ class Recorder:
             self.dropped += 1
 
     def _drain(self):
+        # Flush every record: a serving process is usually stopped with a
+        # signal, and a capture that stops at the last flushed line is worth
+        # more than one that lost its tail in a buffer.
         while True:
             record = self._q.get()
             if record is None:
                 break
             try:
                 self._fh.write(json.dumps(record, sort_keys=True) + "\n")
+                self._fh.flush()
             except (OSError, TypeError, ValueError):
                 self.errors += 1
 
