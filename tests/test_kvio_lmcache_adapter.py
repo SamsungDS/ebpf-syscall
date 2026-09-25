@@ -43,6 +43,12 @@ def key(i, rank=0):
     return encode_object_key(ObjectKey(chunk_hash=ObjectKey.IntHash2Bytes(i), model_name="g1", kv_rank=rank))
 
 
+def oid(i):
+    """The opaque identity the adapter records for key(i)."""
+    import hashlib
+    return "k" + hashlib.sha256(key(i).encoded.encode()).hexdigest()[:20]
+
+
 @unittest.skipUnless(ENGINE, "vendored raw_block engine or torch not importable here")
 class LmcacheAdapterTest(unittest.TestCase):
     def _core(self, tmp, name):
@@ -93,13 +99,18 @@ class LmcacheAdapterTest(unittest.TestCase):
             self.assertEqual(it["provenance"]["completeness"]["status"], "complete", it["provenance"])
             self.assertEqual(it["engine"]["name"], "lmcache-raw_block")
             self.assertEqual([(o["object_id"], o["version"]) for o in it["initial_state"]["live"]],
-                             [(key(0).encoded, 1)])
+                             [(oid(0), 1)])
             got = [(o["op"], o["object_id"], o["requested_bytes"], o["source_outcome"]) for o in it["operations"]]
-            want = [(op, k, size, expect) for op, k, size, expect, _ in ledger]
+            want = [(op, "k" + __import__("hashlib").sha256(k.encode()).hexdigest()[:20], size, expect)
+                    for op, k, size, expect, _ in ledger]
             self.assertEqual(got, want)
+            # no raw key in the record; the mapping is private and complete
+            self.assertNotIn("g1@", json.dumps(it))
+            mapping = json.load(open(wrapped.write_key_mapping(tmp / "keys.json")))
+            self.assertEqual(mapping[oid(2)], key(2).encoded)
             # the reuse after release is a new version of the same identity
-            self.assertEqual(sorted(it["objects"][key(2).encoded]["versions"]), ["1", "2"])
-            self.assertEqual(it["objects"][key(2).encoded]["versions"]["2"]["bytes"], 6000)
+            self.assertEqual(sorted(it["objects"][oid(2)]["versions"]), ["1", "2"])
+            self.assertEqual(it["objects"][oid(2)]["versions"]["2"]["bytes"], 6000)
             (tmp / "intent.json").write_text(json.dumps(it))
             self.g1 = (it, sidecar)
             return it, sidecar
@@ -115,13 +126,18 @@ class LmcacheAdapterTest(unittest.TestCase):
             self.assertEqual(intent_exec.check_dependencies(rows, it), [])
             self.assertEqual(intent_exec.compare_outcomes(rows), [], [r.__dict__ for r in rows])
             re_it, _ = capture_events.normalize_capture(capture_events.read_events(tmp / "replay-cap.jsonl"))
+            # The replay stores the record's opaque ids as its keys, and the
+            # recording adapter digests those again: a replay's capture names
+            # the digest of the digest, and its private mapping leads back.
+            import hashlib
+            dd = lambda x: "k" + hashlib.sha256(x.encode()).hexdigest()[:20]
             got = [(o["op"], o["object_id"], o["requested_bytes"], o["source_outcome"]) for o in re_it["operations"]]
-            want = [(o["op"], o["object_id"], o["requested_bytes"], o["source_outcome"]) for o in it["operations"]]
+            want = [(o["op"], dd(o["object_id"]), o["requested_bytes"], o["source_outcome"]) for o in it["operations"]]
             # The replay's initial-state materialization is its own store, before
             # the workload. Two workers may record independent operations in
             # another order than the source; order is not causality, and the
             # dependency check above is the causal test.
-            self.assertEqual(got[0], ("store", key(0).encoded, 4096, "success"))
+            self.assertEqual(got[0], ("store", dd(oid(0)), 4096, "success"))
             self.assertEqual(sorted(got[1:]), sorted(want))
 
 

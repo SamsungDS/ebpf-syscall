@@ -22,13 +22,19 @@ a missing key and for a failed read alike; presence before the call
 separates ``miss`` from ``error``.  ``delete_many`` returns whether an
 entry was removed: ``success`` or ``miss``.
 
-The recorded object identity is the encoded raw_block key string.  The
-representation is the payload length with an opaque codec; whatever the
-payload encodes (a codec header, K and V planes) is not visible at this
-boundary and is not invented here.
+The recorded object identity is a digest of the encoded raw_block key,
+because a serving LMCache's key carries the model's name as the
+deployment spelled it, which can be a path.  The real key is kept in a
+private mapping next to the capture (``<capture>.keys.json``), written by
+the recorder's owner when it closes.  The representation is the payload
+length with an opaque codec; whatever the payload encodes (a codec
+header, K and V planes) is not visible at this boundary and is not
+invented here.
 """
 from __future__ import annotations
 
+import hashlib
+import json
 import time
 
 import capture_events
@@ -60,6 +66,7 @@ class RecordingRawBlockCore:
         self._rec = recorder
         self._stream = stream
         self._batch = 0
+        self._keys = {}          # digest -> encoded key, private
         self._last = {}          # stream -> op_id of the last batch on it
 
     def __getattr__(self, name):
@@ -74,9 +81,21 @@ class RecordingRawBlockCore:
         for encoded in self._core.snapshot_indexed_keys():
             meta = self._core.get_metadata_many([encoded])[0]
             size = int(getattr(meta, "size", 0) or 0)
-            live.append((encoded, 1, {"codec": "raw_block-opaque", "encoded_bytes": size}, size, "storage"))
+            live.append((self.oid(encoded), 1, {"codec": "raw_block-opaque", "encoded_bytes": size}, size, "storage"))
         self._rec.object_state(live)
         return len(live)
+
+    def oid(self, encoded):
+        """Opaque object identity for a raw_block key; the mapping stays private."""
+        d = "k" + hashlib.sha256(encoded.encode()).hexdigest()[:20]
+        self._keys[d] = encoded
+        return d
+
+    def write_key_mapping(self, path=None):
+        path = path or (str(self._rec.path) + ".keys.json")
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(self._keys, f, indent=0, sort_keys=True)
+        return path
 
     def _next_batch(self):
         self._batch += 1
@@ -92,7 +111,7 @@ class RecordingRawBlockCore:
     def put_many(self, keys, objs, placement_ids=None):
         encoded = [k.encoded for k in keys]
         present = self._core.exists_many(encoded) if hasattr(self._core, "exists_many") else [False] * len(keys)
-        items = [{"object_id": e, "requested_bytes": _payload_len(o),
+        items = [{"object_id": self.oid(e), "requested_bytes": _payload_len(o),
                   "representation": {"codec": "raw_block-opaque", "encoded_bytes": _payload_len(o)}}
                  for e, o in zip(encoded, objs)]
         op = self._begin(op="store", items=items)
@@ -114,7 +133,7 @@ class RecordingRawBlockCore:
 
     def load_many_into(self, encoded_keys, objs):
         present = self._core.exists_many(list(encoded_keys))
-        items = [{"object_id": e, "requested_bytes": _payload_len(o)} for e, o in zip(encoded_keys, objs)]
+        items = [{"object_id": self.oid(e), "requested_bytes": _payload_len(o)} for e, o in zip(encoded_keys, objs)]
         op = self._begin(op="load", items=items)
         try:
             results = self._core.load_many_into(encoded_keys, objs)
@@ -133,7 +152,7 @@ class RecordingRawBlockCore:
         return results
 
     def delete_many(self, encoded_keys, *, force=False):
-        items = [{"object_id": e, "requested_bytes": 0} for e in encoded_keys]
+        items = [{"object_id": self.oid(e), "requested_bytes": 0} for e in encoded_keys]
         op = self._begin(op="release", items=items)
         try:
             results = self._core.delete_many(encoded_keys, force=force)

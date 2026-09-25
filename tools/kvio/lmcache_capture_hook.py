@@ -58,10 +58,19 @@ def install(capture_dir):
         wrapper._core = _Delegate(self, orig)
         self._kvio_wrapper = wrapper
         _recorders.append(rec)
+        _wrappers.append(wrapper)
         try:
             wrapper.record_initial_state()
         except Exception as error:
             rec.marker("initial_state_failed", error=repr(error))
+        wrapper.write_key_mapping()
+        _every = wrapper._begin
+
+        def _begin_and_map(**fields):
+            op = _every(**fields)
+            wrapper.write_key_mapping()
+            return op
+        wrapper._begin = _begin_and_map
         sys.stderr.write(f"[kvio-capture] recording core {n} of pid {os.getpid()} to {path}\n")
 
     def _put_many(self, *a, **k):
@@ -103,7 +112,15 @@ class _Delegate:
         return getattr(self._c, name)
 
 
+_wrappers = []
+
+
 def _close_all():
+    for w in _wrappers:
+        try:
+            w.write_key_mapping()
+        except Exception:
+            pass
     for rec in _recorders:
         try:
             h = rec.close()
