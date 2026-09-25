@@ -64,6 +64,8 @@ COMMANDS = {
                      "validate a kvio.workload.v3 file or carry a v2 intent into it", False),
     "engines":      ("tools/kvio/engines.py",
                      "list registered engines, their families, providers and readiness", False),
+    "coordinate":   ("tools/kvio/coordinator.py",
+                     "run one workload from many clients: shard, start together, merge", False),
     "content":      ("tools/kvio/content_profile.py",
                      "report what a named content profile achieves under zlib, zstd and LZ4", False),
     # engine-driving (vendored RawBlockCore + built Rust module)
