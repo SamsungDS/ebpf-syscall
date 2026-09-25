@@ -127,6 +127,13 @@ it does not recreate a capture.
 | `kvio release-build` | A bounded result draft | Build a two-file results-only candidate with no source trace | No |
 | `kvio release-example` | No input | Print the canonical result draft | No |
 | `kvio release-verify` | A results-only candidate | Check its closed grammar, inventory, and payload hash | No |
+| `kvio intent2 validate\|normalize-v1` | `kvio.intent.v2`, or a v1 intent | Validate a captured object workload, or carry a v1 intent into that form | No |
+| `kvio capture` | An engine adapter's capture events | Normalize an object-boundary capture into `kvio.intent.v2` with its timing sidecar | No |
+| `kvio workload3 validate\|from-v2` | `kvio.workload.v3`, or a v2 intent | Validate a typed multi-family workload, or carry a v2 record into it | No |
+| `kvio engines` | No input | List registered replay engines, their families, providers and readiness | No |
+| `kvio content report` | A content profile name | Report what the profile achieves under zlib, zstd and LZ4 | No |
+| `kvio execute` | A v2 intent or a v3 workload plus an engine | Replay the workload on a registered engine under a named timing profile; write the ledger and fidelity manifest | Yes; may write |
+| `kvio coordinate serve\|client` | A workload, a client count, and per-client engine configuration | Run one workload from many clients, start them together, merge the ledgers | Yes; may write |
 | `kvio bench` | An evidence-labeled stress profile | Run sustained storage pressure without claiming capture fidelity | Yes, including writes |
 | `kvio bench-compare` | Results from repeated benchmark runs | Compare the median results of two configurations | No |
 
