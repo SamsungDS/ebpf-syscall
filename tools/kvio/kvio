@@ -60,6 +60,8 @@ COMMANDS = {
                      "normalize an engine's object-operation capture into kvio.intent.v2", False),
     "execute":      ("tools/kvio/intent_exec.py",
                      "execute a kvio.intent.v2 workload against a backend (fake today)", False),
+    "content":      ("tools/kvio/content_profile.py",
+                     "report what a named content profile achieves under zlib, zstd and LZ4", False),
     # engine-driving (vendored RawBlockCore + built Rust module)
     "workload":     ("tools/kvio/workload.py",
                      "drive the real raw_block engine with a serving-shaped request mix", True),
