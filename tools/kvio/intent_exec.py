@@ -204,8 +204,12 @@ class RawBlockBackend(Backend):
     def describe(self):
         c = self.core
         return {"device": getattr(c, "device_path", None), "io_engine": getattr(c, "io_engine", None),
+                "use_odirect": getattr(c, "use_odirect", None),
+                "max_data_transfer_size": getattr(c, "max_data_transfer_size", None),
                 "slot_bytes": getattr(c, "slot_bytes", None), "block_align": getattr(c, "block_align", None),
-                "header_bytes": getattr(c, "header_bytes", None)}
+                "header_bytes": getattr(c, "header_bytes", None),
+                "note": "a transfer ceiling of 0 leaves the engine to resolve one; on a regular file the "
+                        "io_uring path then fails 32 MiB writes, so replays pass the ceiling explicitly"}
 
     def __init__(self, core, *, record_to=None, profile="incompressible"):
         self.core = core
@@ -296,7 +300,7 @@ def raw_block_from_config(cfg):
         import lmcache_rust_raw_block_io  # noqa: F401
         b = RawBlockBackend.__new__(RawBlockBackend)
         return b
-    largest = cfg.get("slot_bytes") or 4 * 1024 * 1024
+    largest = cfg.get("slot_bytes") or 4 * 1024 * 1024 + 4096
     core = open_raw_block_core(cfg["device"], capacity_bytes=cfg.get("capacity_bytes", 256 * 1024 * 1024),
                                slot_bytes=largest, io_engine=cfg.get("provider", "posix") if cfg.get("provider") != "uring_cmd" else "io_uring",
                                odirect=cfg.get("odirect", False),
@@ -708,8 +712,11 @@ def main(argv=None):
     else:
         if not args.device:
             ap.error("--backend raw_block needs --device")
-        largest = max(v["bytes"] for o in intent["objects"].values() for v in o["versions"].values())
-        slot = args.slot_bytes or ((largest + 4095) // 4096) * 4096
+        # The engine's own default: a slot holds its header and the largest
+        # payload, rounded up to the alignment (raw_block's default_slot_bytes).
+        largest = max(v["bytes"] for o in intent["objects"].values() for v in o["versions"].values()) \
+            if intent.get("objects") else max(n.get("size", 0) for n in intent["namespace"]["nodes"].values())
+        slot = args.slot_bytes or ((largest + 4096 + 4095) // 4096) * 4096
         core = open_raw_block_core(args.device, capacity_bytes=args.capacity_bytes, slot_bytes=slot,
                                    io_engine=args.io_engine, odirect=args.odirect,
                                    max_data_transfer_size=args.max_data_transfer_size)
