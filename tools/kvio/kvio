@@ -59,7 +59,11 @@ COMMANDS = {
     "capture":      ("tools/kvio/capture_events.py",
                      "normalize an engine's object-operation capture into kvio.intent.v2", False),
     "execute":      ("tools/kvio/intent_exec.py",
-                     "execute a kvio.intent.v2 workload against a backend (fake today)", False),
+                     "execute a kvio.intent.v2 intent or kvio.workload.v3 workload on a registered engine", False),
+    "workload3":    ("tools/kvio/workload3.py",
+                     "validate a kvio.workload.v3 file or carry a v2 intent into it", False),
+    "engines":      ("tools/kvio/engines.py",
+                     "list registered engines, their families, providers and readiness", False),
     "content":      ("tools/kvio/content_profile.py",
                      "report what a named content profile achieves under zlib, zstd and LZ4", False),
     # engine-driving (vendored RawBlockCore + built Rust module)
