@@ -127,3 +127,41 @@ class LmcacheAdapterTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+@unittest.skipUnless(ENGINE, "vendored raw_block engine or torch not importable here")
+class CaptureHookTest(unittest.TestCase):
+    def test_hook_records_a_core_it_did_not_construct(self):
+        """The serving-time hook wraps RawBlockCore at class level: a core built
+        by code we do not control records through the same adapter rules."""
+        import importlib
+        import lmcache_capture_hook
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            lmcache_capture_hook._installed = False
+            lmcache_capture_hook.install(str(tmp / "cap"))
+            try:
+                core = intent_exec.open_raw_block_core(self._mk_file(tmp), capacity_bytes=64 * 1024 * 1024, slot_bytes=SLOT)
+                mk = intent_exec.RawBlockBackend._memory_obj
+                obj, _ = mk(intent_exec.synthetic_bytes(key(1).encoded, 1, 0, 8000))
+                self.assertEqual(core.put_many([key(1)], [obj]).results, [True])
+                self.assertEqual(core.put_many([key(1)], [obj]).results, [True])
+                out, _ = mk(bytes(8000))
+                self.assertEqual(core.load_many_into([key(1).encoded], [out]), [True])
+                self.assertEqual(core.delete_many([key(1).encoded]), [True])
+                self.assertEqual(core.load_many_into([key(1).encoded], [out]), [False])
+                core.close()
+            finally:
+                lmcache_capture_hook._close_all()
+            (cap,) = list((tmp / "cap").glob("*.jsonl"))
+            it, _ = capture_events.normalize_capture(capture_events.read_events(cap))
+            self.assertEqual([(o["op"], o["source_outcome"]) for o in it["operations"]],
+                             [("store", "success"), ("store", "already_present"), ("load", "success"),
+                              ("release", "success"), ("load", "miss")])
+            self.assertEqual(it["provenance"]["completeness"]["status"], "complete")
+
+    def _mk_file(self, tmp):
+        path = tmp / "hook.bin"
+        with open(path, "wb") as f:
+            f.truncate(64 * 1024 * 1024)
+        return path
